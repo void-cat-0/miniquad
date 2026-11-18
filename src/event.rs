@@ -172,6 +172,12 @@ pub trait EventHandler {
     fn update(&mut self);
     fn draw(&mut self);
     fn resize_event(&mut self, _width: f32, _height: f32) {}
+
+    /// When supported by the backend, called immediately before a callback with
+    /// physical coordinates (mouse enter, motion, button down/up, or touch).
+    /// The scale applies only to that callback.
+    fn input_event_dpi_scale(&mut self, _scale: f32) {}
+
     fn mouse_motion_event(&mut self, _x: f32, _y: f32) {}
     fn mouse_wheel_event(&mut self, _x: f32, _y: f32) {}
     fn mouse_button_down_event(&mut self, _button: MouseButton, _x: f32, _y: f32) {}

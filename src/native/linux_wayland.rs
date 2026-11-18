@@ -59,7 +59,7 @@ struct WaylandPayload {
     pointer_context: PointerContext,
     keyboard: *mut wl_keyboard,
     touch: *mut wl_touch,
-    touch_positions: HashMap<core::ffi::c_int, (f32, f32)>,
+    touch_positions: HashMap<core::ffi::c_int, InputPosition>,
     focused_window: *mut wl_surface,
     decoration_manager: *mut extensions::xdg_decoration::zxdg_decoration_manager_v1,
     decorations: decorations::Decorations,
@@ -462,7 +462,8 @@ impl KeyboardContext {
 struct PointerContext {
     pointer: *mut wl_pointer,
     enter_serial: Option<core::ffi::c_uint>,
-    position: (f32, f32),
+    // Buttons carry no coordinates; keep the last absolute position in logical units.
+    logical_position: (f32, f32),
     /// Wayland does not remember what cursor icon a window has; if the cursor leaves and comes
     /// back, it will not be reset to what icon it had unless we keep track of it.
     cursor_icon: Option<crate::CursorIcon>,
@@ -481,7 +482,7 @@ impl PointerContext {
         Self {
             pointer: std::ptr::null_mut(),
             enter_serial: None,
-            position: (0., 0.),
+            logical_position: (0., 0.),
             cursor_icon: Some(crate::CursorIcon::Default),
             queued_cursor_icon: None,
             cursor_shape_manager: std::ptr::null_mut(),
@@ -679,17 +680,34 @@ unsafe extern "C" fn seat_handle_capabilities(
     }
 }
 
+#[derive(Clone, Copy)]
+struct InputPosition {
+    x: f32,
+    y: f32,
+    scale: f32,
+}
+
+impl InputPosition {
+    fn from_logical((x, y): (f32, f32), scale: f32) -> Self {
+        Self {
+            x: x * scale,
+            y: y * scale,
+            scale,
+        }
+    }
+}
+
 enum WaylandEvent {
     KeyDown(KeyCode, KeyMods, bool),
     KeyUp(KeyCode, KeyMods),
     Char(char, KeyMods, bool),
-    PointerMotion(f32, f32),
-    PointerEnter(f32, f32),
+    PointerMotion(InputPosition),
+    PointerEnter(InputPosition),
     PointerLeave,
     RawMotion(f32, f32),
-    PointerButton(MouseButton, bool),
+    PointerButton(MouseButton, bool, InputPosition),
     PointerAxis(f32, f32),
-    Touch(crate::TouchPhase, u64, f32, f32, f64),
+    Touch(crate::TouchPhase, u64, InputPosition, f64),
     FilesDropped(String),
     Resize(f32, f32),
     WindowMinimized,
@@ -848,10 +866,10 @@ unsafe extern "C" fn pointer_handle_enter(
     display.focused_window = surface;
     if surface == display.surface {
         let scale = crate::native_display().lock().unwrap().dpi_scale;
-        let x = wl_fixed_to_double(surface_x) * scale;
-        let y = wl_fixed_to_double(surface_y) * scale;
-        display.pointer_context.position = (x, y);
-        display.events.push(WaylandEvent::PointerEnter(x, y));
+        let logical = (wl_fixed_to_double(surface_x), wl_fixed_to_double(surface_y));
+        display.pointer_context.logical_position = logical;
+        let position = InputPosition::from_logical(logical, scale);
+        display.events.push(WaylandEvent::PointerEnter(position));
         display
             .pointer_context
             .handle_enter(&mut display.client, serial);
@@ -880,12 +898,11 @@ unsafe extern "C" fn pointer_handle_motion(
 ) {
     let display: &mut WaylandPayload = &mut *(data as *mut _);
     if display.focused_window == display.surface {
-        // From wl_fixed_to_double(), it simply divides by 256
-        let d = crate::native_display().lock().unwrap();
-        let x = wl_fixed_to_double(surface_x) * d.dpi_scale;
-        let y = wl_fixed_to_double(surface_y) * d.dpi_scale;
-        display.pointer_context.position = (x, y);
-        display.events.push(WaylandEvent::PointerMotion(x, y));
+        let scale = crate::native_display().lock().unwrap().dpi_scale;
+        let logical = (wl_fixed_to_double(surface_x), wl_fixed_to_double(surface_y));
+        display.pointer_context.logical_position = logical;
+        let position = InputPosition::from_logical(logical, scale);
+        display.events.push(WaylandEvent::PointerMotion(position));
     }
 }
 unsafe extern "C" fn pointer_handle_button(
@@ -905,9 +922,11 @@ unsafe extern "C" fn pointer_handle_button(
             274 => MouseButton::Middle,
             _ => MouseButton::Unknown,
         };
+        let scale = crate::native_display().lock().unwrap().dpi_scale;
+        let position = InputPosition::from_logical(display.pointer_context.logical_position, scale);
         display
             .events
-            .push(WaylandEvent::PointerButton(button, state == 1));
+            .push(WaylandEvent::PointerButton(button, state == 1, position));
     }
 }
 unsafe extern "C" fn pointer_handle_axis(
@@ -977,15 +996,14 @@ unsafe extern "C" fn touch_handle_down(
     let display: &mut WaylandPayload = &mut *(data as *mut _);
     display.focused_window = surface;
     if display.focused_window == display.surface {
-        let d = crate::native_display().lock().unwrap();
-        let x = wl_fixed_to_double(x) * d.dpi_scale;
-        let y = wl_fixed_to_double(y) * d.dpi_scale;
-        display.touch_positions.insert(id, (x, y));
+        let scale = crate::native_display().lock().unwrap().dpi_scale;
+        let logical = (wl_fixed_to_double(x), wl_fixed_to_double(y));
+        let position = InputPosition::from_logical(logical, scale);
+        display.touch_positions.insert(id, position);
         display.events.push(WaylandEvent::Touch(
             crate::TouchPhase::Started,
             id as _,
-            x,
-            y,
+            position,
             time as f64 / 1000.,
         ));
     }
@@ -1001,13 +1019,16 @@ unsafe extern "C" fn touch_handle_motion(
 ) {
     let display: &mut WaylandPayload = &mut *(data as *mut _);
     if display.focused_window == display.surface {
-        let d = crate::native_display().lock().unwrap();
-        let x = wl_fixed_to_double(x) * d.dpi_scale;
-        let y = wl_fixed_to_double(y) * d.dpi_scale;
-        display.touch_positions.insert(id, (x, y));
-        display
-            .events
-            .push(WaylandEvent::Touch(crate::TouchPhase::Moved, id as _, x, y, time as f64 / 1000.));
+        let scale = crate::native_display().lock().unwrap().dpi_scale;
+        let logical = (wl_fixed_to_double(x), wl_fixed_to_double(y));
+        let position = InputPosition::from_logical(logical, scale);
+        display.touch_positions.insert(id, position);
+        display.events.push(WaylandEvent::Touch(
+            crate::TouchPhase::Moved,
+            id as _,
+            position,
+            time as f64 / 1000.,
+        ));
     }
 }
 
@@ -1020,22 +1041,24 @@ unsafe extern "C" fn touch_handle_up(
 ) {
     let display: &mut WaylandPayload = &mut *(data as *mut _);
     if display.focused_window == display.surface {
-        if let Some((x, y)) = display.touch_positions.remove(&id) {
-            display
-                .events
-                .push(WaylandEvent::Touch(crate::TouchPhase::Ended, id as _, x, y, time as f64 / 1000.));
+        if let Some(position) = display.touch_positions.remove(&id) {
+            display.events.push(WaylandEvent::Touch(
+                crate::TouchPhase::Ended,
+                id as _,
+                position,
+                time as f64 / 1000.,
+            ));
         }
     }
 }
 
 unsafe extern "C" fn touch_handle_cancel(data: *mut std::ffi::c_void, _touch: *mut wl_touch) {
     let display: &mut WaylandPayload = &mut *(data as *mut _);
-    for (id, (x, y)) in display.touch_positions.drain() {
+    for (id, position) in display.touch_positions.drain() {
         display.events.push(WaylandEvent::Touch(
             crate::TouchPhase::Cancelled,
             id as _,
-            x,
-            y,
+            position,
             0.0,
         ));
     }
@@ -1594,26 +1617,30 @@ where
                     WaylandEvent::Char(chr, keymods, repeat) => {
                         event_handler.char_event(chr, keymods, repeat)
                     }
-                    WaylandEvent::PointerEnter(x, y) => {
+                    WaylandEvent::PointerEnter(InputPosition { x, y, scale }) => {
+                        event_handler.input_event_dpi_scale(scale);
                         event_handler.mouse_enter_event(MouseButton::Unknown, x, y)
                     }
                     WaylandEvent::PointerLeave => event_handler.mouse_leave_event(),
-                    WaylandEvent::PointerMotion(x, y) => {
+                    WaylandEvent::PointerMotion(InputPosition { x, y, scale }) => {
+                        event_handler.input_event_dpi_scale(scale);
                         event_handler.mouse_motion_event(x, y);
                     }
                     WaylandEvent::RawMotion(dx, dy) => {
                         event_handler.raw_mouse_motion(dx, dy);
                     }
-                    WaylandEvent::PointerButton(button, state) => {
-                        let (x, y) = display.pointer_context.position;
+                    WaylandEvent::PointerButton(button, state, InputPosition { x, y, scale }) => {
                         if state {
+                            event_handler.input_event_dpi_scale(scale);
                             event_handler.mouse_button_down_event(button, x, y);
                         } else {
+                            event_handler.input_event_dpi_scale(scale);
                             event_handler.mouse_button_up_event(button, x, y);
                         }
                     }
                     WaylandEvent::PointerAxis(x, y) => event_handler.mouse_wheel_event(x, y),
-                    WaylandEvent::Touch(phase, id, x, y, time) => {
+                    WaylandEvent::Touch(phase, id, InputPosition { x, y, scale }, time) => {
+                        event_handler.input_event_dpi_scale(scale);
                         event_handler.touch_event(phase, id, x, y, time)
                     }
                     WaylandEvent::Resize(width, height) => {
