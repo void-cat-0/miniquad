@@ -796,6 +796,93 @@ impl X11Display {
     }
 }
 
+#[cfg(feature = "vulkan")]
+unsafe fn vulkan_main_loop<F>(
+    mut display: X11Display,
+    conf: &crate::conf::Conf,
+    f: &mut Option<F>,
+    screen: i32,
+) -> Result<(), X11Display>
+where
+    F: 'static + FnOnce() -> Box<dyn EventHandler>,
+{
+    display.window =
+        display
+            .libx11
+            .create_window(display.root, display.display, std::ptr::null_mut(), 0, conf);
+    display.init_drag_n_drop();
+    if !conf.headless {
+        display.libx11.show_window(display.display, display.window);
+    }
+
+    (display.libx11.XFlush)(display.display);
+
+    let (w, h) = display
+        .libx11
+        .query_window_size(display.display, display.window);
+
+    let (tx, rx) = std::sync::mpsc::channel();
+    let clipboard = Box::new(clipboard::X11Clipboard::new(
+        display.libx11.clone(),
+        display.display,
+        display.window,
+    ));
+    crate::set_display(NativeDisplayData {
+        rendering_backend: crate::conf::RenderingBackend::Vulkan,
+        vulkan_window: Some(super::vulkan::VulkanWindow::Xlib {
+            display: display.display as usize,
+            window: display.window as u64,
+            screen,
+        }),
+        high_dpi: conf.high_dpi,
+        dpi_scale: display.libx11.update_system_dpi(display.display),
+        blocking_event_loop: conf.platform.blocking_event_loop,
+        ..NativeDisplayData::new(w, h, tx, clipboard)
+    });
+    if conf.fullscreen {
+        display.set_fullscreen(display.window, true);
+    }
+
+    let mut event_handler = (f.take().unwrap())();
+
+    while !crate::native_display().try_lock().unwrap().quit_ordered {
+        while let Ok(request) = rx.try_recv() {
+            display.process_request(request);
+        }
+
+        let mut count = (display.libx11.XPending)(display.display);
+        let block_on_wait = conf.platform.blocking_event_loop && !display.update_requested;
+        if block_on_wait {
+            // if there are multiple events pending, it is still desired to process
+            // them all in one frame.
+            // However, when there are no events in the queue, +1 hack
+            // will block main thread and release the cpu until the new event.
+            count += 1;
+        }
+
+        for _ in 0..count {
+            let mut xevent = _XEvent { type_0: 0 };
+            (display.libx11.XNextEvent)(display.display, &mut xevent);
+            display.process_event(&mut xevent, &mut *event_handler);
+        }
+
+        if !conf.platform.blocking_event_loop || display.update_requested {
+            display.update_requested = false;
+            event_handler.update();
+            event_handler.draw();
+
+            (display.libx11.XFlush)(display.display);
+        }
+    }
+
+    drop(event_handler);
+    (display.libx11.XUnmapWindow)(display.display, display.window);
+    (display.libx11.XDestroyWindow)(display.display, display.window);
+    (display.libx11.XCloseDisplay)(display.display);
+
+    Ok(())
+}
+
 unsafe fn glx_main_loop<F>(
     mut display: X11Display,
     conf: &crate::conf::Conf,
@@ -1074,6 +1161,12 @@ where
         display
             .libxi
             .query_xi_extension(&mut display.libx11, display.display);
+
+        #[cfg(feature = "vulkan")]
+        if conf.platform.rendering_backend == crate::conf::RenderingBackend::Vulkan {
+            vulkan_main_loop(display, conf, f, x11_screen).ok().unwrap();
+            return Ok(());
+        }
 
         match conf.platform.linux_x11_gl {
             crate::conf::LinuxX11Gl::GLXOnly => {

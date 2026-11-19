@@ -9,6 +9,12 @@ pub(crate) struct DroppedFiles {
     pub bytes: Vec<Vec<u8>>,
 }
 pub(crate) struct NativeDisplayData {
+    pub rendering_backend: crate::conf::RenderingBackend,
+    #[cfg(all(
+        feature = "vulkan",
+        any(windows, all(target_os = "linux", not(target_env = "ohos")))
+    ))]
+    pub vulkan_window: Option<vulkan::VulkanWindow>,
     pub screen_width: i32,
     pub screen_height: i32,
     pub screen_position: (u32, u32),
@@ -46,6 +52,12 @@ impl NativeDisplayData {
         clipboard: Box<dyn Clipboard>,
     ) -> NativeDisplayData {
         NativeDisplayData {
+            rendering_backend: crate::conf::RenderingBackend::OpenGl,
+            #[cfg(all(
+                feature = "vulkan",
+                any(windows, all(target_os = "linux", not(target_env = "ohos")))
+            ))]
+            vulkan_window: None,
             screen_width,
             screen_height,
             screen_position: (0, 0),
@@ -74,11 +86,20 @@ pub(crate) enum Request {
     SetCursorGrab(bool),
     ShowMouse(bool),
     SetMouseCursor(crate::CursorIcon),
-    SetWindowSize { new_width: u32, new_height: u32 },
-    SetWindowPosition { new_x: u32, new_y: u32 },
+    SetWindowSize {
+        new_width: u32,
+        new_height: u32,
+    },
+    SetWindowPosition {
+        new_x: u32,
+        new_y: u32,
+    },
     SetFullscreen(bool),
     ShowKeyboard(bool),
-    SetImePosition { x: i32, y: i32 },
+    SetImePosition {
+        x: i32,
+        y: i32,
+    },
     SetImeEnabled(bool),
     UpdateTextInputState {
         text: String,
@@ -95,6 +116,12 @@ pub trait Clipboard: Send + Sync {
     fn get(&mut self) -> Option<String>;
     fn set(&mut self, string: &str);
 }
+
+#[cfg(all(
+    feature = "vulkan",
+    any(windows, all(target_os = "linux", not(target_env = "ohos")))
+))]
+pub(crate) mod vulkan;
 
 pub mod module;
 

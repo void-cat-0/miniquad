@@ -12,6 +12,8 @@ mod event;
 pub mod fs;
 pub mod graphics;
 pub mod native;
+#[cfg(feature = "tracy")]
+pub mod tracy;
 use std::collections::HashMap;
 use std::ops::{Index, IndexMut};
 
@@ -138,6 +140,24 @@ pub mod window {
     /// ```
     /// but under #[cfg] gate to avoid MetalContext on non-apple platforms
     pub fn new_rendering_backend() -> Box<dyn RenderingBackend> {
+        #[cfg(all(
+            feature = "vulkan",
+            any(windows, all(target_os = "linux", not(target_env = "ohos")))
+        ))]
+        {
+            let d = native_display().lock().unwrap();
+            if d.rendering_backend == conf::RenderingBackend::Vulkan {
+                let (display, window) = d
+                    .vulkan_window
+                    .expect("Vulkan window handles are unavailable")
+                    .handles();
+                return Box::new(VulkanBackend::new(
+                    display,
+                    window,
+                    (d.screen_width as u32, d.screen_height as u32),
+                ));
+            }
+        }
         #[cfg(target_vendor = "apple")]
         {
             if window::apple_gfx_api() == conf::AppleGfxApi::Metal {
@@ -518,6 +538,19 @@ pub fn start<F>(conf: conf::Conf, f: F)
 where
     F: 'static + FnOnce() -> Box<dyn EventHandler>,
 {
+    if conf.platform.rendering_backend == conf::RenderingBackend::Vulkan {
+        assert!(
+            cfg!(feature = "vulkan"),
+            "Vulkan requires the `vulkan` Cargo feature"
+        );
+        assert!(
+            cfg!(any(
+                windows,
+                all(target_os = "linux", not(target_env = "ohos"))
+            )),
+            "Vulkan is supported on Windows and Linux"
+        );
+    }
     #[cfg(target_env = "ohos")]
     unsafe {
         native::ohos::run(conf, f);

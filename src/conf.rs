@@ -117,9 +117,22 @@ pub enum WaylandDecorations {
     ServerOnly,
 }
 
+/// Rendering API on Windows and Linux. Apple platforms use `AppleGfxApi`.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
+pub enum RenderingBackend {
+    #[default]
+    OpenGl,
+    /// Requires the `vulkan` feature and a Vulkan 1.3 capable driver.
+    Vulkan,
+}
+
 /// Platform-specific settings.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub struct Platform {
+    /// Rendering API on Windows and Linux; defaults to OpenGL.
+    /// Selecting Vulkan requires the `vulkan` Cargo feature.
+    pub rendering_backend: RenderingBackend,
+
     /// Determines how to load an OpenGL context on X11 (via GLX or EGL).
     pub linux_x11_gl: LinuxX11Gl,
 
@@ -186,6 +199,7 @@ pub struct Platform {
 impl Default for Platform {
     fn default() -> Platform {
         Platform {
+            rendering_backend: RenderingBackend::default(),
             linux_x11_gl: LinuxX11Gl::default(),
             linux_backend: LinuxBackend::default(),
             apple_gfx_api: AppleGfxApi::default(),

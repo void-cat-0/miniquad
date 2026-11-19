@@ -65,12 +65,12 @@ impl Stage {
         let shader = ctx
             .new_shader(
                 match ctx.info().backend {
-                    Backend::OpenGl => ShaderSource::Glsl {
-                        vertex: shader::VERTEX,
-                        fragment: shader::FRAGMENT,
-                    },
                     Backend::Metal => ShaderSource::Msl {
                         program: shader::METAL,
+                    },
+                    _ => ShaderSource::Glsl {
+                        vertex: shader::VERTEX,
+                        fragment: shader::FRAGMENT,
                     },
                 },
                 shader::meta(),

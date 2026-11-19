@@ -35,7 +35,7 @@ struct WaylandPayload {
     registry: *mut wl_registry,
     // this is libwayland-egl.so, a library with ~4 functions
     // not the libEGL.so(which will be loaded, but not here)
-    egl: LibWaylandEgl,
+    egl: Option<LibWaylandEgl>,
     xkb: LibXkbCommon,
     compositor: *mut wl_compositor,
     subcompositor: *mut wl_subcompositor,
@@ -93,11 +93,7 @@ fn dead_keysym_to_char(keysym: u32) -> Option<char> {
 }
 
 impl WaylandPayload {
-    unsafe fn process_key_event(
-        &mut self,
-        key: core::ffi::c_uint,
-        repeat: bool,
-    ) {
+    unsafe fn process_key_event(&mut self, key: core::ffi::c_uint, repeat: bool) {
         let libxkb = &mut self.xkb;
         let keymap = &self.keymap;
         let xkb_state = self.xkb_state;
@@ -105,7 +101,8 @@ impl WaylandPayload {
 
         let keysym_raw = libxkb.keymap_key_get_sym_without_mod(keymap.xkb_keymap, key + 8);
         let keycode = keycodes::translate_keysym(keysym_raw);
-        self.events.push(WaylandEvent::KeyDown(keycode, keymods, repeat));
+        self.events
+            .push(WaylandEvent::KeyDown(keycode, keymods, repeat));
 
         if self.external_ime_active {
             return;
@@ -126,13 +123,17 @@ impl WaylandPayload {
                         buf.len(),
                     );
                     let preedit_str = if len > 0 {
-                        std::str::from_utf8(&buf[..len as usize]).unwrap_or("").to_string()
+                        std::str::from_utf8(&buf[..len as usize])
+                            .unwrap_or("")
+                            .to_string()
                     } else if let Some(c) = dead_keysym_to_char(keysym) {
                         c.to_string()
                     } else {
                         let chr = (libxkb.xkb_keysym_to_utf32)(keysym);
                         if chr > 0 && chr < 0xFE00 {
-                            char::from_u32(chr).map(|c| c.to_string()).unwrap_or_default()
+                            char::from_u32(chr)
+                                .map(|c| c.to_string())
+                                .unwrap_or_default()
                         } else {
                             String::new()
                         }
@@ -775,7 +776,9 @@ unsafe extern "C" fn keyboard_handle_leave(
     display.keyboard_context.enter_serial = None;
     if display.compose_preediting {
         display.compose_preediting = false;
-        display.events.push(WaylandEvent::ImePreedit(String::new(), 0));
+        display
+            .events
+            .push(WaylandEvent::ImePreedit(String::new(), 0));
     }
     if !display.xkb_compose_state.is_null() {
         (display.xkb.xkb_compose_state_reset)(display.xkb_compose_state);
@@ -1097,7 +1100,9 @@ unsafe extern "C" fn text_input_handle_preedit_string(
             .unwrap_or("")
             .to_string()
     };
-    display.events.push(WaylandEvent::ImePreedit(preedit, cursor_end as usize));
+    display
+        .events
+        .push(WaylandEvent::ImePreedit(preedit, cursor_end as usize));
 }
 
 unsafe extern "C" fn text_input_handle_commit_string(
@@ -1114,7 +1119,11 @@ unsafe extern "C" fn text_input_handle_commit_string(
             .to_str()
             .unwrap_or("")
             .to_string();
-        if s.is_empty() { None } else { Some(s) }
+        if s.is_empty() {
+            None
+        } else {
+            Some(s)
+        }
     };
     display.events.push(WaylandEvent::ImeCommit(commit));
 }
@@ -1331,7 +1340,12 @@ where
 {
     unsafe {
         let client = LibWaylandClient::try_load().ok()?;
-        let egl = LibWaylandEgl::try_load().ok()?;
+        let vulkan = conf.platform.rendering_backend == crate::conf::RenderingBackend::Vulkan;
+        let egl = if vulkan {
+            None
+        } else {
+            Some(LibWaylandEgl::try_load().ok()?)
+        };
         let xkb = LibXkbCommon::try_load().ok()?;
 
         let wdisplay = (client.wl_display_connect)(std::ptr::null_mut());
@@ -1354,7 +1368,8 @@ where
             .or_else(|_| std::env::var("LC_CTYPE"))
             .or_else(|_| std::env::var("LANG"))
             .unwrap_or_else(|_| "C".to_string());
-        let locale_c = std::ffi::CString::new(locale).unwrap_or_else(|_| std::ffi::CString::new("C").unwrap());
+        let locale_c =
+            std::ffi::CString::new(locale).unwrap_or_else(|_| std::ffi::CString::new("C").unwrap());
 
         let xkb_compose_table = if !xkb_context.is_null() {
             (xkb.xkb_compose_table_new_from_locale)(
@@ -1435,23 +1450,14 @@ where
         display.init_pointer_context();
         display.init_text_input();
 
-        let mut libegl = egl::LibEgl::try_load().ok()?;
-        let (context, config, egl_display) = egl::create_egl_context(
-            &mut libegl,
-            wdisplay as *mut _,
-            conf.platform.framebuffer_alpha,
-            conf.sample_count,
-        )
-        .unwrap();
-
-        {
-            // At this point we have been told the dpi_scale
-            let d = crate::native_display().try_lock().unwrap();
-            display.egl_window = (display.egl.wl_egl_window_create)(
-                display.surface as _,
-                d.screen_width,
-                d.screen_height,
-            );
+        #[cfg(feature = "vulkan")]
+        if vulkan {
+            let mut d = crate::native_display().lock().unwrap();
+            d.rendering_backend = crate::conf::RenderingBackend::Vulkan;
+            d.vulkan_window = Some(super::vulkan::VulkanWindow::Wayland {
+                display: wdisplay as usize,
+                surface: display.surface as usize,
+            });
             wl_request!(
                 display.client,
                 display.surface,
@@ -1459,30 +1465,61 @@ where
                 d.dpi_scale as i32
             );
         }
+        let mut opengl = if vulkan {
+            None
+        } else {
+            let mut libegl = egl::LibEgl::try_load().ok()?;
+            let (context, config, egl_display) = egl::create_egl_context(
+                &mut libegl,
+                wdisplay as *mut _,
+                conf.platform.framebuffer_alpha,
+                conf.sample_count,
+            )
+            .unwrap();
 
-        let egl_surface = (libegl.eglCreateWindowSurface)(
-            egl_display,
-            config,
-            display.egl_window as _,
-            std::ptr::null_mut(),
-        );
+            {
+                // At this point we have been told the dpi_scale
+                let d = crate::native_display().try_lock().unwrap();
+                display.egl_window = (display.egl.as_ref().unwrap().wl_egl_window_create)(
+                    display.surface as _,
+                    d.screen_width,
+                    d.screen_height,
+                );
+                wl_request!(
+                    display.client,
+                    display.surface,
+                    WL_SURFACE_SET_BUFFER_SCALE,
+                    d.dpi_scale as i32
+                );
+            }
 
-        if egl_surface.is_null() {
-            // == EGL_NO_SURFACE
-            panic!("surface creation failed");
-        }
-        if (libegl.eglMakeCurrent)(egl_display, egl_surface, egl_surface, context) == 0 {
-            panic!("eglMakeCurrent failed");
-        }
+            let egl_surface = (libegl.eglCreateWindowSurface)(
+                egl_display,
+                config,
+                display.egl_window as _,
+                std::ptr::null_mut(),
+            );
 
-        if (libegl.eglSwapInterval)(egl_display, conf.platform.swap_interval.unwrap_or(1)) == 0 {
-            eprintln!("eglSwapInterval failed");
-        }
+            if egl_surface.is_null() {
+                // == EGL_NO_SURFACE
+                panic!("surface creation failed");
+            }
+            if (libegl.eglMakeCurrent)(egl_display, egl_surface, egl_surface, context) == 0 {
+                panic!("eglMakeCurrent failed");
+            }
 
-        crate::native::gl::load_gl_funcs(|proc| {
-            let name = std::ffi::CString::new(proc).unwrap();
-            (libegl.eglGetProcAddress)(name.as_ptr() as _)
-        });
+            if (libegl.eglSwapInterval)(egl_display, conf.platform.swap_interval.unwrap_or(1)) == 0
+            {
+                eprintln!("eglSwapInterval failed");
+            }
+
+            crate::native::gl::load_gl_funcs(|proc| {
+                let name = std::ffi::CString::new(proc).unwrap();
+                (libegl.eglGetProcAddress)(name.as_ptr() as _)
+            });
+
+            Some((libegl, egl_display, egl_surface))
+        };
 
         display.decorations = decorations::Decorations::new(&mut display, conf);
         assert!(!display.xdg_toplevel.is_null());
@@ -1692,7 +1729,9 @@ where
                 display.update_requested = false;
                 event_handler.update();
                 event_handler.draw();
-                (libegl.eglSwapBuffers)(egl_display, egl_surface);
+                if let Some((libegl, egl_display, egl_surface)) = &mut opengl {
+                    (libegl.eglSwapBuffers)(*egl_display, *egl_surface);
+                }
             }
         }
     }

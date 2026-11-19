@@ -910,7 +910,7 @@ pub(crate) struct RenderPassInternal {
     depth_texture: Option<TextureId>,
 }
 
-struct Textures(Vec<Texture>);
+struct Textures(ResourceManager<Texture>);
 impl Textures {
     fn get(&self, texture: TextureId) -> Texture {
         match texture.0 {
@@ -920,6 +920,11 @@ impl Textures {
             },
             #[cfg(target_vendor = "apple")]
             TextureIdInner::Raw(RawId::Metal(..)) => panic!("Metal texture in OpenGL context!"),
+            #[cfg(all(
+                feature = "vulkan",
+                any(windows, all(target_os = "linux", not(target_env = "ohos")))
+            ))]
+            TextureIdInner::Raw(RawId::Vulkan(_)) => panic!("Vulkan image passed to OpenGL"),
             TextureIdInner::Managed(texture) => self.0[texture],
         }
     }
@@ -962,7 +967,7 @@ impl GlContext {
                 pipelines: ResourceManager::default(),
                 passes: ResourceManager::default(),
                 buffers: ResourceManager::default(),
-                textures: Textures(vec![]),
+                textures: Textures(ResourceManager::default()),
                 info,
                 transfer_caps,
                 cache: GlCache {
@@ -1323,12 +1328,11 @@ impl RenderingBackend for GlContext {
         params: TextureParams,
     ) -> TextureId {
         let texture = Texture::new(&self.transfer_caps, access, source, params);
-        self.textures.0.push(texture);
-        TextureId(TextureIdInner::Managed(self.textures.0.len() - 1))
+        TextureId(TextureIdInner::Managed(self.textures.0.add(texture)))
     }
 
     fn delete_texture(&mut self, texture: TextureId) {
-        //self.cache.clear_texture_bindings();
+        self.cache.clear_texture_bindings();
 
         let t = self.textures.get(texture);
         match &t.raw {
@@ -1338,6 +1342,9 @@ impl RenderingBackend for GlContext {
             TextureOrRenderbuffer::Renderbuffer(raw) => unsafe {
                 glDeleteRenderbuffers(1, raw as *const _);
             },
+        }
+        if let TextureIdInner::Managed(id) = texture.0 {
+            self.textures.0.remove(id);
         }
     }
 
@@ -1583,6 +1590,12 @@ impl RenderingBackend for GlContext {
     fn render_pass_color_attachments(&self, render_pass: RenderPass) -> &[TextureId] {
         &self.passes[render_pass.0].color_textures
     }
+    fn render_pass_resolve_texture(&self, pass: RenderPass) -> Option<TextureId> {
+        self.passes[pass.0].resolves.as_ref().map(|resolves| {
+            assert_eq!(resolves.len(), 1, "multiple resolve attachments");
+            resolves[0].1
+        })
+    }
     fn delete_render_pass(&mut self, render_pass: RenderPass) {
         let pass_id = render_pass.0;
 
@@ -1590,17 +1603,8 @@ impl RenderingBackend for GlContext {
 
         unsafe { glDeleteFramebuffers(1, &render_pass.gl_fb as *const _) }
 
-        for color_texture in &render_pass.color_textures {
-            self.delete_texture(*color_texture);
-        }
         if let Some(resolves) = render_pass.resolves {
-            for (fb, texture) in resolves {
-                unsafe { glDeleteFramebuffers(1, &fb as *const _) }
-                self.delete_texture(texture);
-            }
-        }
-        if let Some(depth_texture) = render_pass.depth_texture {
-            self.delete_texture(depth_texture);
+            for (fb, _) in resolves { unsafe { glDeleteFramebuffers(1, &fb); } }
         }
     }
 

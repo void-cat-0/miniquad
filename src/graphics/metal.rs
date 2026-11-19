@@ -223,6 +223,7 @@ struct RenderPassInternal {
     render_pass_desc: ObjcId,
     texture: Vec<TextureId>,
     _depth_texture: Option<TextureId>,
+    resolve_textures: Option<Vec<TextureId>>,
 }
 
 #[derive(Clone, Debug)]
@@ -570,6 +571,7 @@ impl RenderingBackend for MetalContext {
                 render_pass_desc,
                 texture: color_img.to_vec(),
                 _depth_texture: depth_img,
+                resolve_textures: resolve_img.map(|textures| textures.to_vec()),
             };
 
             self.passes.push(pass);
@@ -578,6 +580,12 @@ impl RenderingBackend for MetalContext {
         }
     }
 
+    fn render_pass_resolve_texture(&self, pass: RenderPass) -> Option<TextureId> {
+        self.passes[pass.0].resolve_textures.as_ref().map(|textures| {
+            assert_eq!(textures.len(), 1, "multiple resolve attachments");
+            textures[0]
+        })
+    }
     fn delete_render_pass(&mut self, render_pass: RenderPass) {
         let render_pass = &self.passes[render_pass.0];
         unsafe {

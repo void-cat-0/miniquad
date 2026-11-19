@@ -127,11 +127,11 @@ impl Stage {
         let default_shader = ctx
             .new_shader(
                 match ctx.info().backend {
-                    Backend::OpenGl => ShaderSource::Glsl {
+                    Backend::Metal => unimplemented!(),
+                    _ => ShaderSource::Glsl {
                         vertex: post_processing_shader::VERTEX,
                         fragment: post_processing_shader::FRAGMENT,
                     },
-                    Backend::Metal => unimplemented!(),
                 },
                 post_processing_shader::meta(),
             )
