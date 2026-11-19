@@ -93,7 +93,7 @@ impl From<TextureFormat> for (GLenum, GLenum, GLenum) {
         match format {
             TextureFormat::RGB8 => (GL_RGB, GL_RGB, GL_UNSIGNED_BYTE),
             TextureFormat::RGBA8 => (GL_RGBA, GL_RGBA, GL_UNSIGNED_BYTE),
-            TextureFormat::RGBA16F => (GL_RGBA16F, GL_RGBA, GL_FLOAT),
+            TextureFormat::RGBA16F => (GL_RGBA16F, GL_RGBA, GL_HALF_FLOAT),
             TextureFormat::Depth => (GL_DEPTH_COMPONENT, GL_DEPTH_COMPONENT, GL_UNSIGNED_SHORT),
             TextureFormat::Depth32 => (GL_DEPTH_COMPONENT, GL_DEPTH_COMPONENT, GL_FLOAT),
             #[cfg(target_arch = "wasm32")]
@@ -409,6 +409,10 @@ impl Texture {
 
     /// Read texture data into CPU memory
     pub fn read_pixels(&self, bytes: &mut [u8]) {
+        assert!(
+            bytes.len() >= self.size(self.params.width, self.params.height),
+            "texture_read_pixels destination is too small"
+        );
         let raw = self
             .raw
             .texture()
@@ -419,12 +423,19 @@ impl Texture {
         let mut fbo = 0;
         unsafe {
             let mut binded_fbo: i32 = 0;
+            let mut pack_alignment: i32 = 0;
             glGetIntegerv(gl::GL_DRAW_FRAMEBUFFER_BINDING, &mut binded_fbo);
+            glGetIntegerv(gl::GL_PACK_ALIGNMENT, &mut pack_alignment);
+            glPixelStorei(gl::GL_PACK_ALIGNMENT, 1);
             glGenFramebuffers(1, &mut fbo);
             glBindFramebuffer(gl::GL_FRAMEBUFFER, fbo);
             glFramebufferTexture2D(
                 gl::GL_FRAMEBUFFER,
-                gl::GL_COLOR_ATTACHMENT0,
+                if matches!(self.params.format, TextureFormat::Depth | TextureFormat::Depth32) {
+                    gl::GL_DEPTH_ATTACHMENT
+                } else {
+                    gl::GL_COLOR_ATTACHMENT0
+                },
                 gl::GL_TEXTURE_2D,
                 raw,
                 0,
@@ -441,13 +452,17 @@ impl Texture {
             );
 
             glBindFramebuffer(gl::GL_FRAMEBUFFER, binded_fbo as _);
+            glPixelStorei(gl::GL_PACK_ALIGNMENT, pack_alignment);
             glDeleteFramebuffers(1, &fbo);
         }
     }
 
     #[inline]
     fn size(&self, width: u32, height: u32) -> usize {
-        self.params.format.size(width, height) as usize
+        (width as usize)
+            .checked_mul(height as usize)
+            .and_then(|pixels| pixels.checked_mul(self.params.format.size(1, 1) as usize))
+            .expect("texture byte size exceeds address space")
     }
 
     fn gl_filter(filter: FilterMode, mipmap_filter: MipmapFilterMode) -> GLenum {
@@ -496,7 +511,7 @@ pub(crate) struct RenderPassInternal {
     depth_texture: Option<TextureId>,
 }
 
-struct Textures(Vec<Texture>);
+struct Textures(ResourceManager<Texture>);
 impl Textures {
     fn get(&self, texture: TextureId) -> Texture {
         match texture.0 {
@@ -506,6 +521,11 @@ impl Textures {
             },
             #[cfg(target_vendor = "apple")]
             TextureIdInner::Raw(RawId::Metal(..)) => panic!("Metal texture in OpenGL context!"),
+            #[cfg(all(
+                feature = "vulkan",
+                any(windows, all(target_os = "linux", not(target_env = "ohos")))
+            ))]
+            TextureIdInner::Raw(RawId::Vulkan(_)) => panic!("Vulkan image passed to OpenGL"),
             TextureIdInner::Managed(texture) => self.0[texture],
         }
     }
@@ -546,7 +566,7 @@ impl GlContext {
                 pipelines: ResourceManager::default(),
                 passes: ResourceManager::default(),
                 buffers: ResourceManager::default(),
-                textures: Textures(vec![]),
+                textures: Textures(ResourceManager::default()),
                 info,
                 cache: GlCache {
                     stored_index_buffer: 0,
@@ -906,12 +926,11 @@ impl RenderingBackend for GlContext {
         params: TextureParams,
     ) -> TextureId {
         let texture = Texture::new(self, access, source, params);
-        self.textures.0.push(texture);
-        TextureId(TextureIdInner::Managed(self.textures.0.len() - 1))
+        TextureId(TextureIdInner::Managed(self.textures.0.add(texture)))
     }
 
     fn delete_texture(&mut self, texture: TextureId) {
-        //self.cache.clear_texture_bindings();
+        self.cache.clear_texture_bindings();
 
         let t = self.textures.get(texture);
         match &t.raw {
@@ -921,6 +940,9 @@ impl RenderingBackend for GlContext {
             TextureOrRenderbuffer::Renderbuffer(raw) => unsafe {
                 glDeleteRenderbuffers(1, raw as *const _);
             },
+        }
+        if let TextureIdInner::Managed(id) = texture.0 {
+            self.textures.0.remove(id);
         }
     }
 
@@ -1159,6 +1181,12 @@ impl RenderingBackend for GlContext {
     fn render_pass_color_attachments(&self, render_pass: RenderPass) -> &[TextureId] {
         &self.passes[render_pass.0].color_textures
     }
+    fn render_pass_resolve_texture(&self, pass: RenderPass) -> Option<TextureId> {
+        self.passes[pass.0].resolves.as_ref().map(|resolves| {
+            assert_eq!(resolves.len(), 1, "multiple resolve attachments");
+            resolves[0].1
+        })
+    }
     fn delete_render_pass(&mut self, render_pass: RenderPass) {
         let pass_id = render_pass.0;
 
@@ -1166,17 +1194,8 @@ impl RenderingBackend for GlContext {
 
         unsafe { glDeleteFramebuffers(1, &render_pass.gl_fb as *const _) }
 
-        for color_texture in &render_pass.color_textures {
-            self.delete_texture(*color_texture);
-        }
         if let Some(resolves) = render_pass.resolves {
-            for (fb, texture) in resolves {
-                unsafe { glDeleteFramebuffers(1, &fb as *const _) }
-                self.delete_texture(texture);
-            }
-        }
-        if let Some(depth_texture) = render_pass.depth_texture {
-            self.delete_texture(depth_texture);
+            for (fb, _) in resolves { unsafe { glDeleteFramebuffers(1, &fb); } }
         }
     }
 

@@ -136,12 +136,12 @@ impl Stage {
         };
 
         let source = match ctx.info().backend {
-            Backend::OpenGl => ShaderSource::Glsl {
-                vertex: display_shader::VERTEX,
-                fragment: display_shader::FRAGMENT,
-            },
             Backend::Metal => ShaderSource::Msl {
                 program: display_shader::METAL,
+            },
+            _ => ShaderSource::Glsl {
+                vertex: display_shader::VERTEX,
+                fragment: display_shader::FRAGMENT,
             },
         };
         let default_shader = ctx.new_shader(source, display_shader::meta()).unwrap();
@@ -162,12 +162,12 @@ impl Stage {
         );
 
         let source = match ctx.info().backend {
-            Backend::OpenGl => ShaderSource::Glsl {
-                vertex: offscreen_shader::VERTEX,
-                fragment: offscreen_shader::FRAGMENT,
-            },
             Backend::Metal => ShaderSource::Msl {
                 program: offscreen_shader::METAL,
+            },
+            _ => ShaderSource::Glsl {
+                vertex: offscreen_shader::VERTEX,
+                fragment: offscreen_shader::FRAGMENT,
             },
         };
         let offscreen_shader = ctx.new_shader(source, offscreen_shader::meta()).unwrap();

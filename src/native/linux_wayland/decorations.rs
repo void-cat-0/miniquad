@@ -197,14 +197,11 @@ unsafe extern "C" fn handle_configure(data: *mut std::ffi::c_void, width: i32, h
     let payload: &mut WaylandPayload = &mut *(data as *mut _);
 
     if width != 0 && height != 0 {
-        let mut d = crate::native_display().lock().unwrap();
+        let d = crate::native_display().lock().unwrap();
         // Currently non-integer scales are not supported
         let dpi_scale = d.dpi_scale as i32;
         let screen_width = width * dpi_scale;
         let screen_height = height * dpi_scale;
-        // screen_width / screen_height are the actual numbers of pixels
-        d.screen_width = screen_width;
-        d.screen_height = screen_height;
         drop(d);
 
         let mut window_width = screen_width;
@@ -215,7 +212,22 @@ unsafe extern "C" fn handle_configure(data: *mut std::ffi::c_void, width: i32, h
                 (fallback::Decorations::BAR_HEIGHT + fallback::Decorations::WIDTH) * dpi_scale;
             fallback.resize(&mut payload.client, width, height);
         }
-        (payload.egl.wl_egl_window_resize)(payload.egl_window, window_width, window_height, 0, 0);
+        let (screen_width, screen_height) = {
+            let mut d = crate::native_display().lock().unwrap();
+            // Fallback decoration subsurfaces are included in xdg window
+            // geometry. Vulkan renders into the content surface alone.
+            let size = if d.rendering_backend == crate::conf::RenderingBackend::Vulkan {
+                (window_width.max(dpi_scale), window_height.max(dpi_scale))
+            } else {
+                (screen_width, screen_height)
+            };
+            d.screen_width = size.0;
+            d.screen_height = size.1;
+            size
+        };
+        if let Some(egl) = &payload.egl {
+            (egl.wl_egl_window_resize)(payload.egl_window, window_width, window_height, 0, 0);
+        }
         // We need to ensure that the buffer has been correctly resized before setting the
         // dpi_scale, since Wayland would rather crash than letting you have a width that's an
         // odd number on a display with 2x dpi...

@@ -1,7 +1,10 @@
 use std::{ffi::OsString, os::windows::ffi::OsStringExt, path::PathBuf, time::SystemTime};
 
 use crate::{
-    CursorIcon, EventHandler, TouchPhase, conf::{Conf, Icon}, event::{KeyMods, MouseButton}, native::{NativeDisplayData, Request}
+    conf::{Conf, Icon},
+    event::{KeyMods, MouseButton},
+    native::{NativeDisplayData, Request},
+    CursorIcon, EventHandler, TouchPhase,
 };
 
 use winapi::{
@@ -12,7 +15,7 @@ use winapi::{
         windef::{HBRUSH, HCURSOR, HDC, HICON, HWND, POINT, RECT},
     },
     um::{
-        imm::{HIMC, ImmGetContext, ImmReleaseContext},
+        imm::{ImmGetContext, ImmReleaseContext, HIMC},
         libloaderapi::{GetModuleHandleW, GetProcAddress},
         shellapi::{DragAcceptFiles, DragQueryFileW, HDROP},
         shellscalingapi::*,
@@ -82,7 +85,12 @@ struct CANDIDATEFORM {
 // Link to imm32.dll for IME support
 #[link(name = "imm32")]
 extern "system" {
-    fn ImmGetCompositionStringW(himc: HIMC, index: DWORD, buf: *mut std::ffi::c_void, len: DWORD) -> i32;
+    fn ImmGetCompositionStringW(
+        himc: HIMC,
+        index: DWORD,
+        buf: *mut std::ffi::c_void,
+        len: DWORD,
+    ) -> i32;
     fn ImmAssociateContextEx(hwnd: HWND, himc: HIMC, flags: DWORD) -> i32;
     fn ImmAssociateContext(hwnd: HWND, himc: HIMC) -> HIMC;
     fn ImmCreateContext() -> HIMC;
@@ -165,7 +173,10 @@ impl WindowsDisplay {
             let cand_form = CANDIDATEFORM {
                 dwIndex: 0,
                 dwStyle: CFS_CANDIDATEPOS,
-                ptCurrentPos: POINT { x: x, y: y + CANDIDATE_WINDOW_Y_OFFSET },
+                ptCurrentPos: POINT {
+                    x: x,
+                    y: y + CANDIDATE_WINDOW_Y_OFFSET,
+                },
                 rcArea: std::mem::zeroed(),
             };
             ImmSetCandidateWindow(himc, &cand_form);
@@ -374,7 +385,7 @@ unsafe fn convert_to_absolute(hwnd: HWND, x: i32, y: i32) -> (f32, f32) {
     (x as f32, y as f32)
 }
 
-fn get_uptime() -> f64 {
+pub fn get_uptime() -> f64 {
     let start = SystemTime::UNIX_EPOCH;
     let now = SystemTime::now();
     let duration = now.duration_since(start).expect("Time went backwards");
@@ -422,7 +433,9 @@ unsafe extern "system" fn win32_wndproc(
         return DefWindowProcW(hwnd, umsg, wparam, lparam);
     }
     let payload = &mut *(display_ptr as *mut WindowsDisplay);
-    let event_handler = payload.event_handler.as_mut().unwrap();
+    let Some(event_handler) = payload.event_handler.as_mut() else {
+        return DefWindowProcW(hwnd, umsg, wparam, lparam);
+    };
 
     match umsg {
         WM_CLOSE => {
@@ -489,8 +502,11 @@ unsafe extern "system" fn win32_wndproc(
                 } else {
                     let mut info: POINTER_INFO = std::mem::zeroed();
                     if GetPointerInfo(pointer_id, &mut info) != 0 {
-                        let (x, y) =
-                            convert_to_absolute(hwnd, info.ptPixelLocationRaw.x, info.ptPixelLocationRaw.y);
+                        let (x, y) = convert_to_absolute(
+                            hwnd,
+                            info.ptPixelLocationRaw.x,
+                            info.ptPixelLocationRaw.y,
+                        );
                         event_handler.mouse_enter_event(
                             MouseButton::Unknown,
                             x * payload.mouse_scale,
@@ -702,7 +718,12 @@ unsafe extern "system" fn win32_wndproc(
                     if compstr_len > 0 {
                         let cursor_pos_len = ImmGetCompositionStringW(himc, GCS_CURSORPOS, std::ptr::null_mut(), 0);
                         let mut buffer: Vec<u16> = vec![0; (compstr_len as usize / 2) + 1];
-                        ImmGetCompositionStringW(himc, GCS_COMPSTR, buffer.as_mut_ptr() as *mut _, compstr_len as u32);
+                        ImmGetCompositionStringW(
+                            himc,
+                            GCS_COMPSTR,
+                            buffer.as_mut_ptr() as *mut _,
+                            compstr_len as u32,
+                        );
                         let char_count = compstr_len as usize / 2;
                         let preedit_str = String::from_utf16_lossy(&buffer[..char_count]);
                         
@@ -717,7 +738,12 @@ unsafe extern "system" fn win32_wndproc(
                     let len = ImmGetCompositionStringW(himc, GCS_RESULTSTR, std::ptr::null_mut(), 0);
                     if len > 0 {
                         let mut buffer: Vec<u16> = vec![0; (len as usize / 2) + 1];
-                        ImmGetCompositionStringW(himc, GCS_RESULTSTR, buffer.as_mut_ptr() as *mut _, len as u32);
+                        ImmGetCompositionStringW(
+                            himc,
+                            GCS_RESULTSTR,
+                            buffer.as_mut_ptr() as *mut _,
+                            len as u32,
+                        );
                         let char_count = len as usize / 2;
                         let result_str = String::from_utf16_lossy(&buffer[..char_count]);
                         event_handler.on_ime_commit(Some(&result_str));
@@ -762,7 +788,12 @@ unsafe extern "system" fn win32_wndproc(
                 let comp_form = COMPOSITIONFORM {
                     dwStyle: CFS_POINT,
                     ptCurrentPos: pt,
-                    rcArea: RECT { left: 0, top: 0, right: 0, bottom: 0 },
+                    rcArea: RECT {
+                        left: 0,
+                        top: 0,
+                        right: 0,
+                        bottom: 0,
+                    },
                 };
                 ImmSetCompositionWindow(himc, &comp_form);
                 
@@ -770,8 +801,16 @@ unsafe extern "system" fn win32_wndproc(
                 let cand_form = CANDIDATEFORM {
                     dwIndex: 0,
                     dwStyle: CFS_CANDIDATEPOS,
-                    ptCurrentPos: POINT { x: pt.x, y: pt.y + CANDIDATE_WINDOW_Y_OFFSET },
-                    rcArea: RECT { left: 0, top: 0, right: 0, bottom: 0 },
+                    ptCurrentPos: POINT {
+                        x: pt.x,
+                        y: pt.y + CANDIDATE_WINDOW_Y_OFFSET,
+                    },
+                    rcArea: RECT {
+                        left: 0,
+                        top: 0,
+                        right: 0,
+                        bottom: 0,
+                    },
                 };
                 ImmSetCandidateWindow(himc, &cand_form);
                 
@@ -849,7 +888,11 @@ unsafe extern "system" fn win32_wndproc(
                 payload.event_handler.as_mut().unwrap().update();
                 payload.event_handler.as_mut().unwrap().draw();
 
-                SwapBuffers(payload.dc);
+                if crate::native_display().lock().unwrap().rendering_backend
+                    != crate::conf::RenderingBackend::Vulkan
+                {
+                    SwapBuffers(payload.dc);
+                }
             }
         }
         WM_EXITSIZEMOVE | WM_EXITMENULOOP => {
@@ -1328,14 +1371,28 @@ where
 
         display.update_dimensions(wnd);
 
-        let mut wgl = wgl::Wgl::new(&mut display);
-        let gl_ctx = wgl.create_context(
-            &mut display,
-            conf.sample_count,
-            conf.platform.swap_interval.unwrap_or(1),
-        );
-
-        super::gl::load_gl_funcs(|proc| display.get_proc_address(proc));
+        let vulkan = conf.platform.rendering_backend == crate::conf::RenderingBackend::Vulkan;
+        let gl_ctx = if vulkan {
+            None
+        } else {
+            let mut wgl = wgl::Wgl::new(&mut display);
+            let context = wgl.create_context(
+                &mut display,
+                conf.sample_count,
+                conf.platform.swap_interval.unwrap_or(1),
+            );
+            super::gl::load_gl_funcs(|proc| display.get_proc_address(proc));
+            Some(context)
+        };
+        #[cfg(feature = "vulkan")]
+        if vulkan {
+            let mut d = crate::native_display().lock().unwrap();
+            d.rendering_backend = crate::conf::RenderingBackend::Vulkan;
+            d.vulkan_window = Some(super::vulkan::VulkanWindow::Win32 {
+                hwnd: wnd as usize,
+                hinstance: GetModuleHandleW(NULL as _) as usize,
+            });
+        }
 
         // IMPORTANT: Show window AFTER WGL context is created
         // This ensures IME initializes correctly when window gains focus
@@ -1379,7 +1436,11 @@ where
                 }
             };
             let mut msg: MSG = std::mem::zeroed();
-            let block_on_wait = conf.platform.blocking_event_loop && !display.update_requested;
+            // A minimized Vulkan surface may not return a swapchain image.
+            // Keep processing messages until restore instead of blocking the
+            // window thread inside acquisition/presentation.
+            let block_on_wait = (vulkan && display.iconified)
+                || (conf.platform.blocking_event_loop && !display.update_requested);
             if block_on_wait {
                 GetMessageW(&mut msg as *mut _ as _, NULL as _, 0, 0);
                 dispatch_message(msg);
@@ -1400,19 +1461,26 @@ where
                     .unwrap()
                     .resize_event(width, height);
             }
-            if !conf.platform.blocking_event_loop || display.update_requested {
+            if (!vulkan || !display.iconified)
+                && (!conf.platform.blocking_event_loop || display.update_requested)
+            {
                 display.update_requested = false;
                 display.event_handler.as_mut().unwrap().update();
                 display.event_handler.as_mut().unwrap().draw();
 
-                SwapBuffers(display.dc);
+                if !vulkan {
+                    SwapBuffers(display.dc);
+                }
             }
             if crate::native_display().lock().unwrap().quit_requested {
                 PostMessageW(display.wnd, WM_CLOSE, 0, 0);
             }
         }
 
-        (display.libopengl32.wglDeleteContext)(gl_ctx);
+        display.event_handler.take();
+        if let Some(gl_ctx) = gl_ctx {
+            (display.libopengl32.wglDeleteContext)(gl_ctx);
+        }
         DestroyWindow(wnd);
     }
 }

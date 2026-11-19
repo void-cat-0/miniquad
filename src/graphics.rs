@@ -8,6 +8,17 @@ use std::{error::Error, fmt::Display};
 
 mod gl;
 
+#[cfg(all(
+    feature = "vulkan",
+    any(windows, all(target_os = "linux", not(target_env = "ohos")))
+))]
+pub mod vulkan;
+#[cfg(all(
+    feature = "vulkan",
+    any(windows, all(target_os = "linux", not(target_env = "ohos")))
+))]
+pub use vulkan::VulkanBackend;
+
 pub use gl::raw_gl;
 
 #[cfg(target_vendor = "apple")]
@@ -1047,6 +1058,11 @@ pub enum ShaderSource<'a> {
 #[derive(Debug, Clone, Copy, PartialEq, Hash, Eq)]
 pub enum RawId {
     OpenGl(crate::native::gl::GLuint),
+    #[cfg(all(
+        feature = "vulkan",
+        any(windows, all(target_os = "linux", not(target_env = "ohos")))
+    ))]
+    Vulkan(u64),
     #[cfg(target_vendor = "apple")]
     Metal(*mut objc::runtime::Object),
 }
@@ -1067,6 +1083,11 @@ pub struct GlslSupport {
 pub enum Backend {
     Metal,
     OpenGl,
+    #[cfg(all(
+        feature = "vulkan",
+        any(windows, all(target_os = "linux", not(target_env = "ohos")))
+    ))]
+    Vulkan,
 }
 
 #[derive(Clone, Debug)]
@@ -1090,6 +1111,11 @@ impl ContextInfo {
     pub fn has_integer_attributes(&self) -> bool {
         match self.backend {
             Backend::Metal => true,
+            #[cfg(all(
+                feature = "vulkan",
+                any(windows, all(target_os = "linux", not(target_env = "ohos")))
+            ))]
+            Backend::Vulkan => true,
             Backend::OpenGl => {
                 self.glsl_support.v150 | self.glsl_support.v300es | self.glsl_support.v330
             }
@@ -1098,8 +1124,16 @@ impl ContextInfo {
 }
 
 pub trait RenderingBackend {
+    #[cfg(all(
+        feature = "vulkan",
+        any(windows, all(target_os = "linux", not(target_env = "ohos")))
+    ))]
+    fn vulkan_context(&mut self) -> Option<&mut vulkan::VulkanContext> {
+        None
+    }
+
     fn info(&self) -> ContextInfo;
-    /// For metal context's ShaderSource should contain MSL source string, for GL - glsl.
+    /// Metal uses MSL sources; OpenGL and Vulkan use GLSL sources.
     ///
     /// If in doubt, _most_ OpenGL contexts support "#version 100" glsl shaders.
     /// So far miniquad never encountered where it can create a rendering context,
@@ -1108,12 +1142,12 @@ pub trait RenderingBackend {
     /// Typical `new_shader` invocation for an MSL and `glsl version 100` sources:
     /// ```ignore
     /// let source = match ctx.info().backend {
-    ///    Backend::OpenGl => ShaderSource::Glsl {
-    ///        vertex: display_shader::VERTEX,
-    ///        fragment: display_shader::FRAGMENT,
-    ///    },
     ///    Backend::Metal => ShaderSource::Msl {
     ///        program: display_shader::METAL
+    ///    },
+    ///    _ => ShaderSource::Glsl {
+    ///        vertex: display_shader::VERTEX,
+    ///        fragment: display_shader::FRAGMENT,
     ///    },
     /// };
     /// let shader = ctx.new_shader(source, display_shader::meta()).unwrap();
@@ -1169,7 +1203,7 @@ pub trait RenderingBackend {
         (params.width, params.height)
     }
 
-    /// Get OpenGL's GLuint texture ID or metals ObjcId
+    /// Get the native OpenGL texture ID, Metal object or Vulkan image handle.
     unsafe fn texture_raw_id(&self, texture: TextureId) -> RawId;
 
     /// Update whole texture content
@@ -1187,6 +1221,12 @@ pub trait RenderingBackend {
         self.texture_set_min_filter(texture, filter, mipmap_filter);
         self.texture_set_mag_filter(texture, filter);
     }
+    /// Copy the current window framebuffer into a texture. Backends with
+    /// explicit swapchain images override this instead of issuing GL calls.
+    fn texture_grab_screen(&mut self, _texture: TextureId) {
+        panic!("Framebuffer capture is unsupported by this backend");
+    }
+
     fn texture_set_min_filter(
         &mut self,
         texture: TextureId,
@@ -1248,6 +1288,9 @@ pub trait RenderingBackend {
     }
     /// For depth-only render pass returns empty slice.
     fn render_pass_color_attachments(&self, render_pass: RenderPass) -> &[TextureId];
+    /// Single-color MSAA resolve texture, suitable for sampling after the pass ends.
+    fn render_pass_resolve_texture(&self, _render_pass: RenderPass) -> Option<TextureId> { None }
+    /// Delete the pass only. Attachment textures remain owned by the caller.
     fn delete_render_pass(&mut self, render_pass: RenderPass);
     fn new_pipeline(
         &mut self,
