@@ -234,9 +234,6 @@ impl RenderingBackend for VulkanBackend {
         self.wrap_y
             .resize(self.wrap_y.len().max(index + 1), TextureWrap::Clamp);
         self.wrap_y[index] = params.wrap;
-        if params.sample_count <= 1 {
-            self.update_sampler(index);
-        }
         TextureId(TextureIdInner::Managed(index))
     }
 
@@ -249,6 +246,19 @@ impl RenderingBackend for VulkanBackend {
                 .borrow()
                 .texture_image_raw(self.texture_index(texture)),
         )
+    }
+    fn texture_set_filter(
+        &mut self,
+        texture: TextureId,
+        filter: FilterMode,
+        mipmap: MipmapFilterMode,
+    ) {
+        let index = self.texture_index(texture);
+        let params = self.textures[index].as_mut().unwrap();
+        params.min_filter = filter;
+        params.mag_filter = filter;
+        params.mipmap_filter = mipmap;
+        self.update_sampler(index);
     }
     fn texture_set_min_filter(
         &mut self,
@@ -297,11 +307,12 @@ impl RenderingBackend for VulkanBackend {
         }
         params.width = width;
         params.height = height;
-        let sample_count = params.sample_count;
-        self.context.get_mut().resize_texture(index, *params, bytes);
-        if sample_count == 1 {
-            self.update_sampler(index);
-        }
+        self.context.get_mut().resize_texture_with_wrap_y(
+            index,
+            *params,
+            bytes,
+            self.wrap_y[index],
+        );
     }
     fn texture_grab_screen(&mut self, texture: TextureId) {
         let index = self.texture_index(texture);

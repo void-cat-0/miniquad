@@ -66,7 +66,9 @@ pub struct TextureModule {
     pub layout: vk::ImageLayout,
     pub mip_levels: u32,
     pub filter: FilterMode,
+    pub mag_filter: FilterMode,
     pub wrap: TextureWrap,
+    pub wrap_y: TextureWrap,
     pub mipmap_filter: MipmapFilterMode,
     pub access: TextureAccess,
 }
@@ -92,7 +94,9 @@ pub(crate) fn empty_texture_module() -> TextureModule {
         layout: vk::ImageLayout::UNDEFINED,
         mip_levels: 1,
         filter: FilterMode::Linear,
+        mag_filter: FilterMode::Linear,
         wrap: TextureWrap::Clamp,
+        wrap_y: TextureWrap::Clamp,
         mipmap_filter: MipmapFilterMode::None,
         access: TextureAccess::Static,
     }
@@ -161,25 +165,31 @@ impl VulkanContext {
         wrap_y: TextureWrap,
         mipmap_filter: MipmapFilterMode,
     ) {
+        let module = &self.textures[index];
+        if module.filter == min_filter
+            && module.mag_filter == mag_filter
+            && module.wrap == wrap_x
+            && module.wrap_y == wrap_y
+            && module.mipmap_filter == mipmap_filter
+        {
+            return;
+        }
+
         self.synchronize_resources();
+        let sampler = create_sampler_with_params(
+            &self.device,
+            min_filter,
+            mag_filter,
+            wrap_x,
+            wrap_y,
+            mipmap_filter,
+        );
         let module = &mut self.textures[index];
-        let (mode, max_lod) = match mipmap_filter {
-            MipmapFilterMode::None => (vk::SamplerMipmapMode::NEAREST, 0.0),
-            MipmapFilterMode::Nearest => (vk::SamplerMipmapMode::NEAREST, vk::LOD_CLAMP_NONE),
-            MipmapFilterMode::Linear => (vk::SamplerMipmapMode::LINEAR, vk::LOD_CLAMP_NONE),
-        };
-        let info = vk::SamplerCreateInfo::builder()
-            .min_filter(vk_sampler_filter(min_filter))
-            .mag_filter(vk_sampler_filter(mag_filter))
-            .mipmap_mode(mode)
-            .max_lod(max_lod)
-            .address_mode_u(vk_sampler_wrap(wrap_x))
-            .address_mode_v(vk_sampler_wrap(wrap_y))
-            .address_mode_w(vk_sampler_wrap(wrap_x));
-        let sampler = unsafe { self.device.create_sampler(&info, None).unwrap() };
         let old = std::mem::replace(&mut module.sampler, sampler);
         module.filter = min_filter;
+        module.mag_filter = mag_filter;
         module.wrap = wrap_x;
+        module.wrap_y = wrap_y;
         module.mipmap_filter = mipmap_filter;
         for image in self.pending.images.iter_mut().flatten() {
             if image.sampler == old {
@@ -949,6 +959,16 @@ impl VulkanContext {
         params: TextureParams,
         access: TextureAccess,
     ) -> usize {
+        self.new_texture_with_wrap_y(bytes, params, access, params.wrap)
+    }
+
+    fn new_texture_with_wrap_y(
+        &mut self,
+        bytes: Option<&[u8]>,
+        params: TextureParams,
+        access: TextureAccess,
+        wrap_y: TextureWrap,
+    ) -> usize {
         unsafe {
             let format = vk_texture_format(params.format, access);
             let depth =
@@ -1013,10 +1033,12 @@ impl VulkanContext {
             } else {
                 None
             };
-            let sampler = create_sampler(
+            let sampler = create_sampler_with_params(
                 &self.device,
                 params.min_filter,
+                params.mag_filter,
                 params.wrap,
+                wrap_y,
                 params.mipmap_filter,
             );
             allocation.sampler = sampler;
@@ -1033,7 +1055,9 @@ impl VulkanContext {
                 layout: vk::ImageLayout::UNDEFINED,
                 mip_levels,
                 filter: params.min_filter,
+                mag_filter: params.mag_filter,
                 wrap: params.wrap,
+                wrap_y,
                 mipmap_filter: params.mipmap_filter,
                 access,
             };
@@ -1135,44 +1159,45 @@ impl VulkanContext {
     }
 
     pub fn set_texture_filter(&mut self, index: usize, filter: FilterMode) {
-        if self.textures[index].filter == filter {
-            return;
-        }
-        let wrap = self.textures[index].wrap;
-        self.replace_texture_sampler(index, filter, wrap);
+        let module = &self.textures[index];
+        self.set_sampler_params(
+            index,
+            filter,
+            filter,
+            module.wrap,
+            module.wrap_y,
+            module.mipmap_filter,
+        );
     }
 
     pub fn set_texture_wrap(&mut self, index: usize, wrap: TextureWrap) {
-        if self.textures[index].wrap == wrap {
-            return;
-        }
-        let filter = self.textures[index].filter;
-        self.replace_texture_sampler(index, filter, wrap);
-    }
-
-    fn replace_texture_sampler(&mut self, index: usize, filter: FilterMode, wrap: TextureWrap) {
-        self.synchronize_resources();
-        let module = &mut self.textures[index];
-        let sampler = create_sampler(&self.device, filter, wrap, module.mipmap_filter);
-        let old_sampler = std::mem::replace(&mut module.sampler, sampler);
-        module.filter = filter;
-        module.wrap = wrap;
-        if old_sampler != vk::Sampler::null() {
-            for info in self.pending.images.iter_mut().flatten() {
-                if info.sampler == old_sampler {
-                    info.sampler = sampler;
-                }
-            }
-            unsafe { self.device.destroy_sampler(old_sampler, None) };
-        }
+        let module = &self.textures[index];
+        self.set_sampler_params(
+            index,
+            module.filter,
+            module.mag_filter,
+            wrap,
+            wrap,
+            module.mipmap_filter,
+        );
     }
 
     pub fn resize_texture(&mut self, index: usize, params: TextureParams, bytes: Option<&[u8]>) {
+        self.resize_texture_with_wrap_y(index, params, bytes, params.wrap);
+    }
+
+    pub(crate) fn resize_texture_with_wrap_y(
+        &mut self,
+        index: usize,
+        params: TextureParams,
+        bytes: Option<&[u8]>,
+        wrap_y: TextureWrap,
+    ) {
         self.synchronize_resources();
         let fresh = if params.sample_count > 1 {
             self.new_multisample_texture(params, params.sample_count as u32)
         } else {
-            self.new_texture(bytes, params, self.textures[index].access)
+            self.new_texture_with_wrap_y(bytes, params, self.textures[index].access, wrap_y)
         };
         let previous = &self.textures[index];
         let replacement = &self.textures[fresh];
@@ -1763,7 +1788,9 @@ impl VulkanContext {
                 layout: vk::ImageLayout::UNDEFINED,
                 mip_levels: 1,
                 filter: params.min_filter,
+                mag_filter: params.mag_filter,
                 wrap: params.wrap,
+                wrap_y: params.wrap,
                 mipmap_filter: MipmapFilterMode::None,
                 access: TextureAccess::RenderTarget,
             };
@@ -2304,20 +2331,30 @@ pub fn create_sampler(
     wrap: TextureWrap,
     mipmap_filter: MipmapFilterMode,
 ) -> vk::Sampler {
+    create_sampler_with_params(device, filter, filter, wrap, wrap, mipmap_filter)
+}
+
+fn create_sampler_with_params(
+    device: &Device,
+    min_filter: FilterMode,
+    mag_filter: FilterMode,
+    wrap_x: TextureWrap,
+    wrap_y: TextureWrap,
+    mipmap_filter: MipmapFilterMode,
+) -> vk::Sampler {
     unsafe {
-        let base = vk_sampler_filter(filter);
         let (mipmap_mode, max_lod) = match mipmap_filter {
             MipmapFilterMode::None => (vk::SamplerMipmapMode::NEAREST, 0.0),
             MipmapFilterMode::Nearest => (vk::SamplerMipmapMode::NEAREST, vk::LOD_CLAMP_NONE),
             MipmapFilterMode::Linear => (vk::SamplerMipmapMode::LINEAR, vk::LOD_CLAMP_NONE),
         };
         let create_info = vk::SamplerCreateInfo {
-            mag_filter: base,
-            min_filter: base,
+            mag_filter: vk_sampler_filter(mag_filter),
+            min_filter: vk_sampler_filter(min_filter),
             mipmap_mode,
-            address_mode_u: vk_sampler_wrap(wrap),
-            address_mode_v: vk_sampler_wrap(wrap),
-            address_mode_w: vk_sampler_wrap(wrap),
+            address_mode_u: vk_sampler_wrap(wrap_x),
+            address_mode_v: vk_sampler_wrap(wrap_y),
+            address_mode_w: vk_sampler_wrap(wrap_x),
             mip_lod_bias: 0.0,
             anisotropy_enable: 0,
             max_anisotropy: 0.0,
