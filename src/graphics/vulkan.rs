@@ -2,7 +2,7 @@ use std::ffi::CStr;
 use std::os::raw::c_char;
 
 use ash::extensions::ext::DebugUtils;
-use ash::extensions::khr::{Surface, Swapchain};
+use ash::extensions::khr::{DynamicRendering as KhrDynamicRendering, Surface, Swapchain};
 use ash::vk::Handle;
 use ash::{vk, Device, Entry, Instance};
 use raw_window_handle_vulkan::{RawDisplayHandle, RawWindowHandle};
@@ -94,6 +94,32 @@ pub struct StreamArena {
     pub retired: Vec<(vk::Buffer, vk::DeviceMemory)>,
 }
 
+pub(crate) enum DynamicRenderingMode {
+    Core,
+    Khr(KhrDynamicRendering),
+}
+
+impl DynamicRenderingMode {
+    pub(crate) unsafe fn begin(
+        &self,
+        device: &Device,
+        command: vk::CommandBuffer,
+        info: &vk::RenderingInfo,
+    ) {
+        match self {
+            Self::Core => device.cmd_begin_rendering(command, info),
+            Self::Khr(extension) => extension.cmd_begin_rendering(command, info),
+        }
+    }
+
+    pub(crate) unsafe fn end(&self, device: &Device, command: vk::CommandBuffer) {
+        match self {
+            Self::Core => device.cmd_end_rendering(command),
+            Self::Khr(extension) => extension.cmd_end_rendering(command),
+        }
+    }
+}
+
 pub struct VulkanContext {
     pub entry: Entry,
     pub instance: Instance,
@@ -122,6 +148,7 @@ pub struct VulkanContext {
     pub command_pool: vk::CommandPool,
     pub command_buffers: Vec<vk::CommandBuffer>,
     pub(crate) recorder: recording::CommandRecorder,
+    pub(crate) dynamic_rendering: DynamicRenderingMode,
     /// Only this worker accesses the graphics queue between a frame handoff
     /// and `drain_submissions`. Synchronous resource operations drain first.
     submission: Option<submission::SubmissionWorker>,
@@ -304,10 +331,17 @@ impl VulkanContext {
                 .application_version(0)
                 .engine_name(app_name)
                 .engine_version(0)
-                // Dynamic rendering (`vkCmdBeginRendering`) is what lets a
-                // single pipeline run against the swap chain, plain offscreen
-                // targets and multisampled targets alike.
-                .api_version(vk::make_api_version(0, 1, 3, 0));
+                // Request the newest instance API available to the loader, capped
+                // at 1.3. Device-level Vulkan 1.2 implementations can use the
+                // promoted dynamic-rendering extension below.
+                .api_version(
+                    entry
+                        .try_enumerate_instance_version()
+                        .ok()
+                        .flatten()
+                        .unwrap_or(vk::API_VERSION_1_0)
+                        .min(vk::API_VERSION_1_3),
+                );
 
             let create_info = vk::InstanceCreateInfo::builder()
                 .application_info(&app_info)
@@ -377,6 +411,7 @@ impl VulkanContext {
                 })
                 .expect("No Vulkan device with graphics and presentation support was found");
 
+            let properties = instance.get_physical_device_properties(physical_device);
             let available_extensions = instance
                 .enumerate_device_extension_properties(physical_device)
                 .expect("Failed to enumerate device extensions");
@@ -385,6 +420,19 @@ impl VulkanContext {
                     CStr::from_ptr(extension.extension_name.as_ptr()).to_bytes() == name.as_bytes()
                 })
             };
+            let dynamic_rendering_extension = has_extension(
+                KhrDynamicRendering::name()
+                    .to_str()
+                    .expect("valid extension name"),
+            );
+            let supports_vulkan_1_3 = vk::api_version_major(properties.api_version) > 1
+                || (vk::api_version_major(properties.api_version) == 1
+                    && vk::api_version_minor(properties.api_version) >= 3);
+            let use_khr_dynamic_rendering = !supports_vulkan_1_3 && dynamic_rendering_extension;
+            assert!(
+                supports_vulkan_1_3 || use_khr_dynamic_rendering,
+                "Vulkan 1.2 devices require VK_KHR_dynamic_rendering",
+            );
             let video_queue_supported = has_extension("VK_KHR_video_queue")
                 && has_extension("VK_KHR_video_encode_queue")
                 && has_extension("VK_KHR_video_encode_h264");
@@ -402,6 +450,9 @@ impl VulkanContext {
             };
 
             let mut device_extension_names = vec![Swapchain::name().as_ptr()];
+            if use_khr_dynamic_rendering {
+                device_extension_names.push(KhrDynamicRendering::name().as_ptr());
+            }
             if video_queue_supported {
                 device_extension_names.push(cstr(b"VK_KHR_video_queue\0").as_ptr());
                 device_extension_names.push(cstr(b"VK_KHR_video_encode_queue\0").as_ptr());
@@ -413,7 +464,10 @@ impl VulkanContext {
                     ..Default::default()
                 })
                 .build();
-            let mut dynamic_rendering = vk::PhysicalDeviceVulkan13Features::builder()
+            let mut dynamic_rendering_13 = vk::PhysicalDeviceVulkan13Features::builder()
+                .dynamic_rendering(true)
+                .build();
+            let mut dynamic_rendering_khr = vk::PhysicalDeviceDynamicRenderingFeatures::builder()
                 .dynamic_rendering(true)
                 .build();
             let priorities = [1.0f32];
@@ -434,19 +488,27 @@ impl VulkanContext {
             let device_create_info = vk::DeviceCreateInfo::builder()
                 .queue_create_infos(&queue_infos)
                 .enabled_extension_names(&device_extension_names)
-                .push_next(&mut features)
-                .push_next(&mut dynamic_rendering);
+                .push_next(&mut features);
+            let device_create_info = if use_khr_dynamic_rendering {
+                device_create_info.push_next(&mut dynamic_rendering_khr)
+            } else {
+                device_create_info.push_next(&mut dynamic_rendering_13)
+            };
 
             let device: Device = instance
                 .create_device(physical_device, &device_create_info, None)
                 .expect("Failed to create the Vulkan logical device");
 
+            let dynamic_rendering = if use_khr_dynamic_rendering {
+                DynamicRenderingMode::Khr(KhrDynamicRendering::new(&instance, &device))
+            } else {
+                DynamicRenderingMode::Core
+            };
             let graphics_queue = device.get_device_queue(queue_family_index, 0);
             let video_queue = video_queue_family
                 .map(|family| device.get_device_queue(family, 0))
                 .unwrap_or(vk::Queue::null());
             let memory_properties = instance.get_physical_device_memory_properties(physical_device);
-            let properties = instance.get_physical_device_properties(physical_device);
             let max_texture_size = properties.limits.max_image_dimension2_d;
             let uniform_alignment = properties.limits.min_uniform_buffer_offset_alignment;
             let color_sample_counts = properties.limits.framebuffer_color_sample_counts;
@@ -511,6 +573,7 @@ impl VulkanContext {
                 command_pool,
                 command_buffers: Vec::new(),
                 recorder,
+                dynamic_rendering,
                 submission,
                 presentation_needs_recreate: false,
 

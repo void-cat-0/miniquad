@@ -1308,6 +1308,14 @@ impl RenderingBackend for GlContext {
         self.info.clone()
     }
 
+    fn max_texture_size(&self) -> Option<u32> {
+        unsafe {
+            let mut size = 0;
+            glGetIntegerv(GL_MAX_TEXTURE_SIZE, &mut size);
+            (size > 0).then_some(size as u32)
+        }
+    }
+
     fn new_shader(
         &mut self,
         shader: ShaderSource,
@@ -1315,7 +1323,16 @@ impl RenderingBackend for GlContext {
     ) -> Result<ShaderId, ShaderError> {
         let (fragment, vertex) = match shader {
             ShaderSource::Glsl { fragment, vertex } => (fragment, vertex),
-            _ => panic!("Metal source on OpenGl context"),
+            #[cfg(all(
+                feature = "vulkan",
+                any(windows, all(target_os = "linux", not(target_env = "ohos")))
+            ))]
+            ShaderSource::SpirV(_) => {
+                return Err(ShaderError::LinkError(
+                    "SPIR-V sources require the Vulkan backend".into(),
+                ));
+            }
+            ShaderSource::Msl { .. } => panic!("Metal source on OpenGl context"),
         };
         let shader = load_shader_internal(vertex, fragment, meta)?;
         Ok(ShaderId(self.shaders.add(shader)))

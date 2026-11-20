@@ -1039,7 +1039,8 @@ impl VulkanContext {
             );
         } else {
             unsafe {
-                self.device.cmd_begin_rendering(
+                self.dynamic_rendering.begin(
+                    &self.device,
                     self.command_buffers[self.acquired_image.unwrap()],
                     &rendering_info,
                 );
@@ -1073,8 +1074,10 @@ impl VulkanContext {
             self.recorder.end();
         } else {
             unsafe {
-                self.device
-                    .cmd_end_rendering(self.command_buffers[self.acquired_image.unwrap()]);
+                self.dynamic_rendering.end(
+                    &self.device,
+                    self.command_buffers[self.acquired_image.unwrap()],
+                );
             }
         }
         self.pass_open = false;
@@ -1095,6 +1098,7 @@ impl VulkanContext {
             }
             self.recorder.execute(
                 &self.device,
+                &self.dynamic_rendering,
                 self.command_buffers[self.acquired_image.unwrap()],
                 self.current_frame,
             );

@@ -126,6 +126,19 @@ impl VulkanBackend {
     }
 }
 
+// Called after validating bounds and extents. Widen before forming right and
+// bottom edges so even i32-sized inputs cannot overflow.
+fn regions_overlap(regions: &[TextureUpdateRegion<'_>]) -> bool {
+    regions.iter().enumerate().any(|(i, a)| {
+        let (x, y) = (a.x as u32, a.y as u32);
+        let (right, bottom) = (x + a.width as u32, y + a.height as u32);
+        regions[..i].iter().any(|b| {
+            let (bx, by) = (b.x as u32, b.y as u32);
+            x < bx + b.width as u32 && bx < right && y < by + b.height as u32 && by < bottom
+        })
+    })
+}
+
 impl RenderingBackend for VulkanBackend {
     fn vulkan_context(&mut self) -> Option<&mut VulkanContext> {
         Some(self.context.get_mut())
@@ -147,6 +160,10 @@ impl RenderingBackend for VulkanBackend {
         }
     }
 
+    fn max_texture_size(&self) -> Option<u32> {
+        Some(self.context.borrow().max_texture_size)
+    }
+
     fn new_shader(
         &mut self,
         source: ShaderSource,
@@ -156,8 +173,14 @@ impl RenderingBackend for VulkanBackend {
             ShaderSource::Glsl { vertex, fragment } => {
                 self.context.get_mut().new_shader(vertex, fragment, meta)
             }
+            ShaderSource::SpirV(shader) => self.context.get_mut().new_shader_spirv(
+                shader.vertex,
+                shader.fragment,
+                meta,
+                shader.uniform_arrays,
+            ),
             ShaderSource::Msl { .. } => Err(ShaderError::LinkError(
-                "Vulkan requires GLSL shader sources".into(),
+                "Vulkan requires GLSL or SPIR-V shader sources".into(),
             )),
         }
     }
@@ -339,6 +362,47 @@ impl RenderingBackend for VulkanBackend {
             bytes,
             params.format,
         );
+    }
+    fn texture_update_regions(&mut self, texture: TextureId, regions: &[TextureUpdateRegion<'_>]) {
+        if regions.is_empty() {
+            return;
+        }
+        let index = self.texture_index(texture);
+        let params = self.textures[index].unwrap();
+        if regions.len() > 1
+            && params.format == TextureFormat::RGBA8
+            && params.kind == TextureKind::Texture2D
+            && params.sample_count <= 1
+        {
+            for region in regions {
+                assert!(region.x >= 0 && region.y >= 0 && region.width > 0 && region.height > 0);
+                assert!(
+                    region.x as u32 + region.width as u32 <= params.width
+                        && region.y as u32 + region.height as u32 <= params.height
+                );
+                let len = (region.width as usize)
+                    .checked_mul(region.height as usize)
+                    .and_then(|pixels| pixels.checked_mul(4))
+                    .expect("Texture update dimensions overflow");
+                assert_eq!(region.bytes.len(), len);
+            }
+            // Regions in one copy have no ordering. Keep the sequential path
+            // whenever two destination rectangles share pixels.
+            if !regions_overlap(regions) {
+                self.context.get_mut().upload_rgba8_regions(index, regions);
+                return;
+            }
+        }
+        for region in regions {
+            self.texture_update_part(
+                texture,
+                region.x,
+                region.y,
+                region.width,
+                region.height,
+                region.bytes,
+            );
+        }
     }
     fn delete_texture(&mut self, texture: TextureId) {
         let index = self.texture_index(texture);

@@ -2,7 +2,7 @@ use ash::{vk, Device};
 use rayon::prelude::*;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
-use super::{IMAGE_BINDING_BASE, MAX_FRAMES_IN_FLIGHT, UNIFORM_BINDING};
+use super::{DynamicRenderingMode, IMAGE_BINDING_BASE, MAX_FRAMES_IN_FLIGHT, UNIFORM_BINDING};
 use crate::graphics::MAX_SHADERSTAGE_IMAGES;
 
 pub(crate) struct RecordedDraw {
@@ -610,7 +610,13 @@ impl CommandRecorder {
         self.batch_count += 1;
     }
 
-    pub fn execute(&mut self, device: &Device, primary: vk::CommandBuffer, slot: usize) {
+    pub fn execute(
+        &mut self,
+        device: &Device,
+        dynamic_rendering: &DynamicRenderingMode,
+        primary: vk::CommandBuffer,
+        slot: usize,
+    ) {
         #[cfg(feature = "tracy")]
         let _span = crate::tracy::span_with_callstack(crate::tracy::span_location!(
             "Vulkan::record_execute"
@@ -731,9 +737,9 @@ impl CommandRecorder {
                         } else {
                             info
                         };
-                        device.cmd_begin_rendering(primary, &info);
+                        dynamic_rendering.begin(device, primary, &info);
                     }
-                    PrimaryCommand::End => device.cmd_end_rendering(primary),
+                    PrimaryCommand::End => dynamic_rendering.end(device, primary),
                     PrimaryCommand::Barrier { src, dst, image } => device.cmd_pipeline_barrier(
                         primary,
                         src,

@@ -333,8 +333,47 @@ impl VulkanContext {
     ) -> Result<ShaderId, ShaderError> {
         let (vertex, fragment, arrays) =
             super::shader::compile_glsl_with_layout(vertex_source, fragment_source, &meta)?;
-        let (uniform_offsets, uniforms_size) = std140_layout_with_arrays(&meta.uniforms, &arrays);
-        let float_vertex_locations = vertex_float_locations(&vertex);
+        self.new_shader_words(&vertex, &fragment, meta, &arrays)
+    }
+
+    pub(super) fn new_shader_spirv(
+        &mut self,
+        vertex: &[u8],
+        fragment: &[u8],
+        meta: ShaderMeta,
+        uniform_arrays: &[&str],
+    ) -> Result<ShaderId, ShaderError> {
+        fn decode(bytes: &[u8], stage: ShaderType) -> Result<Vec<u32>, ShaderError> {
+            let invalid = |error_message| ShaderError::CompilationError {
+                shader_type: stage,
+                error_message,
+            };
+            let words = ash::util::read_spv(&mut std::io::Cursor::new(bytes))
+                .map_err(|error| invalid(format!("Invalid precompiled SPIR-V: {error}")))?;
+            if words.len() < 5 {
+                return Err(invalid("Truncated SPIR-V header".into()));
+            }
+            Ok(words)
+        }
+
+        let vertex = decode(vertex, ShaderType::Vertex)?;
+        let fragment = decode(fragment, ShaderType::Fragment)?;
+        let arrays = uniform_arrays
+            .iter()
+            .map(|name| (*name).to_owned())
+            .collect::<HashSet<_>>();
+        self.new_shader_words(&vertex, &fragment, meta, &arrays)
+    }
+
+    fn new_shader_words(
+        &mut self,
+        vertex: &[u32],
+        fragment: &[u32],
+        meta: ShaderMeta,
+        arrays: &HashSet<String>,
+    ) -> Result<ShaderId, ShaderError> {
+        let (uniform_offsets, uniforms_size) = std140_layout_with_arrays(&meta.uniforms, arrays);
+        let float_vertex_locations = vertex_float_locations(vertex);
 
         unsafe {
             let vertex = self
@@ -1499,63 +1538,97 @@ impl VulkanContext {
         } else {
             bytes
         };
-        unsafe {
-            let image = self.textures[index].image;
-            let from_layout = self.textures[index].layout;
-            let aspect_mask = if is_depth_format(self.textures[index].format) {
-                vk::ImageAspectFlags::DEPTH
-            } else {
-                vk::ImageAspectFlags::COLOR
-            };
-            let final_layout = if is_depth_format(self.textures[index].format) {
-                vk::ImageLayout::DEPTH_STENCIL_ATTACHMENT_OPTIMAL
-            } else {
-                vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL
-            };
+        let aspect = if is_depth_format(self.textures[index].format) {
+            vk::ImageAspectFlags::DEPTH
+        } else {
+            vk::ImageAspectFlags::COLOR
+        };
+        let region = texture_upload_copy(x_offset, y_offset, width, height, aspect, 0);
+        self.submit_texture_upload(
+            index,
+            aspect,
+            bytes.len(),
+            &[region],
+            std::iter::once(bytes),
+        );
+    }
 
-            let (staging, staging_memory) = self.create_buffer(
-                bytes.len() as vk::DeviceSize,
+    pub(super) fn upload_rgba8_regions(
+        &mut self,
+        index: usize,
+        regions: &[TextureUpdateRegion<'_>],
+    ) {
+        debug_assert_eq!(self.textures[index].format, vk::Format::R8G8B8A8_UNORM);
+        let aspect = vk::ImageAspectFlags::COLOR;
+        let mut size = 0usize;
+        let mut copies = Vec::with_capacity(regions.len());
+        for region in regions {
+            // Each validated RGBA8 slice is a whole number of four-byte texels.
+            copies.push(texture_upload_copy(
+                region.x,
+                region.y,
+                region.width,
+                region.height,
+                aspect,
+                size,
+            ));
+            size = size
+                .checked_add(region.bytes.len())
+                .expect("Texture staging size overflow");
+        }
+        self.submit_texture_upload(
+            index,
+            aspect,
+            size,
+            &copies,
+            regions.iter().map(|r| r.bytes),
+        );
+    }
+
+    fn submit_texture_upload<'a>(
+        &mut self,
+        index: usize,
+        aspect: vk::ImageAspectFlags,
+        size: usize,
+        copies: &[vk::BufferImageCopy],
+        sources: impl ExactSizeIterator<Item = &'a [u8]>,
+    ) {
+        debug_assert_eq!(copies.len(), sources.len());
+        let image = self.textures[index].image;
+        let from_layout = self.textures[index].layout;
+        let final_layout = if aspect == vk::ImageAspectFlags::DEPTH {
+            vk::ImageLayout::DEPTH_STENCIL_ATTACHMENT_OPTIMAL
+        } else {
+            vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL
+        };
+        unsafe {
+            let (staging, memory) = self.create_buffer(
+                size as vk::DeviceSize,
                 vk::BufferUsageFlags::TRANSFER_SRC,
                 vk::MemoryPropertyFlags::HOST_VISIBLE | vk::MemoryPropertyFlags::HOST_COHERENT,
             );
-            let allocation = ResourceAllocation::buffer(&self.device, staging, staging_memory);
+            let allocation = ResourceAllocation::buffer(&self.device, staging, memory);
             let mapped = self
                 .device
                 .map_memory(
-                    staging_memory,
+                    memory,
                     0,
-                    bytes.len() as vk::DeviceSize,
+                    size as vk::DeviceSize,
                     vk::MemoryMapFlags::empty(),
                 )
-                .expect("Failed to map the staging buffer");
-            ptr::copy_nonoverlapping(bytes.as_ptr(), mapped as *mut u8, bytes.len());
-            self.device.unmap_memory(staging_memory);
-
-            let region = vk::BufferImageCopy {
-                image_subresource: vk::ImageSubresourceLayers {
-                    aspect_mask,
-                    mip_level: 0,
-                    base_array_layer: 0,
-                    layer_count: 1,
-                },
-                image_offset: vk::Offset3D {
-                    x: x_offset,
-                    y: y_offset,
-                    z: 0,
-                },
-                image_extent: vk::Extent3D {
-                    width: width as u32,
-                    height: height as u32,
-                    depth: 1,
-                },
-                ..Default::default()
-            };
-
+                .expect("Failed to map the staging buffer")
+                .cast::<u8>();
+            for (copy, bytes) in copies.iter().zip(sources) {
+                let offset = copy.buffer_offset as usize;
+                debug_assert!(offset <= size && bytes.len() <= size - offset);
+                ptr::copy_nonoverlapping(bytes.as_ptr(), mapped.add(offset), bytes.len());
+            }
+            self.device.unmap_memory(memory);
             self.record_submit(|ctx, cmd| {
                 ctx.barrier(
                     cmd,
                     image,
-                    aspect_mask,
+                    aspect,
                     from_layout,
                     vk::ImageLayout::TRANSFER_DST_OPTIMAL,
                 );
@@ -1564,20 +1637,19 @@ impl VulkanContext {
                     staging,
                     image,
                     vk::ImageLayout::TRANSFER_DST_OPTIMAL,
-                    &[region],
+                    copies,
                 );
                 ctx.barrier(
                     cmd,
                     image,
-                    aspect_mask,
+                    aspect,
                     vk::ImageLayout::TRANSFER_DST_OPTIMAL,
                     final_layout,
                 );
             });
-
             drop(allocation);
-            self.textures[index].layout = final_layout;
         }
+        self.textures[index].layout = final_layout;
     }
 
     /// Record an image layout transition into `cmd`.
@@ -1978,6 +2050,31 @@ fn std140_layout_with_arrays(
 // ---------------------------------------------------------------------
 // State translation
 // ---------------------------------------------------------------------
+
+fn texture_upload_copy(
+    x: i32,
+    y: i32,
+    width: i32,
+    height: i32,
+    aspect_mask: vk::ImageAspectFlags,
+    byte_offset: usize,
+) -> vk::BufferImageCopy {
+    vk::BufferImageCopy {
+        buffer_offset: byte_offset as vk::DeviceSize,
+        image_subresource: vk::ImageSubresourceLayers {
+            aspect_mask,
+            layer_count: 1,
+            ..Default::default()
+        },
+        image_offset: vk::Offset3D { x, y, z: 0 },
+        image_extent: vk::Extent3D {
+            width: width as u32,
+            height: height as u32,
+            depth: 1,
+        },
+        ..Default::default()
+    }
+}
 
 pub(crate) fn is_depth_format(format: vk::Format) -> bool {
     matches!(format, vk::Format::D16_UNORM | vk::Format::D32_SFLOAT)

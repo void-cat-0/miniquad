@@ -122,7 +122,8 @@ pub enum WaylandDecorations {
 pub enum RenderingBackend {
     #[default]
     OpenGl,
-    /// Requires the `vulkan` feature and a Vulkan 1.3 capable driver.
+    /// Requires the `vulkan` feature and either Vulkan 1.3 or Vulkan 1.2
+    /// with `VK_KHR_dynamic_rendering`.
     Vulkan,
 }
 

@@ -355,6 +355,16 @@ impl TextureFormat {
     }
 }
 
+/// One tightly packed rectangle update for [`RenderingBackend::texture_update_regions`].
+#[derive(Clone, Copy, Debug)]
+pub struct TextureUpdateRegion<'a> {
+    pub x: i32,
+    pub y: i32,
+    pub width: i32,
+    pub height: i32,
+    pub bytes: &'a [u8],
+}
+
 /// Sets the wrap parameter for texture.
 #[derive(Debug, PartialEq, Eq, Clone, Copy)]
 pub enum TextureWrap {
@@ -1055,7 +1065,76 @@ impl<'a> UniformsSource<'a> {
 #[derive(Debug)]
 pub enum ShaderSource<'a> {
     Glsl { vertex: &'a str, fragment: &'a str },
+    /// Precompiled Vulkan SPIR-V binaries, encoded as little-endian bytes.
+    ///
+    /// Both stages must have a `main` entry point. The shader must match
+    /// `ShaderMeta`: the std140 uniform block is at set 0, binding 0, and
+    /// combined image samplers occupy subsequent bindings in image order.
+    /// Vertex inputs use the pipeline's attribute locations.
+    ///
+    /// List uniforms declared as arrays of length one in `uniform_arrays`.
+    /// Longer arrays are already identified by their counts in `ShaderMeta`.
+    /// `uses_screen_texture` is a hint for Macroquad's material loader to
+    /// capture the screen before drawing a material that samples `_ScreenTexture`.
+    /// Construct this variant with the unsafe [`ShaderSource::spirv`] helper.
+    #[cfg(all(
+        feature = "vulkan",
+        any(windows, all(target_os = "linux", not(target_env = "ohos")))
+    ))]
+    SpirV(SpirVShader<'a>),
     Msl { program: &'a str },
+}
+
+/// Precompiled SPIR-V supplied through [`ShaderSource::spirv`].
+#[cfg(all(
+    feature = "vulkan",
+    any(windows, all(target_os = "linux", not(target_env = "ohos")))
+))]
+#[derive(Debug)]
+pub struct SpirVShader<'a> {
+    vertex: &'a [u8],
+    fragment: &'a [u8],
+    uniform_arrays: &'a [&'a str],
+    uses_screen_texture: bool,
+}
+
+impl<'a> ShaderSource<'a> {
+    /// Whether this material requests Macroquad's screen capture binding.
+    #[doc(hidden)]
+    pub fn uses_screen_texture(&self) -> bool {
+        match self {
+            Self::Glsl { fragment, .. } => fragment.contains("_ScreenTexture"),
+            Self::Msl { program } => program.contains("_ScreenTexture"),
+            #[cfg(all(
+                feature = "vulkan",
+                any(windows, all(target_os = "linux", not(target_env = "ohos")))
+            ))]
+            Self::SpirV(shader) => shader.uses_screen_texture,
+        }
+    }
+
+    /// Construct a shader source from precompiled Vulkan SPIR-V.
+    ///
+    /// # Safety
+    /// Both modules must be valid for the Vulkan device that will load them and
+    /// satisfy the layout and entry point contract of [`Self::SpirV`].
+    #[cfg(all(
+        feature = "vulkan",
+        any(windows, all(target_os = "linux", not(target_env = "ohos")))
+    ))]
+    pub unsafe fn spirv(
+        vertex: &'a [u8],
+        fragment: &'a [u8],
+        uniform_arrays: &'a [&'a str],
+        uses_screen_texture: bool,
+    ) -> Self {
+        Self::SpirV(SpirVShader {
+            vertex,
+            fragment,
+            uniform_arrays,
+            uses_screen_texture,
+        })
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Hash, Eq)]
@@ -1136,7 +1215,16 @@ pub trait RenderingBackend {
     }
 
     fn info(&self) -> ContextInfo;
-    /// Metal uses MSL sources; OpenGL and Vulkan use GLSL sources.
+
+    /// Maximum supported 2D texture dimension when the backend exposes it.
+    ///
+    /// This keeps callers from reaching through the OpenGL bindings for a
+    /// capability that is also needed by explicit APIs such as Vulkan.
+    fn max_texture_size(&self) -> Option<u32> {
+        None
+    }
+
+    /// Metal uses MSL, OpenGL uses GLSL, and Vulkan accepts GLSL or SPIR-V.
     ///
     /// If in doubt, _most_ OpenGL contexts support "#version 100" glsl shaders.
     /// So far miniquad never encountered where it can create a rendering context,
@@ -1260,6 +1348,24 @@ pub trait RenderingBackend {
         height: i32,
         bytes: &[u8],
     );
+
+    /// Update multiple tightly packed regions of one texture in a batch.
+    ///
+    /// Each region uses the texture's format and covers part of its base level.
+    /// The default calls [`Self::texture_update_part`] in slice order. When
+    /// regions overlap, later regions take precedence. An empty slice is a no-op.
+    fn texture_update_regions(&mut self, texture: TextureId, regions: &[TextureUpdateRegion<'_>]) {
+        for region in regions {
+            self.texture_update_part(
+                texture,
+                region.x,
+                region.y,
+                region.width,
+                region.height,
+                region.bytes,
+            );
+        }
+    }
     fn new_render_pass(
         &mut self,
         color_img: TextureId,
