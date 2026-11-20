@@ -193,6 +193,9 @@ impl VulkanContext {
         }
         uniform.offset = 0;
         stream.offset = 0;
+        if let Some(arena) = &mut self.texture_upload_arenas[self.current_frame] {
+            arena.offset = 0;
+        }
     }
 
     fn restart_command_buffer(&self, command_buffer: vk::CommandBuffer) {
@@ -330,22 +333,33 @@ impl VulkanContext {
     /// presented.  The ring is what lets the exporter keep several frames in
     /// flight instead of blocking on a readback fence every frame.
     ///
-    /// Must be called once, before the first `begin_offscreen_frame`, while the
-    /// device is idle.
+    /// Must be called before the first `begin_offscreen_frame`. A partially
+    /// recorded window frame is submitted without presenting it.
     pub fn enable_offscreen_video(&mut self) {
         if self.offscreen {
             return;
         }
         self.drain_submissions();
+        // Finish any window commands (including queued texture uploads) before
+        // replacing the command-buffer ring. Do not present the partial frame.
+        self.flush_recording();
+        if self.frame_wait_pending {
+            self.wait_acquired_semaphore(self.frame_wait);
+        }
+        let prepared = self.submission.as_mut().and_then(|worker| {
+            worker
+                .wait_prepared()
+                .expect("Failed to drain image acquisition")
+                .0
+        });
+        if let Some(image) = prepared {
+            self.wait_acquired_semaphore(image.semaphore);
+        }
         // Exporters also use the public graphics queue for conversion and
         // readback. Offscreen mode returns its ownership to the caller.
         self.submission.take();
         let command_buffers = unsafe {
             self.device.device_wait_idle().unwrap();
-            if self.pass_open && self.acquired_image.is_some() {
-                self.close_pass();
-                self.flush_draw_commands();
-            }
             for command_buffer in &self.command_buffers {
                 let _ = self.device.reset_command_buffer(
                     *command_buffer,
@@ -379,6 +393,7 @@ impl VulkanContext {
         self.offscreen = true;
         self.current_frame = 0;
         self.acquired_image = None;
+        self.frame_wait_pending = false;
         self.frame_active = false;
         self.recording = false;
         self.pass_open = false;
@@ -867,6 +882,10 @@ impl VulkanContext {
         ) = match pass {
             None => {
                 self.transition_swapchain_image();
+                self.transition_pass_texture(
+                    self.default_depth.texture as usize,
+                    vk::ImageLayout::DEPTH_STENCIL_ATTACHMENT_OPTIMAL,
+                );
                 (
                     vec![self.swapchain_image_views[self.acquired_image.unwrap()]],
                     vec![vk::ImageView::null()],
@@ -1105,7 +1124,7 @@ impl VulkanContext {
         }
     }
 
-    fn pass_image_barrier(
+    pub(super) fn pass_image_barrier(
         &mut self,
         command: vk::CommandBuffer,
         src: vk::PipelineStageFlags,
@@ -1139,9 +1158,6 @@ impl VulkanContext {
         // Only the first pass of a frame may come from `UNDEFINED`; later passes
         // load what the earlier ones wrote, so their contents have to survive.
         let old_layout = self.swapchain_image_layouts[index];
-        if old_layout == vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL {
-            return;
-        }
         let command_buffer = self.command_buffers[index];
         let (src, dst, barrier) = image_barrier(
             image,
@@ -1316,7 +1332,16 @@ impl VulkanContext {
 
     fn transition_pass_texture(&mut self, index: usize, to: vk::ImageLayout) {
         let module = &self.textures[index];
-        if module.layout == to {
+        // Separate rendering instances still need a dependency from the
+        // previous attachment store/resolve to this one's load and writes,
+        // even when there is no layout transition.
+        if module.layout == to
+            && !matches!(
+                to,
+                vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL
+                    | vk::ImageLayout::DEPTH_STENCIL_ATTACHMENT_OPTIMAL
+            )
+        {
             return;
         }
         let aspect = if super::resource::is_depth_format(module.format) {

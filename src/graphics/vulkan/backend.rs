@@ -380,8 +380,7 @@ impl RenderingBackend for VulkanBackend {
         }
         let index = self.texture_index(texture);
         let params = self.textures[index].unwrap();
-        if regions.len() > 1
-            && params.format == TextureFormat::RGBA8
+        if params.format == TextureFormat::RGBA8
             && params.kind == TextureKind::Texture2D
             && params.sample_count <= 1
         {

@@ -1354,6 +1354,10 @@ pub trait RenderingBackend {
     /// Each region uses the texture's format and covers part of its base level.
     /// The default calls [`Self::texture_update_part`] in slice order. When
     /// regions overlap, later regions take precedence. An empty slice is a no-op.
+    /// A backend may record the upload for its next submission. Draws already
+    /// recorded observe the previous contents; later draws and backend readback
+    /// observe the update. Native interop must synchronize the rendering backend
+    /// before accessing a raw image outside this command stream.
     fn texture_update_regions(&mut self, texture: TextureId, regions: &[TextureUpdateRegion<'_>]) {
         for region in regions {
             self.texture_update_part(

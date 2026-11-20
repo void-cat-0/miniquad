@@ -94,6 +94,18 @@ pub struct StreamArena {
     pub retired: Vec<(vk::Buffer, vk::DeviceMemory)>,
 }
 
+/// Temporary pixels for ordered texture updates in one frame slot. Large or
+/// unusually upload-heavy frames use the synchronous path rather than keep
+/// growing this allocation.
+const TEXTURE_UPLOAD_ARENA_SIZE: vk::DeviceSize = 2 * 1024 * 1024;
+
+struct TextureUploadArena {
+    buffer: vk::Buffer,
+    memory: vk::DeviceMemory,
+    mapped: *mut u8,
+    offset: vk::DeviceSize,
+}
+
 pub(crate) enum DynamicRenderingMode {
     Core,
     Khr(KhrDynamicRendering),
@@ -212,6 +224,8 @@ pub struct VulkanContext {
     pub uniform_arenas: Vec<UniformArena>,
     /// One stream arena per frame slot for vertex and index buffer updates.
     pub stream_arenas: Vec<StreamArena>,
+    /// Allocated on the first deferred texture upload to each frame slot.
+    texture_upload_arenas: [Option<TextureUploadArena>; MAX_FRAMES_IN_FLIGHT],
 
     pub current_frame: usize,
     pub acquire_slot: usize,
@@ -614,6 +628,7 @@ impl VulkanContext {
                 descriptor_pools,
                 uniform_arenas: Vec::new(),
                 stream_arenas: Vec::new(),
+                texture_upload_arenas: std::array::from_fn(|_| None),
 
                 current_frame: 0,
                 acquire_slot: 0,
@@ -749,6 +764,15 @@ impl VulkanContext {
                     self.device.destroy_buffer(buffer, None);
                     self.device.free_memory(memory, None);
                 }
+            }
+            for arena in self
+                .texture_upload_arenas
+                .iter_mut()
+                .filter_map(Option::take)
+            {
+                self.device.unmap_memory(arena.memory);
+                self.device.destroy_buffer(arena.buffer, None);
+                self.device.free_memory(arena.memory, None);
             }
             if self.readback_buffer != vk::Buffer::null() {
                 self.device.unmap_memory(self.readback_memory);

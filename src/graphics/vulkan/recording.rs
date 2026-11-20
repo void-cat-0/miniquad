@@ -97,6 +97,11 @@ enum PrimaryCommand {
         dst: vk::PipelineStageFlags,
         image: vk::ImageMemoryBarrier,
     },
+    CopyBufferToImage {
+        buffer: vk::Buffer,
+        image: vk::Image,
+        regions: Vec<vk::BufferImageCopy>,
+    },
     Draw(usize),
 }
 
@@ -477,6 +482,7 @@ fn plan_rendering_contents(
                 batches[*id].contents = active.expect("Drawing outside a rendering scope");
             }
             PrimaryCommand::Barrier { .. } => {}
+            PrimaryCommand::CopyBufferToImage { .. } => debug_assert!(active.is_none()),
         }
     }
     active
@@ -583,6 +589,19 @@ impl CommandRecorder {
     ) {
         self.primary
             .push(PrimaryCommand::Barrier { src, dst, image });
+    }
+
+    pub(super) fn copy_buffer_to_image(
+        &mut self,
+        buffer: vk::Buffer,
+        image: vk::Image,
+        regions: Vec<vk::BufferImageCopy>,
+    ) {
+        self.primary.push(PrimaryCommand::CopyBufferToImage {
+            buffer,
+            image,
+            regions,
+        });
     }
 
     pub fn batch(&mut self, color: &[vk::Format], depth: Option<vk::Format>, samples: u32) {
@@ -749,6 +768,19 @@ impl CommandRecorder {
                         &[],
                         &[image],
                     ),
+                    PrimaryCommand::CopyBufferToImage {
+                        buffer,
+                        image,
+                        regions,
+                    } => {
+                        device.cmd_copy_buffer_to_image(
+                            primary,
+                            buffer,
+                            image,
+                            vk::ImageLayout::TRANSFER_DST_OPTIMAL,
+                            &regions,
+                        );
+                    }
                     PrimaryCommand::Draw(id) => {
                         let batch = &self.batches[id];
                         match batch.contents {

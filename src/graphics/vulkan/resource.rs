@@ -10,7 +10,8 @@ use crate::graphics::*;
 use super::backend::{IndexType, Texture};
 use super::cstr;
 use super::{
-    find_memory_type_index, VulkanContext, DEPTH_FORMAT, IMAGE_BINDING_BASE, UNIFORM_BINDING,
+    find_memory_type_index, TextureUploadArena, VulkanContext, DEPTH_FORMAT, IMAGE_BINDING_BASE,
+    TEXTURE_UPLOAD_ARENA_SIZE, UNIFORM_BINDING,
 };
 
 pub struct ShaderModule {
@@ -1488,6 +1489,22 @@ impl VulkanContext {
                 staging,
                 &[region],
             );
+            let host_read = vk::BufferMemoryBarrier::builder()
+                .src_access_mask(vk::AccessFlags::TRANSFER_WRITE)
+                .dst_access_mask(vk::AccessFlags::HOST_READ)
+                .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+                .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+                .buffer(staging)
+                .size(pixel_len as vk::DeviceSize);
+            self.device.cmd_pipeline_barrier(
+                cmd,
+                vk::PipelineStageFlags::TRANSFER,
+                vk::PipelineStageFlags::HOST,
+                vk::DependencyFlags::empty(),
+                &[],
+                &[*host_read],
+                &[],
+            );
             self.barrier(
                 cmd,
                 image,
@@ -1601,13 +1618,109 @@ impl VulkanContext {
                 .checked_add(region.bytes.len())
                 .expect("Texture staging size overflow");
         }
-        self.submit_texture_upload(
-            index,
-            aspect,
-            size,
-            &copies,
-            regions.iter().map(|r| r.bytes),
-        );
+        if let Some((staging, mapped, base)) = self.reserve_texture_upload(index, size) {
+            for (copy, region) in copies.iter_mut().zip(regions) {
+                copy.buffer_offset += base;
+                unsafe {
+                    ptr::copy_nonoverlapping(
+                        region.bytes.as_ptr(),
+                        mapped.add(copy.buffer_offset as usize),
+                        region.bytes.len(),
+                    );
+                }
+            }
+            self.record_frame_texture_upload(index, staging, copies);
+        } else {
+            self.submit_texture_upload(
+                index,
+                aspect,
+                size,
+                &copies,
+                regions.iter().map(|r| r.bytes),
+            );
+        }
+    }
+
+    fn reserve_texture_upload(
+        &mut self,
+        index: usize,
+        size: usize,
+    ) -> Option<(vk::Buffer, *mut u8, vk::DeviceSize)> {
+        let texture = &self.textures[index];
+        if !self.frame_active
+            || !self.recording
+            || self.frame_submitted
+            || self.pass_open
+            || self.offscreen
+            || texture.access != TextureAccess::Static
+            || texture.mip_levels != 1
+            || texture.layout != vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL
+            || size as vk::DeviceSize > TEXTURE_UPLOAD_ARENA_SIZE
+        {
+            return None;
+        }
+
+        let slot = self.current_frame;
+        if self.texture_upload_arenas[slot].is_none() {
+            let (buffer, memory, mapped) = self.create_mapped_buffer(
+                TEXTURE_UPLOAD_ARENA_SIZE,
+                vk::BufferUsageFlags::TRANSFER_SRC,
+            );
+            self.texture_upload_arenas[slot] = Some(TextureUploadArena {
+                buffer,
+                memory,
+                mapped,
+                offset: 0,
+            });
+        }
+        let arena = self.texture_upload_arenas[slot].as_mut().unwrap();
+        let base = arena.offset;
+        let end = base + size as vk::DeviceSize;
+        if end > TEXTURE_UPLOAD_ARENA_SIZE {
+            return None;
+        }
+        // This path stages whole RGBA8 texels; each region and batch consumes
+        // a multiple of four bytes, so every VkBufferImageCopy stays aligned.
+        debug_assert_eq!(end % 4, 0);
+        arena.offset = end;
+        Some((arena.buffer, arena.mapped, base))
+    }
+
+    fn record_frame_texture_upload(
+        &mut self,
+        index: usize,
+        staging: vk::Buffer,
+        copies: Vec<vk::BufferImageCopy>,
+    ) {
+        let image = self.textures[index].image;
+        let command = self.command_buffers[self.acquired_image.unwrap()];
+        let aspect = vk::ImageAspectFlags::COLOR;
+        let shader_read = vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL;
+        let transfer_dst = vk::ImageLayout::TRANSFER_DST_OPTIMAL;
+        let transfer = vk::PipelineStageFlags::TRANSFER;
+        let transfer_access = vk::AccessFlags::TRANSFER_READ | vk::AccessFlags::TRANSFER_WRITE;
+        let (src, dst, mut to_copy) = image_barrier(image, aspect, shader_read, transfer_dst);
+        // Also order consecutive uploads of the same texels, even if there
+        // was no intervening shader read.
+        to_copy.src_access_mask |= transfer_access;
+        self.pass_image_barrier(command, src | transfer, dst, to_copy);
+        if self.recorder.enabled() {
+            self.recorder.copy_buffer_to_image(staging, image, copies);
+        } else {
+            unsafe {
+                self.device.cmd_copy_buffer_to_image(
+                    command,
+                    staging,
+                    image,
+                    transfer_dst,
+                    &copies,
+                );
+            }
+        }
+        let (src, dst, mut to_sample) = image_barrier(image, aspect, transfer_dst, shader_read);
+        to_sample.dst_access_mask |= transfer_access;
+        self.pass_image_barrier(command, src, dst | transfer, to_sample);
+        self.cmd_dirty = true;
     }
 
     fn submit_texture_upload<'a>(
@@ -1989,12 +2102,13 @@ fn layout_scope(layout: vk::ImageLayout) -> (vk::PipelineStageFlags, vk::AccessF
         ),
         vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL => (
             vk::PipelineStageFlags::COLOR_ATTACHMENT_OUTPUT,
-            vk::AccessFlags::COLOR_ATTACHMENT_WRITE,
+            vk::AccessFlags::COLOR_ATTACHMENT_READ | vk::AccessFlags::COLOR_ATTACHMENT_WRITE,
         ),
         vk::ImageLayout::DEPTH_STENCIL_ATTACHMENT_OPTIMAL => (
             vk::PipelineStageFlags::EARLY_FRAGMENT_TESTS
                 | vk::PipelineStageFlags::LATE_FRAGMENT_TESTS,
-            vk::AccessFlags::DEPTH_STENCIL_ATTACHMENT_WRITE,
+            vk::AccessFlags::DEPTH_STENCIL_ATTACHMENT_READ
+                | vk::AccessFlags::DEPTH_STENCIL_ATTACHMENT_WRITE,
         ),
         vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL => (
             vk::PipelineStageFlags::VERTEX_SHADER | vk::PipelineStageFlags::FRAGMENT_SHADER,
