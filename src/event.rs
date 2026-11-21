@@ -171,6 +171,16 @@ pub trait EventHandler {
     /// Note that in this case drawing from update may lead to crashes.
     fn update(&mut self);
     fn draw(&mut self);
+
+    /// Expose the Vulkan device to the Android window loop. When selecting
+    /// Vulkan on Android, return the context of the same backend used for
+    /// drawing. Miniquad uses it between callbacks to manage the surface and
+    /// swapchain without rebuilding the application's GPU resources.
+    #[cfg(all(target_os = "android", feature = "vulkan"))]
+    fn android_vulkan_context(&mut self) -> Option<&mut crate::graphics::vulkan::VulkanContext> {
+        None
+    }
+
     fn resize_event(&mut self, _width: f32, _height: f32) {}
 
     /// When supported by the backend, called immediately before a callback with

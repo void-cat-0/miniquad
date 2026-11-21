@@ -9,11 +9,31 @@ use std::{convert::TryFrom, ptr};
 impl VulkanContext {
     pub(crate) fn grab_screen(&mut self, dst: usize) {
         assert!(!self.offscreen, "Window capture requires a swapchain frame");
-        if !self.frame_active {
-            self.begin_frame();
+        if !self.frame_active && !self.begin_frame() {
+            return;
+        }
+        let image_index = self.acquired_image.unwrap();
+        #[cfg(target_os = "android")]
+        {
+            let dst_blit = unsafe {
+                self.instance.get_physical_device_format_properties(
+                    self.physical_device,
+                    self.textures[dst].format,
+                )
+            }
+            .optimal_tiling_features
+            .contains(vk::FormatFeatureFlags::BLIT_DST);
+            assert!(
+                self.android_swapchain_can_capture && dst_blit,
+                "This Android swapchain does not support screen capture to that texture format"
+            );
+            if self.swapchain_image_layouts[image_index] == vk::ImageLayout::UNDEFINED {
+                // The acquired image has not had any window rendering yet.
+                // It has no defined pixels to copy or valid layout to restore.
+                return;
+            }
         }
         self.close_pass();
-        let image_index = self.acquired_image.unwrap();
         let src_image = self.swapchain_images[image_index];
         let src_layout = self.swapchain_image_layouts[image_index];
         let module = &self.textures[dst];
@@ -214,7 +234,13 @@ impl VulkanContext {
         }
     }
 
-    fn begin_frame(&mut self) {
+    fn begin_frame(&mut self) -> bool {
+        // The Android host pre-acquires before invoking application code.
+        // Other callbacks must not record to a detached window or try to
+        // acquire again partway through a draw callback.
+        if cfg!(target_os = "android") {
+            return false;
+        }
         #[cfg(feature = "tracy")]
         let _span =
             crate::tracy::span_with_callstack(crate::tracy::span_location!("Vulkan::begin_frame"));
@@ -255,7 +281,8 @@ impl VulkanContext {
                     if let Some(image) = prepared.take() {
                         self.wait_acquired_semaphore(image.semaphore);
                     }
-                    self.recreate_swapchain();
+                    self.recreate_swapchain()
+                        .expect("Failed to recreate the swapchain");
                 }
             }
 
@@ -286,7 +313,8 @@ impl VulkanContext {
                     // The swapchain no longer matches the surface; rebuild it
                     // and try again with the new one.
                     Err(vk::Result::ERROR_OUT_OF_DATE_KHR) => {
-                        self.recreate_swapchain();
+                        self.recreate_swapchain()
+                            .expect("Failed to recreate the swapchain");
                     }
                     // With the worker drained above, `VK_NOT_READY`/`VK_TIMEOUT`
                     // are not expected: the acquisition blocks until the
@@ -297,29 +325,155 @@ impl VulkanContext {
                 }
             };
 
-            // Reset only once an image was acquired and a submission will use
-            // this fence; the slot stays idle otherwise.
+            self.start_acquired_frame(image_index, slot, suboptimal);
+        }
+        true
+    }
+
+    fn start_acquired_frame(&mut self, image_index: u32, slot: usize, suboptimal: bool) {
+        // Reset only once an image was acquired and a submission will use
+        // this fence; the slot stays idle on a failed or skipped acquisition.
+        unsafe {
             self.device
-                .reset_fences(&[fence])
+                .reset_fences(&[self.in_flight[self.current_frame]])
                 .expect("Failed to reset the frame fence");
-            let image_index = image_index as usize;
-            self.swapchain_suboptimal = suboptimal;
+        }
+        let image_index = image_index as usize;
+        self.swapchain_suboptimal = suboptimal;
+        self.frame_wait = self.image_available[slot];
+        self.acquire_slot = (slot + 1) % self.image_available.len();
+        self.acquired_image = Some(image_index);
+        // The presentation engine owned the image until now, so whatever it
+        // holds is undefined.
+        self.swapchain_image_layouts[image_index] = vk::ImageLayout::UNDEFINED;
+        self.restart_command_buffer(self.command_buffers[image_index]);
 
-            self.frame_wait = self.image_available[slot];
-            self.acquire_slot = (slot + 1) % self.image_available.len();
-            self.acquired_image = Some(image_index);
-            // The presentation engine owned the image until now, so whatever it
-            // holds is undefined.
-            self.swapchain_image_layouts[image_index] = vk::ImageLayout::UNDEFINED;
+        self.frame_wait_pending = true;
+        self.recording = true;
+        self.frame_active = true;
+        self.cmd_dirty = false;
+        self.frame_submitted = false;
+        self.cur_pipeline = None;
+        self.cur_index_buffer = None;
+        self.cur_vertex_buffers.clear();
+        self.cur_target = None;
+        self.pending.clear();
+    }
 
-            self.restart_command_buffer(self.command_buffers[image_index]);
-
-            self.frame_wait_pending = true;
-            self.recording = true;
-            self.frame_active = true;
-            self.cmd_dirty = false;
+    /// Prepare the window frame before entering application callbacks. A
+    /// transient lack of a drawable image leaves the fence and frame inactive.
+    #[cfg(target_os = "android")]
+    pub(crate) fn prepare_android_frame(&mut self) -> Result<bool, vk::Result> {
+        if self.offscreen {
+            return Ok(true);
+        }
+        if self.android_surface_lost {
+            return Err(vk::Result::ERROR_SURFACE_LOST_KHR);
+        }
+        if self.surface == vk::SurfaceKHR::null()
+            || self.window_size.0 == 0
+            || self.window_size.1 == 0
+        {
+            return Ok(false);
+        }
+        if self.frame_active {
+            return Ok(true);
+        }
+        // The command buffers are indexed by image, not by frame slot. The
+        // acquired index can be returned before its semaphore is signalled,
+        // so ensure no old submission can still be using its command buffer.
+        for &fence in &self.in_flight {
+            if !unsafe { self.device.get_fence_status(fence)? } {
+                return Ok(false);
+            }
+        }
+        if self.presentation_needs_recreate || self.swapchain == vk::SwapchainKHR::null() {
+            match self.recreate_swapchain() {
+                Ok(()) => (),
+                Err(error) => return self.android_frame_not_ready(error),
+            }
+            if self.swapchain == vk::SwapchainKHR::null() {
+                return Ok(false);
+            }
         }
 
+        let slot = self.acquire_slot;
+        let image = unsafe {
+            self.swapchain_loader.acquire_next_image(
+                self.swapchain,
+                0, // Do not block Android's surface lifecycle messages.
+                self.image_available[slot],
+                vk::Fence::null(),
+            )
+        };
+        match image {
+            Ok((image_index, suboptimal)) => {
+                self.reset_frame_storage();
+                self.start_acquired_frame(image_index, slot, suboptimal);
+                Ok(true)
+            }
+            Err(error) => self.android_frame_not_ready(error),
+        }
+    }
+
+    #[cfg(target_os = "android")]
+    pub(crate) fn android_window_needs_attention(&self) -> bool {
+        !self.offscreen && (self.android_surface_lost || self.presentation_needs_recreate)
+    }
+
+    #[cfg(target_os = "android")]
+    fn android_frame_not_ready(&mut self, error: vk::Result) -> Result<bool, vk::Result> {
+        match error {
+            vk::Result::ERROR_OUT_OF_DATE_KHR => {
+                self.presentation_needs_recreate = true;
+                Ok(false)
+            }
+            vk::Result::NOT_READY | vk::Result::TIMEOUT => Ok(false),
+            vk::Result::ERROR_SURFACE_LOST_KHR => {
+                self.android_surface_lost = true;
+                Err(error)
+            }
+            _ => Err(error),
+        }
+    }
+
+    #[cfg(target_os = "android")]
+    pub(super) fn finish_android_window_frame(&mut self) {
+        if self.offscreen {
+            return;
+        }
+        if self.frame_active {
+            // Flush uploads and offscreen draws to keep their resource layouts
+            // valid, without trying to present to a disappearing window.
+            self.flush_recording();
+            let wait = [self.frame_wait];
+            let stages = [vk::PipelineStageFlags::ALL_COMMANDS];
+            let count = usize::from(self.frame_wait_pending);
+            let submit = vk::SubmitInfo::builder()
+                .wait_semaphores(&wait[..count])
+                .wait_dst_stage_mask(&stages[..count]);
+            // Consume an unused acquire semaphore and signal the slot fence
+            // that was reset at acquisition, even for an empty frame.
+            unsafe {
+                self.device
+                    .queue_submit(
+                        self.graphics_queue,
+                        &[submit.build()],
+                        self.in_flight[self.current_frame],
+                    )
+                    .expect("Failed to retire the Android window frame");
+            }
+        }
+        self.frame_wait = vk::Semaphore::null();
+        self.frame_wait_pending = false;
+        self.acquired_image = None;
+        self.recording = false;
+        self.pass_open = false;
+        self.frame_active = false;
+        self.frame_submitted = false;
+        self.cmd_dirty = false;
+        self.cur_pass = None;
+        self.cur_target = None;
         self.cur_pipeline = None;
         self.cur_index_buffer = None;
         self.cur_vertex_buffers.clear();
@@ -856,8 +1010,8 @@ impl VulkanContext {
             // would transition an image that is not ours.
             return;
         }
-        if !self.frame_active {
-            self.begin_frame();
+        if !self.frame_active && !self.begin_frame() {
+            return;
         }
         let target = pass.map(|pass| pass.0);
         // Reuse an open target when no clear is requested. end_render_pass
@@ -1272,6 +1426,9 @@ impl VulkanContext {
     }
 
     pub(crate) fn apply_bindings(&mut self, bindings: &backend::Bindings) {
+        if cfg!(target_os = "android") && !self.frame_active {
+            return;
+        }
         let pipeline = self
             .cur_pipeline
             .expect("apply_bindings without a bound pipeline");
@@ -1358,6 +1515,9 @@ impl VulkanContext {
     /// # Safety
     /// `uniform_ptr` must address `size` readable bytes in the bound shader's uniform layout.
     pub unsafe fn apply_uniforms_from_bytes(&mut self, uniform_ptr: *const u8, size: usize) {
+        if cfg!(target_os = "android") && !self.frame_active {
+            return;
+        }
         let pipeline = self
             .cur_pipeline
             .expect("apply_uniforms without a bound pipeline");
@@ -1445,7 +1605,10 @@ impl VulkanContext {
     }
 
     pub fn draw(&mut self, base_element: i32, num_elements: i32, num_instances: i32) {
-        if num_elements == 0 || num_instances == 0 {
+        if (cfg!(target_os = "android") && !self.frame_active)
+            || num_elements == 0
+            || num_instances == 0
+        {
             return;
         }
         assert!(base_element >= 0 && num_elements >= 0 && num_instances >= 0);
@@ -1671,16 +1834,23 @@ impl VulkanContext {
         if let Some(worker) = &mut self.submission {
             worker.submit(submission);
         } else {
-            self.presentation_needs_recreate |= submission
-                .execute(
-                    &self.device,
-                    &self.swapchain_loader,
-                    self.graphics_queue,
-                    |_| {},
-                )
-                .expect("Failed to submit or present the frame");
+            match submission.execute(
+                &self.device,
+                &self.swapchain_loader,
+                self.graphics_queue,
+                |_| {},
+            ) {
+                Ok(recreate) => self.presentation_needs_recreate |= recreate,
+                #[cfg(target_os = "android")]
+                Err(vk::Result::ERROR_SURFACE_LOST_KHR) => self.android_surface_lost = true,
+                Err(error) => panic!("Failed to submit or present the frame: {:?}", error),
+            }
         }
-        self.presentation_needs_recreate |= self.swapchain_suboptimal;
+        // Android's compositor handles rotation; IDENTITY can legitimately be
+        // suboptimal until the display rotates back, even after recreation.
+        if !cfg!(target_os = "android") {
+            self.presentation_needs_recreate |= self.swapchain_suboptimal;
+        }
         self.swapchain_suboptimal = false;
         self.swapchain_image_layouts[image_index] = vk::ImageLayout::PRESENT_SRC_KHR;
         self.frame_wait_pending = false;

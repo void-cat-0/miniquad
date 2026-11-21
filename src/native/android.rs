@@ -6,7 +6,10 @@ use crate::{
     },
 };
 
-use std::{cell::RefCell, sync::mpsc, thread, time::Duration};
+use std::{cell::RefCell, ptr::NonNull, sync::mpsc, thread, time::Duration};
+
+#[cfg(feature = "vulkan")]
+use {crate::graphics::vulkan::VulkanContext, ash::vk};
 
 pub use crate::native::gl::{self, *};
 
@@ -46,10 +49,8 @@ enum Message {
         width: i32,
         height: i32,
     },
-    SurfaceCreated {
-        window: *mut ndk_sys::ANativeWindow,
-    },
-    SurfaceDestroyed,
+    SurfaceCreated(NativeWindow),
+    SurfaceDestroyed(Option<mpsc::Sender<()>>),
     Touch {
         phase: TouchPhase,
         touch_id: u64,
@@ -82,17 +83,42 @@ enum Message {
     ImeAction(i32),
     Request(crate::native::Request),
 }
-unsafe impl Send for Message {}
+/// Owns the reference acquired by ANativeWindow_fromSurface.
+#[derive(Debug)]
+struct NativeWindow(NonNull<ndk_sys::ANativeWindow>);
+
+// The Android native window reference can move from the Java UI thread to
+// the rendering thread. All rendering operations stay on that thread.
+unsafe impl Send for NativeWindow {}
+
+impl NativeWindow {
+    #[cfg(feature = "vulkan")]
+    fn vulkan_handle(&self) -> crate::native::vulkan::VulkanWindow {
+        crate::native::vulkan::VulkanWindow::Android {
+            window: self.0.as_ptr() as usize,
+        }
+    }
+}
+
+impl Drop for NativeWindow {
+    fn drop(&mut self) {
+        unsafe { ndk_sys::ANativeWindow_release(self.0.as_ptr()) };
+    }
+}
 
 thread_local! {
     static MESSAGES_TX: RefCell<Option<mpsc::Sender<Message>>> = RefCell::new(None);
+    #[cfg(feature = "vulkan")]
+    static SYNC_SURFACE_DESTROY: std::cell::Cell<bool> = std::cell::Cell::new(false);
 }
 
 fn send_message(message: Message) {
     MESSAGES_TX.with(|tx| {
-        let mut tx = tx.borrow_mut();
-        tx.as_mut().unwrap().send(message).unwrap();
-    })
+        if let Some(tx) = tx.borrow().as_ref() {
+            // Java lifecycle events may arrive after the render thread exits.
+            let _ = tx.send(message);
+        }
+    });
 }
 
 pub static mut ACTIVITY: ndk_sys::jobject = std::ptr::null_mut();
@@ -138,14 +164,91 @@ pub unsafe fn console_error(msg: *const ::core::ffi::c_char) {
 //     unsafe { console_info(msg.as_ptr()) };
 // }
 
-struct MainThreadState {
+struct EglState {
     libegl: LibEgl,
-    egl_display: egl::EGLDisplay,
-    egl_config: egl::EGLConfig,
-    egl_context: egl::EGLContext,
+    display: egl::EGLDisplay,
+    config: egl::EGLConfig,
+    context: egl::EGLContext,
     surface: egl::EGLSurface,
-    window: *mut ndk_sys::ANativeWindow,
+}
+
+impl EglState {
+    unsafe fn new(conf: &crate::conf::Conf, window: &NativeWindow) -> Self {
+        let mut libegl = LibEgl::try_load().expect("Can't load LibEGL");
+        let (context, config, display) = egl::create_egl_context(
+            &mut libegl,
+            std::ptr::null_mut(), // EGL_DEFAULT_DISPLAY
+            conf.platform.framebuffer_alpha,
+            conf.sample_count,
+        )
+        .expect("Can't create EGL context");
+        assert!(!display.is_null());
+        assert!(!config.is_null());
+
+        crate::native::gl::load_gl_funcs(|proc| {
+            let name = std::ffi::CString::new(proc).unwrap();
+            (libegl.eglGetProcAddress)(name.as_ptr() as _)
+        });
+
+        let mut state = Self {
+            libegl,
+            display,
+            config,
+            context,
+            surface: std::ptr::null_mut(),
+        };
+        state.attach(window);
+        state
+    }
+
+    unsafe fn attach(&mut self, window: &NativeWindow) {
+        self.surface = (self.libegl.eglCreateWindowSurface)(
+            self.display,
+            self.config,
+            window.0.as_ptr() as _,
+            std::ptr::null_mut(),
+        );
+        assert!(!self.surface.is_null());
+        assert_ne!(
+            (self.libegl.eglMakeCurrent)(self.display, self.surface, self.surface, self.context),
+            0
+        );
+    }
+
+    unsafe fn detach(&mut self) {
+        if !self.surface.is_null() {
+            (self.libegl.eglMakeCurrent)(
+                self.display,
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+            );
+            (self.libegl.eglDestroySurface)(self.display, self.surface);
+            self.surface = std::ptr::null_mut();
+        }
+    }
+}
+
+impl Drop for EglState {
+    fn drop(&mut self) {
+        unsafe {
+            self.detach();
+            (self.libegl.eglDestroyContext)(self.display, self.context);
+            (self.libegl.eglTerminate)(self.display);
+        }
+    }
+}
+
+struct MainThreadState {
     event_handler: Box<dyn EventHandler>,
+    egl: Option<EglState>,
+    window: Option<NativeWindow>,
+    #[cfg(feature = "vulkan")]
+    vulkan_surface_attached: bool,
+    #[cfg(feature = "vulkan")]
+    window_size: (i32, i32),
+    #[cfg(feature = "vulkan")]
+    paused: bool,
     quit: bool,
     fullscreen: bool,
     update_requested: bool,
@@ -153,59 +256,91 @@ struct MainThreadState {
 }
 
 impl MainThreadState {
-    unsafe fn destroy_surface(&mut self) {
-        (self.libegl.eglMakeCurrent)(
-            self.egl_display,
-            std::ptr::null_mut(),
-            std::ptr::null_mut(),
-            std::ptr::null_mut(),
-        );
-        (self.libegl.eglDestroySurface)(self.egl_display, self.surface);
-        self.surface = std::ptr::null_mut();
+    #[cfg(feature = "vulkan")]
+    fn vulkan_context(&mut self) -> &mut VulkanContext {
+        self.event_handler
+            .android_vulkan_context()
+            .expect("Android Vulkan EventHandler must return its android_vulkan_context")
     }
 
-    unsafe fn update_surface(&mut self, window: *mut ndk_sys::ANativeWindow) {
-        if !self.window.is_null() {
-            ndk_sys::ANativeWindow_release(self.window);
+    #[cfg(feature = "vulkan")]
+    fn suspend_vulkan_surface(&mut self) {
+        self.vulkan_context().suspend_android_surface();
+        self.vulkan_surface_attached = false;
+        crate::native_display().lock().unwrap().vulkan_window = None;
+    }
+
+    fn detach_window(&mut self) {
+        if let Some(egl) = &mut self.egl {
+            unsafe { egl.detach() };
         }
-        self.window = window;
-        if self.surface.is_null() == false {
-            self.destroy_surface();
+        #[cfg(feature = "vulkan")]
+        if self.egl.is_none() && self.vulkan_surface_attached {
+            self.suspend_vulkan_surface();
         }
+        self.window = None;
+    }
 
-        self.surface = (self.libegl.eglCreateWindowSurface)(
-            self.egl_display,
-            self.egl_config,
-            window as _,
-            std::ptr::null_mut(),
-        );
+    #[cfg(feature = "vulkan")]
+    fn attach_vulkan_surface(&mut self, size: (u32, u32)) {
+        if let Some(window) = &self.window {
+            let handle = window.vulkan_handle();
+            match self.vulkan_context().resume_android_surface(handle, size) {
+                Ok(()) => {
+                    self.vulkan_surface_attached = true;
+                    crate::native_display().lock().unwrap().vulkan_window = Some(handle);
+                }
+                Err(vk::Result::ERROR_SURFACE_LOST_KHR | vk::Result::ERROR_OUT_OF_DATE_KHR) => (),
+                Err(error) => panic!("Failed to attach Android Vulkan surface: {:?}", error),
+            }
+        }
+    }
 
-        assert!(!self.surface.is_null());
-
-        let res = (self.libegl.eglMakeCurrent)(
-            self.egl_display,
-            self.surface,
-            self.surface,
-            self.egl_context,
-        );
-
-        assert!(res != 0);
+    fn waiting_for_vulkan_window(&self) -> bool {
+        #[cfg(feature = "vulkan")]
+        if self.egl.is_none() {
+            return self.paused
+                || !self.vulkan_surface_attached
+                || self.window_size.0 <= 0
+                || self.window_size.1 <= 0;
+        }
+        false
     }
 
     fn process_message(&mut self, msg: Message) {
         match msg {
-            Message::SurfaceCreated { window } => unsafe {
-                self.update_surface(window);
-            },
-            Message::SurfaceDestroyed => unsafe {
-                self.destroy_surface();
-            },
+            Message::SurfaceCreated(window) => {
+                self.detach_window();
+                #[cfg(feature = "vulkan")]
+                {
+                    self.window_size = (0, 0);
+                }
+                if let Some(egl) = &mut self.egl {
+                    unsafe { egl.attach(&window) };
+                }
+                self.window = Some(window);
+                self.update_requested = true;
+            }
+            Message::SurfaceDestroyed(done) => {
+                self.detach_window();
+                if let Some(done) = done {
+                    let _ = done.send(());
+                }
+            }
             Message::SurfaceChanged { width, height } => {
                 {
                     let mut d = crate::native_display().lock().unwrap();
                     d.screen_width = width as _;
                     d.screen_height = height as _;
                 }
+                #[cfg(feature = "vulkan")]
+                if self.egl.is_none() {
+                    self.window_size = (width, height);
+                    if !self.vulkan_surface_attached && width > 0 && height > 0 {
+                        self.attach_vulkan_surface((width as u32, height as u32));
+                    }
+                }
+                self.update_requested = true;
                 self.event_handler.resize_event(width as _, height as _);
             }
             Message::Touch {
@@ -258,8 +393,29 @@ impl MainThreadState {
                 self.event_handler.key_down_event(KeyCode::Enter, self.keymods, false);
                 self.event_handler.key_up_event(KeyCode::Enter, self.keymods);
             }
-            Message::Pause => self.event_handler.window_minimized_event(),
+            Message::Pause => {
+                #[cfg(feature = "vulkan")]
+                {
+                    self.paused = true;
+                }
+                self.event_handler.window_minimized_event();
+            }
             Message::Resume => {
+                #[cfg(feature = "vulkan")]
+                {
+                    self.paused = false;
+                    // A surface lost on pause may come back without a fresh
+                    // SurfaceCreated event (the Activity kept the same view).
+                    let (width, height) = self.window_size;
+                    if self.egl.is_none()
+                        && !self.vulkan_surface_attached
+                        && width > 0
+                        && height > 0
+                    {
+                        self.attach_vulkan_surface((width as u32, height as u32));
+                    }
+                }
+                self.update_requested = true;
                 if self.fullscreen {
                     unsafe {
                         let env = attach_jni_env();
@@ -277,17 +433,48 @@ impl MainThreadState {
         }
     }
 
-    fn frame(&mut self) {
-        self.event_handler.update();
-
-        if self.surface.is_null() == false {
-            self.update_requested = false;
-            self.event_handler.draw();
-
-            unsafe {
-                (self.libegl.eglSwapBuffers)(self.egl_display, self.surface);
+    /// Returns true if a live Vulkan window needs a delayed acquire retry.
+    fn frame(&mut self) -> bool {
+        if let Some(egl) = &mut self.egl {
+            self.event_handler.update();
+            if !egl.surface.is_null() {
+                self.update_requested = false;
+                self.event_handler.draw();
+                unsafe { (egl.libegl.eglSwapBuffers)(egl.display, egl.surface) };
+            }
+            return false;
+        }
+        #[cfg(feature = "vulkan")]
+        {
+            if self.waiting_for_vulkan_window() {
+                self.event_handler.update();
+                return false;
+            }
+            let (width, height) = self.window_size;
+            let context = self.vulkan_context();
+            context.set_window_size(width as u32, height as u32);
+            match context.prepare_android_frame() {
+                Ok(true) => {
+                    self.update_requested = false;
+                    self.event_handler.update();
+                    self.event_handler.draw();
+                    let context = self.vulkan_context();
+                    if !context.offscreen {
+                        // Present an acquired frame even if the handler did not
+                        // commit it. This is a no-op after commit_frame().
+                        context.present();
+                    }
+                    if context.android_window_needs_attention() {
+                        self.update_requested = true;
+                        return true;
+                    }
+                }
+                Ok(false) => return true,
+                Err(vk::Result::ERROR_SURFACE_LOST_KHR) => self.suspend_vulkan_surface(),
+                Err(error) => panic!("Failed to prepare Android Vulkan frame: {:?}", error),
             }
         }
+        false
     }
 
     fn process_request(&mut self, request: crate::native::Request) {
@@ -449,132 +636,124 @@ where
     unsafe impl<F> Send for SendHack<F> {}
 
     let f = SendHack(f);
+    let vulkan = conf.platform.rendering_backend == crate::conf::RenderingBackend::Vulkan;
 
     let (tx, rx) = mpsc::channel();
-
     let tx2 = tx.clone();
     MESSAGES_TX.with(move |messages_tx| *messages_tx.borrow_mut() = Some(tx2));
+    #[cfg(feature = "vulkan")]
+    SYNC_SURFACE_DESTROY.with(|sync| sync.set(vulkan));
 
     thread::spawn(move || {
-        let mut libegl = LibEgl::try_load().expect("Cant load LibEGL");
-
-        // skip all the messages until android will be able to actually open a window
-        //
-        // sometimes before launching an app android will show a permission dialog
-        // it is important to create GL context only after a first SurfaceChanged
-        let window = 'a: loop {
-            match rx.try_recv() {
-                Ok(Message::SurfaceCreated { window }) => {
-                    break 'a window;
+        // Wait for a current native window and its first nonzero extent. A
+        // window can be destroyed or replaced even during Activity startup.
+        let mut window = None;
+        let mut paused = false;
+        let (screen_width, screen_height) = loop {
+            match rx.recv() {
+                Ok(Message::SurfaceCreated(created)) => window = Some(created),
+                Ok(Message::SurfaceDestroyed(done)) => {
+                    window = None;
+                    if let Some(done) = done {
+                        let _ = done.send(());
+                    }
                 }
+                Ok(Message::SurfaceChanged { width, height })
+                    if window.is_some() && width > 0 && height > 0 =>
+                {
+                    break (width, height);
+                }
+                Ok(Message::Pause) => paused = true,
+                Ok(Message::Resume) => paused = false,
+                Ok(Message::Destroy) | Err(_) => return,
                 _ => {}
             }
         };
-        let (screen_width, screen_height) = 'a: loop {
-            match rx.try_recv() {
-                Ok(Message::SurfaceChanged { width, height }) => {
-                    break 'a (width as f32, height as f32);
-                }
-                _ => {}
-            }
+        let window = window.unwrap();
+
+        // EGL and a Vulkan surface cannot be connected to the same window.
+        let egl = if vulkan {
+            None
+        } else {
+            Some(EglState::new(&conf, &window))
         };
-
-        let (egl_context, egl_config, egl_display) = crate::native::egl::create_egl_context(
-            &mut libegl,
-            std::ptr::null_mut(), /* EGL_DEFAULT_DISPLAY */
-            conf.platform.framebuffer_alpha,
-            conf.sample_count,
-        )
-        .expect("Cant create EGL context");
-
-        assert!(!egl_display.is_null());
-        assert!(!egl_config.is_null());
-
-        crate::native::gl::load_gl_funcs(|proc| {
-            let name = std::ffi::CString::new(proc).unwrap();
-            (libegl.eglGetProcAddress)(name.as_ptr() as _)
-        });
-
-        let surface = (libegl.eglCreateWindowSurface)(
-            egl_display,
-            egl_config,
-            window as _,
-            std::ptr::null_mut(),
-        );
-
-        if (libegl.eglMakeCurrent)(egl_display, surface, surface, egl_context) == 0 {
-            panic!();
-        }
-
         let clipboard = Box::new(AndroidClipboard::new());
-        let tx_fn = Box::new(move |req| tx.send(Message::Request(req)).unwrap());
+        let tx_fn = Box::new(move |req| {
+            let _ = tx.send(Message::Request(req));
+        });
         crate::set_or_replace_display(NativeDisplayData {
             high_dpi: conf.high_dpi,
             blocking_event_loop: conf.platform.blocking_event_loop,
-            ..NativeDisplayData::new(screen_width as _, screen_height as _, tx_fn, clipboard)
+            rendering_backend: conf.platform.rendering_backend,
+            #[cfg(feature = "vulkan")]
+            vulkan_window: vulkan.then(|| window.vulkan_handle()),
+            ..NativeDisplayData::new(screen_width, screen_height, tx_fn, clipboard)
         });
 
-        let event_handler = f.0();
         let mut s = MainThreadState {
-            libegl,
-            egl_display,
-            egl_config,
-            egl_context,
-            surface,
-            window,
-            event_handler,
+            egl,
+            window: Some(window),
+            event_handler: f.0(),
+            #[cfg(feature = "vulkan")]
+            vulkan_surface_attached: vulkan,
+            #[cfg(feature = "vulkan")]
+            window_size: (screen_width, screen_height),
+            #[cfg(feature = "vulkan")]
+            paused,
             quit: false,
             fullscreen: conf.fullscreen,
             update_requested: true,
-            keymods: KeyMods {
-                shift: false,
-                ctrl: false,
-                alt: false,
-                logo: false,
-            },
+            keymods: KeyMods::default(),
         };
+        #[cfg(feature = "vulkan")]
+        if vulkan {
+            // Reject handlers that cannot follow Android surface changes before
+            // allowing them to record anything into the window swapchain.
+            s.vulkan_context();
+        }
+        if paused {
+            s.event_handler.window_minimized_event();
+        }
 
         let rx_timeout = conf
             .platform
             .sleep_interval_ms
             .map(|sleep| Duration::from_millis(sleep as u64));
 
+        let mut retry_vulkan = false;
         while !s.quit {
-            let block_on_wait = conf.platform.blocking_event_loop && !s.update_requested;
-
-            if block_on_wait {
-                // We don't need to loop here because the loop above consumes all
-                // available messages. Instead we are going to block until receiving here.
-
-                match rx_recv(&rx, rx_timeout) {
+            let waiting_for_window = s.waiting_for_vulkan_window();
+            if waiting_for_window
+                || retry_vulkan
+                || (conf.platform.blocking_event_loop && !s.update_requested)
+            {
+                let timeout = if retry_vulkan && !waiting_for_window {
+                    // Poll Vulkan without blocking on image acquisition while a
+                    // Java lifecycle callback may be waiting for this thread.
+                    Some(Duration::from_millis(8))
+                } else {
+                    rx_timeout
+                };
+                match rx_recv(&rx, timeout) {
                     Ok(msg) => s.process_message(msg),
-                    // Timeout so time to do periodic update()
                     Err(mpsc::RecvTimeoutError::Timeout) => s.update_requested = true,
-                    Err(mpsc::RecvTimeoutError::Disconnected) => panic!(),
+                    Err(mpsc::RecvTimeoutError::Disconnected) => break,
                 }
+            }
+            while !s.quit {
+                let Ok(msg) = rx.try_recv() else { break };
+                s.process_message(msg);
+            }
+
+            if !s.quit && (!conf.platform.blocking_event_loop || s.update_requested) {
+                retry_vulkan = s.frame();
             } else {
-                // process all the messages from the main thread
-                while let Ok(msg) = rx.try_recv() {
-                    s.process_message(msg);
-                }
+                retry_vulkan = false;
             }
-
-            if !conf.platform.blocking_event_loop || s.update_requested {
-                s.frame();
-            }
-
             thread::yield_now();
         }
 
-        (s.libegl.eglMakeCurrent)(
-            s.egl_display,
-            std::ptr::null_mut(),
-            std::ptr::null_mut(),
-            std::ptr::null_mut(),
-        );
-        (s.libegl.eglDestroySurface)(s.egl_display, s.surface);
-        (s.libegl.eglDestroyContext)(s.egl_display, s.egl_context);
-        (s.libegl.eglTerminate)(s.egl_display);
+        s.detach_window();
     });
 }
 
@@ -598,10 +777,9 @@ extern "C" fn jni_on_load(vm: *mut std::ffi::c_void) {
     }
 }
 
-unsafe fn create_native_window(surface: ndk_sys::jobject) -> *mut ndk_sys::ANativeWindow {
+unsafe fn create_native_window(surface: ndk_sys::jobject) -> Option<NativeWindow> {
     let env = attach_jni_env();
-
-    ndk_sys::ANativeWindow_fromSurface(env, surface)
+    NonNull::new(ndk_sys::ANativeWindow_fromSurface(env, surface)).map(NativeWindow)
 }
 
 #[no_mangle]
@@ -668,8 +846,9 @@ extern "C" fn Java_quad_1native_QuadNative_surfaceOnSurfaceCreated(
     _: ndk_sys::jobject,
     surface: ndk_sys::jobject,
 ) {
-    let window = unsafe { create_native_window(surface) };
-    send_message(Message::SurfaceCreated { window });
+    if let Some(window) = unsafe { create_native_window(surface) } {
+        send_message(Message::SurfaceCreated(window));
+    }
 }
 
 #[no_mangle]
@@ -677,7 +856,16 @@ extern "C" fn Java_quad_1native_QuadNative_surfaceOnSurfaceDestroyed(
     _: *mut ndk_sys::JNIEnv,
     _: ndk_sys::jobject,
 ) {
-    send_message(Message::SurfaceDestroyed);
+    #[cfg(feature = "vulkan")]
+    if SYNC_SURFACE_DESTROY.with(|sync| sync.get()) {
+        // SurfaceHolder requires the render thread to stop using its surface
+        // before this callback returns. An exited render thread drops the sender.
+        let (done, wait) = mpsc::channel();
+        send_message(Message::SurfaceDestroyed(Some(done)));
+        let _ = wait.recv();
+        return;
+    }
+    send_message(Message::SurfaceDestroyed(None));
 }
 
 #[no_mangle]

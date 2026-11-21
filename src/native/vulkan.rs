@@ -4,6 +4,10 @@ use raw_window_handle_vulkan::*;
 // asserting thread safety for raw window/display pointers.
 #[derive(Clone, Copy)]
 pub(crate) enum VulkanWindow {
+    #[cfg(target_os = "android")]
+    Android {
+        window: usize,
+    },
     Win32 {
         hwnd: usize,
         hinstance: usize,
@@ -22,6 +26,15 @@ pub(crate) enum VulkanWindow {
 impl VulkanWindow {
     pub fn handles(self) -> (RawDisplayHandle, RawWindowHandle) {
         match self {
+            #[cfg(target_os = "android")]
+            Self::Android { window } => {
+                let mut handle = AndroidNdkWindowHandle::empty();
+                handle.a_native_window = window as *mut _;
+                (
+                    RawDisplayHandle::Android(AndroidDisplayHandle::empty()),
+                    RawWindowHandle::AndroidNdk(handle),
+                )
+            }
             Self::Win32 { hwnd, hinstance } => {
                 let mut window = Win32WindowHandle::empty();
                 window.hwnd = hwnd as *mut _;

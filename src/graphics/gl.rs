@@ -922,7 +922,11 @@ impl Textures {
             TextureIdInner::Raw(RawId::Metal(..)) => panic!("Metal texture in OpenGL context!"),
             #[cfg(all(
                 feature = "vulkan",
-                any(windows, all(target_os = "linux", not(target_env = "ohos")))
+                any(
+                    windows,
+                    target_os = "android",
+                    all(target_os = "linux", not(target_env = "ohos"))
+                )
             ))]
             TextureIdInner::Raw(RawId::Vulkan(_)) => panic!("Vulkan image passed to OpenGL"),
             TextureIdInner::Managed(texture) => self.0[texture],
@@ -1325,7 +1329,11 @@ impl RenderingBackend for GlContext {
             ShaderSource::Glsl { fragment, vertex } => (fragment, vertex),
             #[cfg(all(
                 feature = "vulkan",
-                any(windows, all(target_os = "linux", not(target_env = "ohos")))
+                any(
+                    windows,
+                    target_os = "android",
+                    all(target_os = "linux", not(target_env = "ohos"))
+                )
             ))]
             ShaderSource::SpirV(_) => {
                 return Err(ShaderError::LinkError(

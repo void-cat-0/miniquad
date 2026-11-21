@@ -125,8 +125,9 @@ impl FrameSubmission {
                 "Vulkan::queue_present"
             ));
             match swapchain.queue_present(queue, &present) {
-                Ok(suboptimal) => Ok(suboptimal),
-                Err(vk::Result::ERROR_OUT_OF_DATE_KHR | vk::Result::SUBOPTIMAL_KHR) => Ok(true),
+                Ok(suboptimal) => Ok(suboptimal && !cfg!(target_os = "android")),
+                Err(vk::Result::ERROR_OUT_OF_DATE_KHR) => Ok(true),
+                Err(vk::Result::SUBOPTIMAL_KHR) => Ok(!cfg!(target_os = "android")),
                 Err(error) => Err(error),
             }
         }

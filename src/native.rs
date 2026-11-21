@@ -12,7 +12,11 @@ pub(crate) struct NativeDisplayData {
     pub rendering_backend: crate::conf::RenderingBackend,
     #[cfg(all(
         feature = "vulkan",
-        any(windows, all(target_os = "linux", not(target_env = "ohos")))
+        any(
+            windows,
+            target_os = "android",
+            all(target_os = "linux", not(target_env = "ohos"))
+        )
     ))]
     pub vulkan_window: Option<vulkan::VulkanWindow>,
     pub screen_width: i32,
@@ -55,7 +59,11 @@ impl NativeDisplayData {
             rendering_backend: crate::conf::RenderingBackend::OpenGl,
             #[cfg(all(
                 feature = "vulkan",
-                any(windows, all(target_os = "linux", not(target_env = "ohos")))
+                any(
+                    windows,
+                    target_os = "android",
+                    all(target_os = "linux", not(target_env = "ohos"))
+                )
             ))]
             vulkan_window: None,
             screen_width,
@@ -119,7 +127,11 @@ pub trait Clipboard: Send + Sync {
 
 #[cfg(all(
     feature = "vulkan",
-    any(windows, all(target_os = "linux", not(target_env = "ohos")))
+    any(
+        windows,
+        target_os = "android",
+        all(target_os = "linux", not(target_env = "ohos"))
+    )
 ))]
 pub(crate) mod vulkan;
 

@@ -10,12 +10,20 @@ mod gl;
 
 #[cfg(all(
     feature = "vulkan",
-    any(windows, all(target_os = "linux", not(target_env = "ohos")))
+    any(
+        windows,
+        target_os = "android",
+        all(target_os = "linux", not(target_env = "ohos"))
+    )
 ))]
 pub mod vulkan;
 #[cfg(all(
     feature = "vulkan",
-    any(windows, all(target_os = "linux", not(target_env = "ohos")))
+    any(
+        windows,
+        target_os = "android",
+        all(target_os = "linux", not(target_env = "ohos"))
+    )
 ))]
 pub use vulkan::VulkanBackend;
 
@@ -1079,7 +1087,11 @@ pub enum ShaderSource<'a> {
     /// Construct this variant with the unsafe [`ShaderSource::spirv`] helper.
     #[cfg(all(
         feature = "vulkan",
-        any(windows, all(target_os = "linux", not(target_env = "ohos")))
+        any(
+            windows,
+            target_os = "android",
+            all(target_os = "linux", not(target_env = "ohos"))
+        )
     ))]
     SpirV(SpirVShader<'a>),
     Msl { program: &'a str },
@@ -1088,7 +1100,11 @@ pub enum ShaderSource<'a> {
 /// Precompiled SPIR-V supplied through [`ShaderSource::spirv`].
 #[cfg(all(
     feature = "vulkan",
-    any(windows, all(target_os = "linux", not(target_env = "ohos")))
+    any(
+        windows,
+        target_os = "android",
+        all(target_os = "linux", not(target_env = "ohos"))
+    )
 ))]
 #[derive(Debug)]
 pub struct SpirVShader<'a> {
@@ -1107,7 +1123,11 @@ impl<'a> ShaderSource<'a> {
             Self::Msl { program } => program.contains("_ScreenTexture"),
             #[cfg(all(
                 feature = "vulkan",
-                any(windows, all(target_os = "linux", not(target_env = "ohos")))
+                any(
+                    windows,
+                    target_os = "android",
+                    all(target_os = "linux", not(target_env = "ohos"))
+                )
             ))]
             Self::SpirV(shader) => shader.uses_screen_texture,
         }
@@ -1120,7 +1140,11 @@ impl<'a> ShaderSource<'a> {
     /// satisfy the layout and entry point contract of [`Self::SpirV`].
     #[cfg(all(
         feature = "vulkan",
-        any(windows, all(target_os = "linux", not(target_env = "ohos")))
+        any(
+            windows,
+            target_os = "android",
+            all(target_os = "linux", not(target_env = "ohos"))
+        )
     ))]
     pub unsafe fn spirv(
         vertex: &'a [u8],
@@ -1142,7 +1166,11 @@ pub enum RawId {
     OpenGl(crate::native::gl::GLuint),
     #[cfg(all(
         feature = "vulkan",
-        any(windows, all(target_os = "linux", not(target_env = "ohos")))
+        any(
+            windows,
+            target_os = "android",
+            all(target_os = "linux", not(target_env = "ohos"))
+        )
     ))]
     Vulkan(u64),
     #[cfg(target_vendor = "apple")]
@@ -1167,7 +1195,11 @@ pub enum Backend {
     OpenGl,
     #[cfg(all(
         feature = "vulkan",
-        any(windows, all(target_os = "linux", not(target_env = "ohos")))
+        any(
+            windows,
+            target_os = "android",
+            all(target_os = "linux", not(target_env = "ohos"))
+        )
     ))]
     Vulkan,
 }
@@ -1195,7 +1227,11 @@ impl ContextInfo {
             Backend::Metal => true,
             #[cfg(all(
                 feature = "vulkan",
-                any(windows, all(target_os = "linux", not(target_env = "ohos")))
+                any(
+                    windows,
+                    target_os = "android",
+                    all(target_os = "linux", not(target_env = "ohos"))
+                )
             ))]
             Backend::Vulkan => true,
             Backend::OpenGl => {
@@ -1208,7 +1244,11 @@ impl ContextInfo {
 pub trait RenderingBackend {
     #[cfg(all(
         feature = "vulkan",
-        any(windows, all(target_os = "linux", not(target_env = "ohos")))
+        any(
+            windows,
+            target_os = "android",
+            all(target_os = "linux", not(target_env = "ohos"))
+        )
     ))]
     fn vulkan_context(&mut self) -> Option<&mut vulkan::VulkanContext> {
         None

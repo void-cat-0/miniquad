@@ -142,7 +142,11 @@ pub mod window {
     pub fn new_rendering_backend() -> Box<dyn RenderingBackend> {
         #[cfg(all(
             feature = "vulkan",
-            any(windows, all(target_os = "linux", not(target_env = "ohos")))
+            any(
+                windows,
+                target_os = "android",
+                all(target_os = "linux", not(target_env = "ohos"))
+            )
         ))]
         {
             let d = native_display().lock().unwrap();
@@ -546,9 +550,10 @@ where
         assert!(
             cfg!(any(
                 windows,
+                target_os = "android",
                 all(target_os = "linux", not(target_env = "ohos"))
             )),
-            "Vulkan is supported on Windows and Linux"
+            "Vulkan is supported on Windows, desktop Linux, and Android"
         );
     }
     #[cfg(target_env = "ohos")]

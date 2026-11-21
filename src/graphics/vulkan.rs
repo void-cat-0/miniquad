@@ -165,6 +165,10 @@ pub struct VulkanContext {
     /// and `drain_submissions`. Synchronous resource operations drain first.
     submission: Option<submission::SubmissionWorker>,
     presentation_needs_recreate: bool,
+    #[cfg(target_os = "android")]
+    android_surface_lost: bool,
+    #[cfg(target_os = "android")]
+    android_swapchain_can_capture: bool,
 
     /// `image_available` is handed out round-robin because
     /// `acquire_next_image` has to name the wait semaphore before the image index
@@ -340,22 +344,21 @@ impl VulkanContext {
                 extension_names.push(DebugUtils::name().as_ptr());
             }
 
+            // The loader and physical device both limit the effective API.
+            let instance_api = entry
+                .try_enumerate_instance_version()
+                .expect("Failed to query the Vulkan loader version")
+                .unwrap_or(vk::API_VERSION_1_0)
+                .min(vk::API_VERSION_1_3);
+            assert!(
+                instance_api >= vk::API_VERSION_1_2,
+                "Vulkan needs a 1.2+ loader"
+            );
             let app_info = vk::ApplicationInfo::builder()
                 .application_name(app_name)
                 .application_version(0)
-                .engine_name(app_name)
                 .engine_version(0)
-                // Request the newest instance API available to the loader, capped
-                // at 1.3. Device-level Vulkan 1.2 implementations can use the
-                // promoted dynamic-rendering extension below.
-                .api_version(
-                    entry
-                        .try_enumerate_instance_version()
-                        .ok()
-                        .flatten()
-                        .unwrap_or(vk::API_VERSION_1_0)
-                        .min(vk::API_VERSION_1_3),
-                );
+                .api_version(instance_api);
 
             let create_info = vk::InstanceCreateInfo::builder()
                 .application_info(&app_info)
@@ -399,57 +402,57 @@ impl VulkanContext {
                 .enumerate_physical_devices()
                 .expect("Failed to enumerate Vulkan physical devices");
 
-            let (physical_device, queue_family_index) = physical_devices
-                .iter()
-                .find_map(|device| {
-                    instance
-                        .get_physical_device_queue_family_properties(*device)
-                        .iter()
-                        .enumerate()
-                        .find_map(|(index, info)| {
-                            let graphics_and_surface =
-                                info.queue_flags.contains(vk::QueueFlags::GRAPHICS)
-                                    && surface_loader
-                                        .get_physical_device_surface_support(
-                                            *device,
-                                            index as u32,
-                                            surface,
-                                        )
-                                        .unwrap();
-                            if graphics_and_surface {
-                                Some((*device, index as u32))
-                            } else {
-                                None
-                            }
-                        })
-                })
-                .expect("No Vulkan device with graphics and presentation support was found");
-
-            let properties = instance.get_physical_device_properties(physical_device);
-            let available_extensions = instance
-                .enumerate_device_extension_properties(physical_device)
-                .expect("Failed to enumerate device extensions");
-            let has_extension = |name: &str| {
-                available_extensions.iter().any(|extension| {
-                    CStr::from_ptr(extension.extension_name.as_ptr()).to_bytes() == name.as_bytes()
-                })
+            let has_extension = |extensions: &[vk::ExtensionProperties], name: &CStr| {
+                extensions
+                    .iter()
+                    .any(|extension| CStr::from_ptr(extension.extension_name.as_ptr()) == name)
             };
-            let dynamic_rendering_extension = has_extension(
-                KhrDynamicRendering::name()
-                    .to_str()
-                    .expect("valid extension name"),
-            );
-            let supports_vulkan_1_3 = vk::api_version_major(properties.api_version) > 1
-                || (vk::api_version_major(properties.api_version) == 1
-                    && vk::api_version_minor(properties.api_version) >= 3);
-            let use_khr_dynamic_rendering = !supports_vulkan_1_3 && dynamic_rendering_extension;
-            assert!(
-                supports_vulkan_1_3 || use_khr_dynamic_rendering,
-                "Vulkan 1.2 devices require VK_KHR_dynamic_rendering",
-            );
-            let video_queue_supported = has_extension("VK_KHR_video_queue")
-                && has_extension("VK_KHR_video_encode_queue")
-                && has_extension("VK_KHR_video_encode_h264");
+            let (
+                physical_device,
+                properties,
+                available_extensions,
+                queue_family_index,
+                use_khr_dynamic_rendering,
+            ) = physical_devices
+                .into_iter()
+                .find_map(|device| {
+                    let properties = instance.get_physical_device_properties(device);
+                    let api = properties.api_version.min(instance_api);
+                    if api < vk::API_VERSION_1_2 {
+                        return None;
+                    }
+                    let extensions = instance.enumerate_device_extension_properties(device).ok()?;
+                    let use_khr = api < vk::API_VERSION_1_3;
+                    if !has_extension(&extensions, Swapchain::name())
+                        || (use_khr && !has_extension(&extensions, KhrDynamicRendering::name()))
+                    {
+                        return None;
+                    }
+                    let mut dynamic = vk::PhysicalDeviceDynamicRenderingFeatures::default();
+                    let mut features = vk::PhysicalDeviceFeatures2::builder()
+                        .push_next(&mut dynamic)
+                        .build();
+                    instance.get_physical_device_features2(device, &mut features);
+                    if dynamic.dynamic_rendering != vk::TRUE {
+                        return None;
+                    }
+                    let queues = instance.get_physical_device_queue_family_properties(device);
+                    let family = queues.iter().enumerate().find_map(|(index, info)| {
+                        (info.queue_count != 0
+                            && info.queue_flags.contains(vk::QueueFlags::GRAPHICS)
+                            && surface_loader
+                                .get_physical_device_surface_support(device, index as u32, surface)
+                                .unwrap_or(false))
+                        .then_some(index as u32)
+                    })?;
+                    Some((device, properties, extensions, family, use_khr))
+                })
+                .expect("No Vulkan 1.2+ device with dynamic rendering, swapchain and window presentation support");
+            // Vulkan video export is not part of the Android window path.
+            let video_queue_supported = !cfg!(target_os = "android")
+                && has_extension(&available_extensions, cstr(b"VK_KHR_video_queue\0"))
+                && has_extension(&available_extensions, cstr(b"VK_KHR_video_encode_queue\0"))
+                && has_extension(&available_extensions, cstr(b"VK_KHR_video_encode_h264\0"));
             let video_queue_family = if video_queue_supported {
                 instance
                     .get_physical_device_queue_family_properties(physical_device)
@@ -472,12 +475,7 @@ impl VulkanContext {
                 device_extension_names.push(cstr(b"VK_KHR_video_encode_queue\0").as_ptr());
                 device_extension_names.push(cstr(b"VK_KHR_video_encode_h264\0").as_ptr());
             }
-            let mut features = vk::PhysicalDeviceFeatures2::builder()
-                .features(vk::PhysicalDeviceFeatures {
-                    fill_mode_non_solid: 1,
-                    ..Default::default()
-                })
-                .build();
+
             let mut dynamic_rendering_13 = vk::PhysicalDeviceVulkan13Features::builder()
                 .dynamic_rendering(true)
                 .build();
@@ -501,8 +499,7 @@ impl VulkanContext {
             }
             let device_create_info = vk::DeviceCreateInfo::builder()
                 .queue_create_infos(&queue_infos)
-                .enabled_extension_names(&device_extension_names)
-                .push_next(&mut features);
+                .enabled_extension_names(&device_extension_names);
             let device_create_info = if use_khr_dynamic_rendering {
                 device_create_info.push_next(&mut dynamic_rendering_khr)
             } else {
@@ -561,8 +558,13 @@ impl VulkanContext {
                 .expect("Failed to create the readback fence");
 
             let recorder = recording::CommandRecorder::new(&device, queue_family_index);
+            // The Android render thread must be able to stop using the window
+            // before the surfaceDestroyed callback returns.
+            #[cfg(not(target_os = "android"))]
             let submission =
                 submission::SubmissionWorker::new(&device, &swapchain_loader, graphics_queue);
+            #[cfg(target_os = "android")]
+            let submission = None;
             let mut context = VulkanContext {
                 entry,
                 instance,
@@ -590,6 +592,10 @@ impl VulkanContext {
                 dynamic_rendering,
                 submission,
                 presentation_needs_recreate: false,
+                #[cfg(target_os = "android")]
+                android_surface_lost: false,
+                #[cfg(target_os = "android")]
+                android_swapchain_can_capture: false,
 
                 image_available: Vec::new(),
                 render_finished: Vec::new(),
@@ -668,7 +674,12 @@ impl VulkanContext {
             );
             context.create_uniform_arenas();
             context.create_stream_arenas();
-            context.create_swapchain(window_size);
+            // Android last reports its native window size asynchronously. Let
+            // the render loop create the initial swapchain when it can draw.
+            #[cfg(not(target_os = "android"))]
+            context
+                .create_swapchain(window_size)
+                .expect("Failed to create the swapchain");
             context
         }
     }
@@ -801,15 +812,6 @@ impl VulkanContext {
             }
             self.device.destroy_command_pool(self.command_pool, None);
 
-            for semaphore in self.image_available.drain(..) {
-                self.device.destroy_semaphore(semaphore, None);
-            }
-            for semaphore in self.render_finished.drain(..) {
-                self.device.destroy_semaphore(semaphore, None);
-            }
-            for semaphore in self.retired_semaphores.drain(..) {
-                self.device.destroy_semaphore(semaphore, None);
-            }
             for fence in self.in_flight.drain(..) {
                 self.device.destroy_fence(fence, None);
             }
@@ -817,20 +819,26 @@ impl VulkanContext {
             for view in self.swapchain_image_views.drain(..) {
                 self.device.destroy_image_view(view, None);
             }
-            self.swapchain_loader
-                .destroy_swapchain(self.swapchain, None);
+            if self.swapchain != vk::SwapchainKHR::null() {
+                self.swapchain_loader
+                    .destroy_swapchain(self.swapchain, None);
+            }
+            self.release_swapchain_semaphores();
             if let Some(messenger) = self.debug_messenger {
                 self.debug_utils_loader
                     .destroy_debug_utils_messenger(messenger, None);
             }
             self.device.destroy_device(None);
-            self.surface_loader.destroy_surface(self.surface, None);
+            if self.surface != vk::SurfaceKHR::null() {
+                self.surface_loader.destroy_surface(self.surface, None);
+            }
             self.instance.destroy_instance(None);
         }
     }
 
-    /// (Re)create the swap chain and everything derived from it.
-    fn create_swapchain(&mut self, window_size: (u32, u32)) {
+    /// Retire window work before replacing swapchain resources. Draining the
+    /// submission worker only transfers host ownership; it is not a GPU wait.
+    fn wait_for_swapchain_idle(&mut self) -> Result<(), vk::Result> {
         self.drain_submissions();
         let prepared = self.submission.as_mut().and_then(|worker| {
             worker
@@ -841,13 +849,14 @@ impl VulkanContext {
         if let Some(image) = prepared {
             self.wait_acquired_semaphore(image.semaphore);
         }
-        self.presentation_needs_recreate = false;
-        self.swapchain_suboptimal = false;
-        unsafe {
-            self.device.device_wait_idle().unwrap();
-            self.window_size = window_size;
+        unsafe { self.device.device_wait_idle() }
+    }
 
-            if !self.command_buffers.is_empty() {
+    /// Free objects owned by the old swapchain after its work has drained.
+    /// Keep the handle and semaphores until it is retired by the replacement.
+    fn release_swapchain_attachments(&mut self) {
+        unsafe {
+            if !self.offscreen && !self.command_buffers.is_empty() {
                 self.device
                     .free_command_buffers(self.command_pool, &self.command_buffers);
                 self.command_buffers.clear();
@@ -855,185 +864,320 @@ impl VulkanContext {
             for view in self.swapchain_image_views.drain(..) {
                 self.device.destroy_image_view(view, None);
             }
-            self.retired_semaphores
-                .extend(self.image_available.drain(..));
-            self.retired_semaphores
-                .extend(self.render_finished.drain(..));
-            if self.default_depth.texture != 0 {
-                let depth = self.default_depth.texture as usize;
-                self.default_depth = Texture::empty();
-                self.delete_texture(depth);
-            }
+        }
+        if self.default_depth.texture != 0 {
+            let depth = self.default_depth.texture as usize;
+            self.default_depth = Texture::empty();
+            self.delete_texture(depth);
+        }
+        self.swapchain_images.clear();
+        self.swapchain_image_layouts.clear();
+        self.swapchain_extent = vk::Extent2D::default();
+        self.acquire_slot = 0;
+        #[cfg(target_os = "android")]
+        {
+            self.android_swapchain_can_capture = false;
+        }
+    }
 
-            let surface_capabilities = self
+    fn release_swapchain_semaphores(&mut self) {
+        for semaphore in self
+            .image_available
+            .drain(..)
+            .chain(self.render_finished.drain(..))
+            .chain(self.retired_semaphores.drain(..))
+        {
+            unsafe { self.device.destroy_semaphore(semaphore, None) };
+        }
+    }
+
+    fn destroy_swapchain(&mut self) {
+        self.release_swapchain_attachments();
+        if self.swapchain != vk::SwapchainKHR::null() {
+            unsafe {
+                self.swapchain_loader
+                    .destroy_swapchain(self.swapchain, None)
+            };
+            self.swapchain = vk::SwapchainKHR::null();
+        }
+        self.release_swapchain_semaphores();
+    }
+
+    /// (Re)create the swap chain and everything derived from it.
+    fn create_swapchain(&mut self, window_size: (u32, u32)) -> Result<(), vk::Result> {
+        if self.swapchain != vk::SwapchainKHR::null() {
+            self.wait_for_swapchain_idle()?;
+        }
+        self.window_size = window_size;
+        self.presentation_needs_recreate = false;
+        self.swapchain_suboptimal = false;
+        if cfg!(target_os = "android") && (window_size.0 == 0 || window_size.1 == 0) {
+            self.destroy_swapchain();
+            return Ok(());
+        }
+
+        unsafe {
+            let capabilities = self
                 .surface_loader
-                .get_physical_device_surface_capabilities(self.physical_device, self.surface)
-                .unwrap();
+                .get_physical_device_surface_capabilities(self.physical_device, self.surface)?;
+            let extent = if capabilities.current_extent.width == u32::MAX {
+                // A window with a variable extent may temporarily report a
+                // zero maximum while it has no drawable buffers.
+                if capabilities.max_image_extent.width == 0
+                    || capabilities.max_image_extent.height == 0
+                {
+                    vk::Extent2D::default()
+                } else {
+                    vk::Extent2D {
+                        width: window_size.0.clamp(
+                            capabilities.min_image_extent.width,
+                            capabilities.max_image_extent.width,
+                        ),
+                        height: window_size.1.clamp(
+                            capabilities.min_image_extent.height,
+                            capabilities.max_image_extent.height,
+                        ),
+                    }
+                }
+            } else {
+                capabilities.current_extent
+            };
+            if cfg!(target_os = "android") && (extent.width == 0 || extent.height == 0) {
+                self.destroy_swapchain();
+                return Ok(());
+            }
 
             let formats = self
                 .surface_loader
-                .get_physical_device_surface_formats(self.physical_device, self.surface)
-                .unwrap();
-            // The swap chain format is what the default-frame-buffer pipelines
-            // get compiled against, so any 8-bit UNORM format works. Prefer one
-            // over an `_SRGB` variant, which would apply a gamma transfer the
-            // offscreen colour targets do not.
-            self.surface_format = *formats
+                .get_physical_device_surface_formats(self.physical_device, self.surface)?;
+            // Prefer UNORM over SRGB; offscreen colour targets do not apply a
+            // gamma transfer. Pipeline variants already key on target format.
+            let format = formats
                 .iter()
                 .find(|format| {
                     format.format == vk::Format::R8G8B8A8_UNORM
                         || format.format == vk::Format::B8G8R8A8_UNORM
                 })
-                .unwrap_or(&formats[0]);
+                .or_else(|| formats.first())
+                .copied()
+                .ok_or(vk::Result::ERROR_FORMAT_NOT_SUPPORTED)?;
 
-            let present_modes = self
-                .surface_loader
-                .get_physical_device_surface_present_modes(self.physical_device, self.surface)
-                .unwrap();
-            let present_mode = present_modes
-                .iter()
-                .cloned()
-                .find(|mode| *mode == vk::PresentModeKHR::MAILBOX)
-                .unwrap_or(vk::PresentModeKHR::FIFO);
-
-            let (width, height) = window_size;
-            let requested_extent = vk::Extent2D {
-                width: width.clamp(
-                    surface_capabilities.min_image_extent.width,
-                    surface_capabilities.max_image_extent.width,
-                ),
-                height: height.clamp(
-                    surface_capabilities.min_image_extent.height,
-                    surface_capabilities.max_image_extent.height,
-                ),
-            };
-            self.swapchain_extent = match surface_capabilities.current_extent.width {
-                std::u32::MAX => requested_extent,
-                _ => surface_capabilities.current_extent,
+            let present_mode = if cfg!(target_os = "android") {
+                vk::PresentModeKHR::FIFO
+            } else {
+                let modes = self
+                    .surface_loader
+                    .get_physical_device_surface_present_modes(
+                        self.physical_device,
+                        self.surface,
+                    )?;
+                if modes.contains(&vk::PresentModeKHR::MAILBOX) {
+                    vk::PresentModeKHR::MAILBOX
+                } else {
+                    vk::PresentModeKHR::FIFO
+                }
             };
 
-            let pre_transform = if surface_capabilities
+            let pre_transform = if capabilities
                 .supported_transforms
                 .contains(vk::SurfaceTransformFlagsKHR::IDENTITY)
             {
+                // Let the compositor handle Android display rotation.
                 vk::SurfaceTransformFlagsKHR::IDENTITY
             } else {
-                surface_capabilities.current_transform
+                capabilities.current_transform
             };
 
-            let mut image_count = surface_capabilities.min_image_count + 1;
-            if surface_capabilities.max_image_count > 0
-                && image_count > surface_capabilities.max_image_count
-            {
-                image_count = surface_capabilities.max_image_count;
+            let mut image_count = capabilities.min_image_count + 1;
+            if capabilities.max_image_count > 0 {
+                image_count = image_count.min(capabilities.max_image_count);
             }
 
-            let old_swapchain = self.swapchain;
-            let swapchain_create_info = vk::SwapchainCreateInfoKHR::builder()
+            let mut usage = vk::ImageUsageFlags::COLOR_ATTACHMENT;
+            let mut composite_alpha = vk::CompositeAlphaFlagsKHR::OPAQUE;
+            if cfg!(target_os = "android") {
+                if !capabilities.supported_usage_flags.contains(usage) {
+                    return Err(vk::Result::ERROR_FORMAT_NOT_SUPPORTED);
+                }
+                if capabilities
+                    .supported_usage_flags
+                    .contains(vk::ImageUsageFlags::TRANSFER_SRC)
+                    && self
+                        .instance
+                        .get_physical_device_format_properties(self.physical_device, format.format)
+                        .optimal_tiling_features
+                        .contains(vk::FormatFeatureFlags::BLIT_SRC)
+                {
+                    usage |= vk::ImageUsageFlags::TRANSFER_SRC;
+                }
+                // Android can advertise INHERIT as its only supported option.
+                composite_alpha = [
+                    vk::CompositeAlphaFlagsKHR::OPAQUE,
+                    vk::CompositeAlphaFlagsKHR::INHERIT,
+                    vk::CompositeAlphaFlagsKHR::PRE_MULTIPLIED,
+                    vk::CompositeAlphaFlagsKHR::POST_MULTIPLIED,
+                ]
+                .iter()
+                .copied()
+                .find(|alpha| capabilities.supported_composite_alpha.contains(*alpha))
+                .ok_or(vk::Result::ERROR_INITIALIZATION_FAILED)?;
+            } else {
+                usage |= vk::ImageUsageFlags::TRANSFER_SRC | vk::ImageUsageFlags::TRANSFER_DST;
+            }
+
+            self.release_swapchain_attachments();
+            let old_swapchain = std::mem::replace(&mut self.swapchain, vk::SwapchainKHR::null());
+            let info = vk::SwapchainCreateInfoKHR::builder()
                 .surface(self.surface)
                 .old_swapchain(old_swapchain)
                 .min_image_count(image_count)
-                .image_color_space(self.surface_format.color_space)
-                .image_format(self.surface_format.format)
-                .image_extent(self.swapchain_extent)
-                .image_usage(
-                    vk::ImageUsageFlags::COLOR_ATTACHMENT
-                        | vk::ImageUsageFlags::TRANSFER_DST
-                        | vk::ImageUsageFlags::TRANSFER_SRC,
-                )
+                .image_color_space(format.color_space)
+                .image_format(format.format)
+                .image_extent(extent)
+                .image_usage(usage)
                 .image_sharing_mode(vk::SharingMode::EXCLUSIVE)
                 .pre_transform(pre_transform)
-                .composite_alpha(vk::CompositeAlphaFlagsKHR::OPAQUE)
+                .composite_alpha(composite_alpha)
                 .present_mode(present_mode)
                 .clipped(true)
                 .image_array_layers(1);
-
-            self.swapchain = self
-                .swapchain_loader
-                .create_swapchain(&swapchain_create_info, None)
-                .expect("Failed to create the swapchain");
+            let result = self.swapchain_loader.create_swapchain(&info, None);
+            // Passing oldSwapchain retires it even if vkCreateSwapchainKHR fails.
             if old_swapchain != vk::SwapchainKHR::null() {
                 self.swapchain_loader.destroy_swapchain(old_swapchain, None);
             }
-            for semaphore in self.retired_semaphores.drain(..) {
-                self.device.destroy_semaphore(semaphore, None);
+            self.release_swapchain_semaphores();
+            self.swapchain = result?;
+            self.surface_format = format;
+            self.swapchain_extent = extent;
+            if let Err(error) = self.create_swapchain_attachments() {
+                self.destroy_swapchain();
+                return Err(error);
             }
-            self.swapchain_images = self
-                .swapchain_loader
-                .get_swapchain_images(self.swapchain)
-                .unwrap();
-            self.swapchain_image_layouts =
-                vec![vk::ImageLayout::UNDEFINED; self.swapchain_images.len()];
-
-            self.image_available = (0..self.swapchain_images.len())
-                .map(|_| create_semaphore(&self.device))
-                .collect();
-            self.render_finished = (0..self.swapchain_images.len())
-                .map(|_| create_semaphore(&self.device))
-                .collect();
-            self.acquire_slot = 0;
-
-            self.swapchain_image_views = self
-                .swapchain_images
-                .iter()
-                .map(|&image| {
-                    let create_view_info = vk::ImageViewCreateInfo::builder()
-                        .view_type(vk::ImageViewType::TYPE_2D)
-                        .format(self.surface_format.format)
-                        .components(vk::ComponentMapping {
-                            r: vk::ComponentSwizzle::R,
-                            g: vk::ComponentSwizzle::G,
-                            b: vk::ComponentSwizzle::B,
-                            a: vk::ComponentSwizzle::A,
-                        })
-                        .subresource_range(vk::ImageSubresourceRange {
-                            aspect_mask: vk::ImageAspectFlags::COLOR,
-                            base_mip_level: 0,
-                            level_count: 1,
-                            base_array_layer: 0,
-                            layer_count: 1,
-                        })
-                        .image(image);
-                    self.device
-                        .create_image_view(&create_view_info, None)
-                        .unwrap()
-                })
-                .collect();
-
-            self.command_buffers = self
-                .swapchain_images
-                .iter()
-                .map(|_| {
-                    let allocate_info = vk::CommandBufferAllocateInfo::builder()
-                        .command_buffer_count(1)
-                        .command_pool(self.command_pool)
-                        .level(vk::CommandBufferLevel::PRIMARY);
-                    self.device
-                        .allocate_command_buffers(&allocate_info)
-                        .unwrap()[0]
-                })
-                .collect();
-
-            // A depth attachment matching the swap chain, for `Camera2D::depth_enabled`.
-            self.default_depth = Texture {
-                texture: self.new_texture(
-                    None,
-                    TextureParams {
-                        width: self.swapchain_extent.width,
-                        height: self.swapchain_extent.height,
-                        format: TextureFormat::Depth,
-                        ..Default::default()
-                    },
-                    TextureAccess::RenderTarget,
-                ) as GLuint,
-                width: self.swapchain_extent.width,
-                height: self.swapchain_extent.height,
-                format: TextureFormat::Depth,
-                wrap: TextureWrap::Clamp,
-                filter: FilterMode::Linear,
-                mipmap_filter: MipmapFilterMode::None,
-            };
+            #[cfg(target_os = "android")]
+            {
+                self.android_swapchain_can_capture =
+                    usage.contains(vk::ImageUsageFlags::TRANSFER_SRC);
+            }
         }
+        Ok(())
+    }
+
+    unsafe fn create_swapchain_attachments(&mut self) -> Result<(), vk::Result> {
+        self.swapchain_images = self.swapchain_loader.get_swapchain_images(self.swapchain)?;
+        self.swapchain_image_layouts =
+            vec![vk::ImageLayout::UNDEFINED; self.swapchain_images.len()];
+        for &image in &self.swapchain_images {
+            self.image_available.push(
+                self.device
+                    .create_semaphore(&vk::SemaphoreCreateInfo::default(), None)?,
+            );
+            self.render_finished.push(
+                self.device
+                    .create_semaphore(&vk::SemaphoreCreateInfo::default(), None)?,
+            );
+            let info = vk::ImageViewCreateInfo::builder()
+                .view_type(vk::ImageViewType::TYPE_2D)
+                .format(self.surface_format.format)
+                .subresource_range(vk::ImageSubresourceRange {
+                    aspect_mask: vk::ImageAspectFlags::COLOR,
+                    base_mip_level: 0,
+                    level_count: 1,
+                    base_array_layer: 0,
+                    layer_count: 1,
+                })
+                .image(image);
+            self.swapchain_image_views
+                .push(self.device.create_image_view(&info, None)?);
+        }
+        let buffers = vk::CommandBufferAllocateInfo::builder()
+            .command_buffer_count(self.swapchain_images.len() as u32)
+            .command_pool(self.command_pool)
+            .level(vk::CommandBufferLevel::PRIMARY);
+        self.command_buffers = self.device.allocate_command_buffers(&buffers)?;
+
+        // The window depth image is never sampled or transferred. Do not
+        // require optional sampled-depth format support just to open a window.
+        let vk::Extent2D { width, height } = self.swapchain_extent;
+        let params = TextureParams {
+            width,
+            height,
+            format: TextureFormat::Depth,
+            ..Default::default()
+        };
+        self.default_depth = Texture {
+            texture: self.new_multisample_texture(params, 1) as GLuint,
+            width,
+            height,
+            format: TextureFormat::Depth,
+            wrap: TextureWrap::Clamp,
+            filter: FilterMode::Linear,
+            mipmap_filter: MipmapFilterMode::None,
+        };
+        Ok(())
+    }
+
+    /// Detach on the render thread before the host releases the native window.
+    /// The instance, logical device, and app-owned resources survive.
+    #[cfg(target_os = "android")]
+    pub(crate) fn suspend_android_surface(&mut self) {
+        if self.surface != vk::SurfaceKHR::null() {
+            self.finish_android_window_frame();
+            self.wait_for_swapchain_idle()
+                .expect("Failed to wait for the Android swapchain");
+            self.destroy_swapchain();
+            unsafe { self.surface_loader.destroy_surface(self.surface, None) };
+            self.surface = vk::SurfaceKHR::null();
+        }
+        self.window_size = (0, 0);
+        self.presentation_needs_recreate = false;
+        self.swapchain_suboptimal = false;
+        self.android_surface_lost = false;
+    }
+
+    /// Rebind a retained Android native window without replacing the device.
+    /// A zero or temporarily unavailable extent is retried by frame preflight.
+    #[cfg(target_os = "android")]
+    pub(crate) fn resume_android_surface(
+        &mut self,
+        window: crate::native::vulkan::VulkanWindow,
+        size: (u32, u32),
+    ) -> Result<(), vk::Result> {
+        use crate::native::vulkan::VulkanWindow;
+
+        self.suspend_android_surface();
+        if !matches!(window, VulkanWindow::Android { window } if window != 0) {
+            return Err(vk::Result::ERROR_INITIALIZATION_FAILED);
+        }
+        let (display, window) = window.handles();
+        let surface = unsafe {
+            ash_window::create_surface(&self.entry, &self.instance, display, window, None)?
+        };
+        let supports_present = unsafe {
+            self.surface_loader.get_physical_device_surface_support(
+                self.physical_device,
+                self.queue_family_index,
+                surface,
+            )
+        };
+        if !matches!(supports_present, Ok(true)) {
+            unsafe { self.surface_loader.destroy_surface(surface, None) };
+            return Err(supports_present
+                .err()
+                .unwrap_or(vk::Result::ERROR_INITIALIZATION_FAILED));
+        }
+        self.surface = surface;
+        self.window_size = size;
+        if !self.offscreen {
+            match self.create_swapchain(size) {
+                Ok(()) | Err(vk::Result::ERROR_OUT_OF_DATE_KHR) => (),
+                Err(error) => {
+                    self.suspend_android_surface();
+                    return Err(error);
+                }
+            }
+        }
+        Ok(())
     }
 
     pub fn texture_image_raw(&self, index: usize) -> u64 {
@@ -1225,9 +1369,8 @@ impl VulkanContext {
         }
     }
 
-    pub(crate) fn recreate_swapchain(&mut self) {
-        let size = self.window_size;
-        self.create_swapchain(size);
+    pub(crate) fn recreate_swapchain(&mut self) -> Result<(), vk::Result> {
+        self.create_swapchain(self.window_size)
     }
 
     pub(crate) fn allocate_descriptor_set(
@@ -1319,14 +1462,6 @@ pub(super) fn env_enabled(name: &str) -> bool {
             "0" | "false" | "off"
         )
     })
-}
-
-pub(crate) fn create_semaphore(device: &Device) -> vk::Semaphore {
-    unsafe {
-        device
-            .create_semaphore(&vk::SemaphoreCreateInfo::default(), None)
-            .unwrap()
-    }
 }
 
 pub(crate) fn create_fence(device: &Device) -> vk::Fence {

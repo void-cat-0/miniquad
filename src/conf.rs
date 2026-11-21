@@ -117,20 +117,21 @@ pub enum WaylandDecorations {
     ServerOnly,
 }
 
-/// Rendering API on Windows and Linux. Apple platforms use `AppleGfxApi`.
+/// Rendering API on Windows, desktop Linux, and Android. Apple platforms use `AppleGfxApi`.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
 pub enum RenderingBackend {
     #[default]
     OpenGl,
     /// Requires the `vulkan` feature and either Vulkan 1.3 or Vulkan 1.2
-    /// with `VK_KHR_dynamic_rendering`.
+    /// with `VK_KHR_dynamic_rendering`. On Android this is experimental and
+    /// requires a compatible system loader (normally Android 13+) and driver.
     Vulkan,
 }
 
 /// Platform-specific settings.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub struct Platform {
-    /// Rendering API on Windows and Linux; defaults to OpenGL.
+    /// Rendering API on Windows, desktop Linux, and Android; defaults to OpenGL.
     /// Selecting Vulkan requires the `vulkan` Cargo feature.
     pub rendering_backend: RenderingBackend,
 
