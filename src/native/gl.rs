@@ -240,6 +240,8 @@ pub const GL_CLAMP_TO_BORDER: u32 = 0x812D;
 pub const GL_TEXTURE_BORDER_COLOR: u32 = 0x1004;
 pub const GL_TEXTURE_BINDING_2D: u32 = 0x8069;
 pub const GL_TEXTURE_BINDING_CUBE_MAP: u32 = 0x8514;
+pub const GL_MAX_SAMPLES: u32 = 0x8D57;
+pub const GL_RENDERBUFFER_SAMPLES: u32 = 0x8CAB;
 pub const GL_RENDERBUFFER_BINDING: u32 = 0x8CA7;
 pub const GL_READ_FRAMEBUFFER_BINDING: u32 = 0x8CAA;
 pub const GL_PACK_ALIGNMENT: u32 = 0x0D05;
@@ -423,6 +425,7 @@ gl_loader!(
         width: GLsizei,
         height: GLsizei
     ) -> (),
+    fn glGetRenderbufferParameteriv(target: GLenum, pname: GLenum, params: *mut GLint) -> (),
     fn glDrawBuffers(n: GLsizei, bufs: *const GLenum) -> (),
     fn glVertexAttribDivisor(index: GLuint, divisor: GLuint) -> (),
     fn glBufferSubData(

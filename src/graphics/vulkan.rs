@@ -260,8 +260,6 @@ pub struct VulkanContext {
     pub cur_color_formats: Vec<vk::Format>,
     /// Depth format of the open render target, if it has a depth attachment.
     pub cur_depth_format: Option<vk::Format>,
-    /// Index of the render target currently open, if any.
-    pub cur_pass: Option<usize>,
     /// Target the open rendering instance draws into, kept after the instance
     /// is closed so it can be reopened after an image layout transition.
     pub cur_target: Option<usize>,
@@ -438,8 +436,7 @@ impl VulkanContext {
                     }
                     let queues = instance.get_physical_device_queue_family_properties(device);
                     let family = queues.iter().enumerate().find_map(|(index, info)| {
-                        (info.queue_count != 0
-                            && info.queue_flags.contains(vk::QueueFlags::GRAPHICS)
+                        (info.queue_flags.contains(vk::QueueFlags::GRAPHICS)
                             && surface_loader
                                 .get_physical_device_surface_support(device, index as u32, surface)
                                 .unwrap_or(false))
@@ -650,7 +647,6 @@ impl VulkanContext {
                 cur_samples: 1,
                 cur_color_formats: Vec::new(),
                 cur_depth_format: None,
-                cur_pass: None,
                 cur_target: None,
                 cur_params: PipelineParams::default(),
 
@@ -1140,16 +1136,11 @@ impl VulkanContext {
     #[cfg(target_os = "android")]
     pub(crate) fn resume_android_surface(
         &mut self,
-        window: crate::native::vulkan::VulkanWindow,
+        window: &crate::native::android::NativeWindow,
         size: (u32, u32),
     ) -> Result<(), vk::Result> {
-        use crate::native::vulkan::VulkanWindow;
-
         self.suspend_android_surface();
-        if !matches!(window, VulkanWindow::Android { window } if window != 0) {
-            return Err(vk::Result::ERROR_INITIALIZATION_FAILED);
-        }
-        let (display, window) = window.handles();
+        let (display, window) = window.vulkan_handle().handles();
         let surface = unsafe {
             ash_window::create_surface(&self.entry, &self.instance, display, window, None)?
         };

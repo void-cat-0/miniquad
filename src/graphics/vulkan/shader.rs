@@ -161,26 +161,18 @@ fn storage(qualifier: &TypeQualifier, value: StorageQualifierData) -> bool {
     })
 }
 
-fn layout_value(qualifier: &TypeQualifier, key: &str) -> Option<u32> {
-    for q in &qualifier.qualifiers {
+fn layout_expression<'a>(qualifier: &'a TypeQualifier, key: &str) -> Option<Option<&'a Expr>> {
+    qualifier.qualifiers.iter().rev().find_map(|q| {
         let TypeQualifierSpecData::Layout(layout) = &q.content else {
-            continue;
+            return None;
         };
-        for id in &layout.ids {
-            let LayoutQualifierSpecData::Identifier(name, Some(expr)) = &id.content else {
-                continue;
-            };
-            if name.as_str() != key {
-                continue;
+        layout.ids.iter().rev().find_map(|id| match &id.content {
+            LayoutQualifierSpecData::Identifier(name, expr) if name.as_str() == key => {
+                Some(expr.as_deref())
             }
-            match expr.content {
-                ExprData::IntConst(value) => return Some(value as u32),
-                ExprData::UIntConst(value) => return Some(value),
-                _ => {}
-            }
-        }
-    }
-    None
+            _ => None,
+        })
+    })
 }
 
 fn set_layout(qualifier: &mut TypeQualifier, key: &str, value: u32) {
@@ -376,7 +368,6 @@ fn upgrade(
     sampler_aliases: &HashMap<String, String>,
     uniform_arrays: &HashSet<String>,
 ) -> Result<TranslationUnit, ShaderError> {
-    split_declarations(&mut unit);
     let mut visitor = Upgrade {
         vertex: matches!(kind, ShaderType::Vertex),
         color: false,
@@ -648,7 +639,7 @@ fn global_constants(unit: &TranslationUnit) -> HashMap<String, i64> {
 }
 
 fn location_width(
-    head: &SingleDeclaration,
+    head: &SingleDeclarationData,
     constants: &HashMap<String, i64>,
     kind: ShaderType,
 ) -> Result<u32, ShaderError> {
@@ -686,11 +677,22 @@ fn interface_locations(
     // Match names across stages, including when declarations occur in different orders.
     let mut locations = HashMap::new();
     let mut next = 0;
-    for (unit, direction, kind) in [
-        (&*vertex, StorageQualifierData::Out, ShaderType::Vertex),
-        (&*fragment, StorageQualifierData::In, ShaderType::Fragment),
+    let vertex_constants = global_constants(vertex);
+    let fragment_constants = global_constants(fragment);
+    for (unit, constants, direction, kind) in [
+        (
+            &*vertex,
+            &vertex_constants,
+            StorageQualifierData::Out,
+            ShaderType::Vertex,
+        ),
+        (
+            &*fragment,
+            &fragment_constants,
+            StorageQualifierData::In,
+            ShaderType::Fragment,
+        ),
     ] {
-        let constants = global_constants(unit);
         for item in &unit.0 {
             let ExternalDeclarationData::Declaration(d) = &item.content else {
                 continue;
@@ -704,22 +706,35 @@ fn interface_locations(
             if !storage(q, direction.clone()) {
                 continue;
             }
-            let Some(location) = layout_value(q, "location") else {
+            let Some(location) = layout_expression(q, "location")
+                .flatten()
+                .and_then(|expr| constant_integer(expr, constants))
+                .and_then(|value| u32::try_from(value).ok())
+            else {
                 continue;
             };
             locations.insert(name.as_str().to_owned(), location);
             next = next.max(
                 location
-                    .checked_add(location_width(&list.head, &constants, kind)?)
+                    .checked_add(location_width(&list.head, constants, kind)?)
                     .ok_or_else(|| error(kind, "Shader interface locations overflow u32"))?,
             );
         }
     }
-    for (unit, direction, kind) in [
-        (vertex, StorageQualifierData::Out, ShaderType::Vertex),
-        (fragment, StorageQualifierData::In, ShaderType::Fragment),
+    for (unit, constants, direction, kind) in [
+        (
+            vertex,
+            &vertex_constants,
+            StorageQualifierData::Out,
+            ShaderType::Vertex,
+        ),
+        (
+            fragment,
+            &fragment_constants,
+            StorageQualifierData::In,
+            ShaderType::Fragment,
+        ),
     ] {
-        let constants = global_constants(unit);
         for item in &mut unit.0 {
             let ExternalDeclarationData::Declaration(d) = &mut item.content else {
                 continue;
@@ -727,22 +742,13 @@ fn interface_locations(
             let DeclarationData::InitDeclaratorList(list) = &mut d.content else {
                 continue;
             };
-            let width = if list
-                .head
-                .ty
-                .qualifier
-                .as_ref()
-                .is_some_and(|q| storage(q, direction.clone()))
-            {
-                location_width(&list.head, &constants, kind)?
-            } else {
-                continue;
-            };
             let head = &mut list.head.content;
-            let (Some(q), Some(name)) = (&mut head.ty.qualifier, &head.name) else {
+            let (Some(q), Some(name)) = (&head.ty.qualifier, &head.name) else {
                 continue;
             };
-            if !storage(q, direction.clone()) || layout_value(q, "location").is_some() {
+            // Keep explicit locations even when our legacy constant evaluator
+            // cannot fold them; glslang will validate those expressions.
+            if !storage(q, direction.clone()) || layout_expression(q, "location").is_some() {
                 continue;
             }
             let location = if let Some(&location) = locations.get(name.as_str()) {
@@ -750,12 +756,12 @@ fn interface_locations(
             } else {
                 let location = next;
                 next = next
-                    .checked_add(width)
+                    .checked_add(location_width(head, constants, kind)?)
                     .ok_or_else(|| error(kind, "Shader interface locations overflow u32"))?;
                 locations.insert(name.as_str().to_owned(), location);
                 location
             };
-            set_layout(q, "location", location);
+            set_layout(head.ty.qualifier.as_mut().unwrap(), "location", location);
         }
     }
     Ok(())
@@ -959,5 +965,34 @@ pub(super) fn compile_glsl_with_layout(
             compile(ShaderType::Fragment)?,
             arrays,
         ))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn explicit_varying_locations_are_preserved() {
+        let mut vertex = TranslationUnit::parse(
+            "layout(location = int(1.0)) out vec4 vertex_color;
+             layout(location = 1 + 1) out vec2 vertex_uv;",
+        )
+        .unwrap();
+        let mut fragment = TranslationUnit::parse(
+            "layout(location = 1) in vec4 fragment_color;
+             in vec2 vertex_uv;",
+        )
+        .unwrap();
+        interface_locations(&mut vertex, &mut fragment).unwrap();
+
+        let mut translated = String::new();
+        glsl::show_translation_unit(&mut translated, &vertex, Default::default()).unwrap();
+        assert!(translated.contains("location = int("), "{}", translated);
+        assert!(translated.contains("location = 1 + 1"), "{}", translated);
+
+        translated.clear();
+        glsl::show_translation_unit(&mut translated, &fragment, Default::default()).unwrap();
+        assert!(translated.contains("location = 2"), "{}", translated);
     }
 }

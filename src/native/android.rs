@@ -85,7 +85,7 @@ enum Message {
 }
 /// Owns the reference acquired by ANativeWindow_fromSurface.
 #[derive(Debug)]
-struct NativeWindow(NonNull<ndk_sys::ANativeWindow>);
+pub(crate) struct NativeWindow(NonNull<ndk_sys::ANativeWindow>);
 
 // The Android native window reference can move from the Java UI thread to
 // the rendering thread. All rendering operations stay on that thread.
@@ -93,7 +93,7 @@ unsafe impl Send for NativeWindow {}
 
 impl NativeWindow {
     #[cfg(feature = "vulkan")]
-    fn vulkan_handle(&self) -> crate::native::vulkan::VulkanWindow {
+    pub(crate) fn vulkan_handle(&self) -> crate::native::vulkan::VulkanWindow {
         crate::native::vulkan::VulkanWindow::Android {
             window: self.0.as_ptr() as usize,
         }
@@ -182,8 +182,6 @@ impl EglState {
             conf.sample_count,
         )
         .expect("Can't create EGL context");
-        assert!(!display.is_null());
-        assert!(!config.is_null());
 
         crate::native::gl::load_gl_funcs(|proc| {
             let name = std::ffi::CString::new(proc).unwrap();
@@ -255,17 +253,17 @@ struct MainThreadState {
     keymods: KeyMods,
 }
 
+#[cfg(feature = "vulkan")]
+fn vulkan_context(event_handler: &mut dyn EventHandler) -> &mut VulkanContext {
+    event_handler
+        .android_vulkan_context()
+        .expect("Android Vulkan EventHandler must return its android_vulkan_context")
+}
+
 impl MainThreadState {
     #[cfg(feature = "vulkan")]
-    fn vulkan_context(&mut self) -> &mut VulkanContext {
-        self.event_handler
-            .android_vulkan_context()
-            .expect("Android Vulkan EventHandler must return its android_vulkan_context")
-    }
-
-    #[cfg(feature = "vulkan")]
     fn suspend_vulkan_surface(&mut self) {
-        self.vulkan_context().suspend_android_surface();
+        vulkan_context(self.event_handler.as_mut()).suspend_android_surface();
         self.vulkan_surface_attached = false;
         crate::native_display().lock().unwrap().vulkan_window = None;
     }
@@ -284,11 +282,11 @@ impl MainThreadState {
     #[cfg(feature = "vulkan")]
     fn attach_vulkan_surface(&mut self, size: (u32, u32)) {
         if let Some(window) = &self.window {
-            let handle = window.vulkan_handle();
-            match self.vulkan_context().resume_android_surface(handle, size) {
+            match vulkan_context(self.event_handler.as_mut()).resume_android_surface(window, size) {
                 Ok(()) => {
                     self.vulkan_surface_attached = true;
-                    crate::native_display().lock().unwrap().vulkan_window = Some(handle);
+                    crate::native_display().lock().unwrap().vulkan_window =
+                        Some(window.vulkan_handle());
                 }
                 Err(vk::Result::ERROR_SURFACE_LOST_KHR | vk::Result::ERROR_OUT_OF_DATE_KHR) => (),
                 Err(error) => panic!("Failed to attach Android Vulkan surface: {:?}", error),
@@ -451,14 +449,14 @@ impl MainThreadState {
                 return false;
             }
             let (width, height) = self.window_size;
-            let context = self.vulkan_context();
+            let context = vulkan_context(self.event_handler.as_mut());
             context.set_window_size(width as u32, height as u32);
             match context.prepare_android_frame() {
                 Ok(true) => {
                     self.update_requested = false;
                     self.event_handler.update();
                     self.event_handler.draw();
-                    let context = self.vulkan_context();
+                    let context = vulkan_context(self.event_handler.as_mut());
                     if !context.offscreen {
                         // Present an acquired frame even if the handler did not
                         // commit it. This is a no-op after commit_frame().
@@ -709,7 +707,7 @@ where
         if vulkan {
             // Reject handlers that cannot follow Android surface changes before
             // allowing them to record anything into the window swapchain.
-            s.vulkan_context();
+            vulkan_context(s.event_handler.as_mut());
         }
         if paused {
             s.event_handler.window_minimized_event();

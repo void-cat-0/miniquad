@@ -351,15 +351,29 @@ pub enum TextureFormat {
 impl TextureFormat {
     /// Returns the size in bytes of texture with `dimensions`.
     pub fn size(self, width: u32, height: u32) -> u32 {
-        let square = width * height;
+        width * height * self.bytes_per_pixel() as u32
+    }
+
+    pub(crate) const fn bytes_per_pixel(self) -> usize {
         match self {
-            TextureFormat::RGB8 => 3 * square,
-            TextureFormat::RGBA8 => 4 * square,
-            TextureFormat::RGBA16F => 8 * square,
-            TextureFormat::Depth => 2 * square,
-            TextureFormat::Depth32 => 4 * square,
-            TextureFormat::Alpha => 1 * square,
+            Self::Alpha => 1,
+            Self::Depth => 2,
+            Self::RGB8 => 3,
+            Self::RGBA8 | Self::Depth32 => 4,
+            Self::RGBA16F => 8,
         }
+    }
+
+    // The backend receives a pointer, not the slice length. Compare in pixels
+    // first: width * height fits in u64, but multiplying by the pixel size may not.
+    pub(crate) fn transfer_len(self, width: u32, height: u32, available: usize) -> usize {
+        let pixels = u64::from(width) * u64::from(height);
+        let bytes_per_pixel = self.bytes_per_pixel();
+        assert!(
+            pixels <= (available / bytes_per_pixel) as u64,
+            "texture transfer buffer is too small"
+        );
+        pixels as usize * bytes_per_pixel
     }
 }
 
@@ -1310,8 +1324,6 @@ pub trait RenderingBackend {
         self.new_texture(TextureAccess::Static, TextureSource::Bytes(bytes), params)
     }
     fn new_texture_from_rgba8(&mut self, width: u16, height: u16, bytes: &[u8]) -> TextureId {
-        assert_eq!(width as usize * height as usize * 4, bytes.len());
-
         self.new_texture_from_data_and_format(
             bytes,
             TextureParams {
@@ -1446,8 +1458,11 @@ pub trait RenderingBackend {
     }
     /// For depth-only render pass returns empty slice.
     fn render_pass_color_attachments(&self, render_pass: RenderPass) -> &[TextureId];
-    /// Single-color MSAA resolve texture, suitable for sampling after the pass ends.
-    fn render_pass_resolve_texture(&self, _render_pass: RenderPass) -> Option<TextureId> { None }
+    /// Resolve texture of a single-color MSAA pass, suitable for sampling after
+    /// the pass ends. Returns `None` if there is not exactly one resolve target.
+    fn render_pass_resolve_texture(&self, _render_pass: RenderPass) -> Option<TextureId> {
+        None
+    }
     /// Delete the pass only. Attachment textures remain owned by the caller.
     fn delete_render_pass(&mut self, render_pass: RenderPass);
     fn new_pipeline(
@@ -1566,4 +1581,21 @@ pub trait RenderingBackend {
     /// NOTE: num_instances > 1 might be not supported by the GPU (gl2.1 and gles2).
     /// `features.instancing` check is required.
     fn draw(&self, base_element: i32, num_elements: i32, num_instances: i32);
+}
+
+#[cfg(test)]
+mod texture_transfer_tests {
+    use super::TextureFormat;
+
+    #[test]
+    fn transfer_len_excludes_trailing_bytes() {
+        assert_eq!(TextureFormat::RGB8.transfer_len(1, 3, 10), 9);
+        assert_eq!(TextureFormat::RGBA16F.transfer_len(4, 1, 40), 32);
+    }
+
+    #[test]
+    #[should_panic(expected = "texture transfer buffer is too small")]
+    fn transfer_len_rejects_wrapped_byte_counts() {
+        TextureFormat::RGBA8.transfer_len(1 << 15, 1 << 15, 4);
+    }
 }

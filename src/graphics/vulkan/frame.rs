@@ -1,4 +1,3 @@
-use super::backend;
 use super::resource::{image_barrier, vk_index_type};
 use super::{VulkanContext, DEPTH_FORMAT, MAX_FRAMES_IN_FLIGHT};
 use crate::graphics::*;
@@ -286,19 +285,17 @@ impl VulkanContext {
                 }
             }
 
-            let (image_index, slot, suboptimal) = loop {
-                let slot = self.acquire_slot;
+            let (image_index, slot, semaphore, suboptimal) = loop {
                 if let Some(image) = prepared.take() {
-                    assert_eq!(
-                        image.swapchain, self.swapchain,
-                        "prepared image belongs to an old swapchain"
+                    break (
+                        image.image_index,
+                        image.slot,
+                        image.semaphore,
+                        image.suboptimal,
                     );
-                    assert_eq!(
-                        image.semaphore, self.image_available[slot],
-                        "prepared image used an unexpected semaphore"
-                    );
-                    break (image.image_index, slot, image.suboptimal);
                 }
+                let slot = self.acquire_slot;
+                let semaphore = self.image_available[slot];
                 #[cfg(feature = "tracy")]
                 let _span = crate::tracy::span_with_callstack(crate::tracy::span_location!(
                     "Vulkan::acquire_next_image (wall time)"
@@ -306,10 +303,12 @@ impl VulkanContext {
                 match self.swapchain_loader.acquire_next_image(
                     self.swapchain,
                     u64::MAX,
-                    self.image_available[slot],
+                    semaphore,
                     vk::Fence::null(),
                 ) {
-                    Ok((image_index, suboptimal)) => break (image_index, slot, suboptimal),
+                    Ok((image_index, suboptimal)) => {
+                        break (image_index, slot, semaphore, suboptimal);
+                    }
                     // The swapchain no longer matches the surface; rebuild it
                     // and try again with the new one.
                     Err(vk::Result::ERROR_OUT_OF_DATE_KHR) => {
@@ -325,12 +324,18 @@ impl VulkanContext {
                 }
             };
 
-            self.start_acquired_frame(image_index, slot, suboptimal);
+            self.start_acquired_frame(image_index, slot, semaphore, suboptimal);
         }
         true
     }
 
-    fn start_acquired_frame(&mut self, image_index: u32, slot: usize, suboptimal: bool) {
+    fn start_acquired_frame(
+        &mut self,
+        image_index: u32,
+        slot: usize,
+        semaphore: vk::Semaphore,
+        suboptimal: bool,
+    ) {
         // Reset only once an image was acquired and a submission will use
         // this fence; the slot stays idle on a failed or skipped acquisition.
         unsafe {
@@ -340,7 +345,7 @@ impl VulkanContext {
         }
         let image_index = image_index as usize;
         self.swapchain_suboptimal = suboptimal;
-        self.frame_wait = self.image_available[slot];
+        self.frame_wait = semaphore;
         self.acquire_slot = (slot + 1) % self.image_available.len();
         self.acquired_image = Some(image_index);
         // The presentation engine owned the image until now, so whatever it
@@ -409,7 +414,12 @@ impl VulkanContext {
         match image {
             Ok((image_index, suboptimal)) => {
                 self.reset_frame_storage();
-                self.start_acquired_frame(image_index, slot, suboptimal);
+                self.start_acquired_frame(
+                    image_index,
+                    slot,
+                    self.image_available[slot],
+                    suboptimal,
+                );
                 Ok(true)
             }
             Err(error) => self.android_frame_not_ready(error),
@@ -472,7 +482,6 @@ impl VulkanContext {
         self.frame_active = false;
         self.frame_submitted = false;
         self.cmd_dirty = false;
-        self.cur_pass = None;
         self.cur_target = None;
         self.cur_pipeline = None;
         self.cur_index_buffer = None;
@@ -1016,7 +1025,7 @@ impl VulkanContext {
         let target = pass.map(|pass| pass.0);
         // Reuse an open target when no clear is requested. end_render_pass
         // still closes the instance so resolves finish at the public boundary.
-        if self.pass_open && self.cur_pass == target && matches!(action, PassAction::Nothing) {
+        if self.pass_open && self.cur_target == target && matches!(action, PassAction::Nothing) {
             return;
         }
         if self.pass_open {
@@ -1221,11 +1230,18 @@ impl VulkanContext {
         }
 
         self.pass_open = true;
-        self.cur_pass = pass.map(|pass| pass.0);
         self.viewport = area;
         self.scissor = area;
         self.cmd_dirty = true;
         self.pending.clear();
+    }
+
+    /// Release the given target even if a transfer already closed its rendering
+    /// instance. Leave a different target alone.
+    pub fn end_render_pass_if_target(&mut self, pass: Option<RenderPass>) {
+        if self.cur_target == pass.map(|pass| pass.0) {
+            self.end_render_pass();
+        }
     }
 
     /// Finish attachment writes and MSAA resolves, matching miniquad 0.4.
@@ -1254,7 +1270,6 @@ impl VulkanContext {
             }
         }
         self.pass_open = false;
-        self.cur_pass = None;
         self.cmd_dirty = true;
     }
 
@@ -1425,7 +1440,12 @@ impl VulkanContext {
         };
     }
 
-    pub(crate) fn apply_bindings(&mut self, bindings: &backend::Bindings) {
+    pub(super) fn apply_bindings(
+        &mut self,
+        vertex_buffers: &[BufferId],
+        index_buffer: BufferId,
+        textures: impl Iterator<Item = usize> + Clone,
+    ) {
         if cfg!(target_os = "android") && !self.frame_active {
             return;
         }
@@ -1435,24 +1455,19 @@ impl VulkanContext {
         let shader = self.pipelines[pipeline.0].shader;
         let images = self.shaders[shader].images.len();
 
+        self.cur_vertex_buffers.clear();
         self.cur_vertex_buffers
-            .resize(bindings.vertex_buffers.len(), None);
-        for (slot, buffer) in bindings.vertex_buffers.iter().enumerate() {
-            self.cur_vertex_buffers[slot] = Some(buffer.0);
-        }
-        self.cur_index_buffer = Some(bindings.index_buffer.0);
+            .extend(vertex_buffers.iter().map(|buffer| Some(buffer.0)));
+        self.cur_index_buffer = Some(index_buffer.0);
 
-        let sampled: Vec<usize> = bindings
-            .images
-            .iter()
-            .take(images)
-            .filter(|texture| texture.texture != 0)
-            .map(|texture| texture.texture as usize)
-            .collect();
-        self.pending.sampled.extend(sampled.iter().copied());
-        let needs_transition = sampled
-            .iter()
-            .any(|&index| self.textures[index].layout != vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL);
+        let sampled = textures.take(images);
+        let texture_modules = &self.textures;
+        self.pending
+            .sampled
+            .extend(sampled.clone().filter(|&index| {
+                texture_modules[index].layout != vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL
+            }));
+        let needs_transition = !self.pending.sampled.is_empty();
         if needs_transition && self.pass_open {
             let target = self.cur_target;
             let viewport = self.viewport;
@@ -1463,12 +1478,10 @@ impl VulkanContext {
             self.scissor = scissor;
         }
 
-        self.pending.images = vec![None; images];
-        for (slot, texture) in bindings.images.iter().take(images).enumerate() {
-            if texture.texture == 0 {
-                continue;
-            }
-            let module = &self.textures[texture.texture as usize];
+        self.pending.images.clear();
+        self.pending.images.resize(images, None);
+        for (slot, texture) in sampled.enumerate() {
+            let module = &self.textures[texture];
             self.pending.images[slot] = Some(vk::DescriptorImageInfo {
                 sampler: module.sampler,
                 image_view: module.sample_view.unwrap_or(module.view),
@@ -1740,9 +1753,9 @@ impl VulkanContext {
             index_buffer: index.current_buffer,
             index_offset: index.current_offset,
             index_type: vk_index_type(index_type),
-            first_index: u32::try_from(base_element).expect("Negative first index"),
-            index_count: u32::try_from(num_elements).expect("Negative index count"),
-            instance_count: u32::try_from(num_instances).expect("Negative instance count"),
+            first_index: base_element as u32,
+            index_count: num_elements as u32,
+            instance_count: num_instances as u32,
             vertex_buffers,
             vertex_offsets,
         };
@@ -1829,7 +1842,7 @@ impl VulkanContext {
                 .filter(|worker| {
                     worker.preacquire_enabled() && self.image_available.len() > MAX_FRAMES_IN_FLIGHT
                 })
-                .map(|_| self.image_available[self.acquire_slot]),
+                .map(|_| (self.acquire_slot, self.image_available[self.acquire_slot])),
         };
         if let Some(worker) = &mut self.submission {
             worker.submit(submission);

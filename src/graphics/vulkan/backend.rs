@@ -52,12 +52,6 @@ impl IndexType {
     }
 }
 
-pub(crate) struct Bindings {
-    pub vertex_buffers: Vec<BufferId>,
-    pub index_buffer: BufferId,
-    pub images: Vec<Texture>,
-}
-
 /// Vulkan implementation of miniquad 0.4's rendering interface.
 /// Construct with `window::new_rendering_backend` after selecting Vulkan in `Conf`.
 pub struct VulkanBackend {
@@ -126,19 +120,6 @@ impl VulkanBackend {
     }
 }
 
-// Called after validating bounds and extents. Widen before forming right and
-// bottom edges so even i32-sized inputs cannot overflow.
-fn regions_overlap(regions: &[TextureUpdateRegion<'_>]) -> bool {
-    regions.iter().enumerate().any(|(i, a)| {
-        let (x, y) = (a.x as u32, a.y as u32);
-        let (right, bottom) = (x + a.width as u32, y + a.height as u32);
-        regions[..i].iter().any(|b| {
-            let (bx, by) = (b.x as u32, b.y as u32);
-            x < bx + b.width as u32 && bx < right && y < by + b.height as u32 && by < bottom
-        })
-    })
-}
-
 impl RenderingBackend for VulkanBackend {
     fn vulkan_context(&mut self) -> Option<&mut VulkanContext> {
         Some(self.context.get_mut())
@@ -191,42 +172,28 @@ impl RenderingBackend for VulkanBackend {
         data: TextureSource,
         params: TextureParams,
     ) -> TextureId {
-        assert_eq!(
-            params.kind,
-            TextureKind::Texture2D,
-            "Vulkan currently supports 2D textures"
-        );
-        assert!(params.width > 0 && params.height > 0);
         let bytes = match data {
             TextureSource::Empty => None,
             TextureSource::Bytes(bytes) => Some(bytes),
-            TextureSource::Array(levels) => {
-                assert_eq!(levels.len(), 1, "2D textures have one layer");
-                assert_eq!(
-                    levels[0].len(),
-                    1,
-                    "Explicit mipmap uploads are not supported by Vulkan"
-                );
-                Some(levels[0][0])
-            }
+            TextureSource::Array([levels]) => match *levels {
+                [bytes] => Some(*bytes),
+                _ => panic!("Vulkan does not support explicit mipmap uploads"),
+            },
+            TextureSource::Array(_) => panic!("Vulkan textures have one layer"),
         };
-        if let Some(bytes) = bytes {
-            assert_eq!(
-                bytes.len(),
-                params.format.size(params.width, params.height) as usize
-            );
-        }
-        let ctx = self.context.get_mut();
         let mut params = params;
-        params.sample_count = ctx
-            .texture_sample_count(params.format, params.sample_count.max(1) as u32)
-            .as_raw() as i32;
-        let index = if params.sample_count > 1 {
-            assert_eq!(access, TextureAccess::RenderTarget);
-            assert!(bytes.is_none(), "Multisampled textures cannot be uploaded");
-            ctx.new_multisample_texture(params, params.sample_count as u32)
+        let ctx = self.context.get_mut();
+        let samples = if access == TextureAccess::RenderTarget {
+            ctx.texture_sample_count(params.format, params.sample_count.max(1) as u32)
         } else {
+            vk::SampleCountFlags::TYPE_1
+        };
+        params.sample_count = samples.as_raw() as i32;
+        let index = if samples == vk::SampleCountFlags::TYPE_1 {
             ctx.new_texture(bytes, params, access)
+        } else {
+            assert!(bytes.is_none(), "Multisampled textures cannot be uploaded");
+            ctx.new_attachment_texture(params, samples)
         };
         self.textures
             .resize(self.textures.len().max(index + 1), None);
@@ -296,23 +263,15 @@ impl RenderingBackend for VulkanBackend {
         bytes: Option<&[u8]>,
     ) {
         let index = self.texture_index(texture);
-        let params = self.textures[index].as_mut().unwrap();
-        assert!(width > 0 && height > 0);
-        if let Some(bytes) = bytes {
-            assert_eq!(
-                params.sample_count, 1,
-                "Multisampled textures cannot be uploaded"
-            );
-            assert_eq!(bytes.len(), params.format.size(width, height) as usize);
-        }
-        params.width = width;
-        params.height = height;
-        self.context.get_mut().resize_texture_with_wrap_y(
-            index,
-            *params,
-            bytes,
-            self.wrap_y[index],
-        );
+        let params = TextureParams {
+            width,
+            height,
+            ..self.textures[index].unwrap()
+        };
+        self.context
+            .get_mut()
+            .resize_texture_with_wrap_y(index, params, bytes, self.wrap_y[index]);
+        self.textures[index] = Some(params);
     }
     fn texture_grab_screen(&mut self, texture: TextureId) {
         let index = self.texture_index(texture);
@@ -332,18 +291,7 @@ impl RenderingBackend for VulkanBackend {
     }
     fn texture_read_pixels(&mut self, texture: TextureId, bytes: &mut [u8]) {
         let index = self.texture_index(texture);
-        let params = self.textures[index].unwrap();
-        assert_eq!(
-            bytes.len(),
-            params.format.size(params.width, params.height) as usize
-        );
-        self.context.get_mut().read_texture_pixels(
-            index,
-            params.width,
-            params.height,
-            params.format,
-            bytes,
-        );
+        self.context.get_mut().read_texture_pixels(index, bytes);
     }
     fn texture_update_part(
         &mut self,
@@ -354,24 +302,15 @@ impl RenderingBackend for VulkanBackend {
         height: i32,
         bytes: &[u8],
     ) {
-        let index = self.texture_index(texture);
-        let params = self.textures[index].unwrap();
-        assert!(x >= 0 && y >= 0 && width > 0 && height > 0);
-        assert!(
-            x as u32 + width as u32 <= params.width && y as u32 + height as u32 <= params.height
-        );
-        assert_eq!(
-            bytes.len(),
-            params.format.size(width as u32, height as u32) as usize
-        );
-        self.context.get_mut().update_texture_part(
-            index,
-            x,
-            y,
-            width,
-            height,
-            bytes,
-            params.format,
+        self.texture_update_regions(
+            texture,
+            &[TextureUpdateRegion {
+                x,
+                y,
+                width,
+                height,
+                bytes,
+            }],
         );
     }
     fn texture_update_regions(&mut self, texture: TextureId, regions: &[TextureUpdateRegion<'_>]) {
@@ -379,40 +318,9 @@ impl RenderingBackend for VulkanBackend {
             return;
         }
         let index = self.texture_index(texture);
-        let params = self.textures[index].unwrap();
-        if params.format == TextureFormat::RGBA8
-            && params.kind == TextureKind::Texture2D
-            && params.sample_count <= 1
-        {
-            for region in regions {
-                assert!(region.x >= 0 && region.y >= 0 && region.width > 0 && region.height > 0);
-                assert!(
-                    region.x as u32 + region.width as u32 <= params.width
-                        && region.y as u32 + region.height as u32 <= params.height
-                );
-                let len = (region.width as usize)
-                    .checked_mul(region.height as usize)
-                    .and_then(|pixels| pixels.checked_mul(4))
-                    .expect("Texture update dimensions overflow");
-                assert_eq!(region.bytes.len(), len);
-            }
-            // Regions in one copy have no ordering. Keep the sequential path
-            // whenever two destination rectangles share pixels.
-            if !regions_overlap(regions) {
-                self.context.get_mut().upload_rgba8_regions(index, regions);
-                return;
-            }
-        }
-        for region in regions {
-            self.texture_update_part(
-                texture,
-                region.x,
-                region.y,
-                region.width,
-                region.height,
-                region.bytes,
-            );
-        }
+        self.context
+            .get_mut()
+            .update_texture_regions(index, regions);
     }
     fn delete_texture(&mut self, texture: TextureId) {
         let index = self.texture_index(texture);
@@ -426,13 +334,13 @@ impl RenderingBackend for VulkanBackend {
         resolves: Option<&[TextureId]>,
         depth: Option<TextureId>,
     ) -> RenderPass {
-        assert!(
-            !colors.is_empty() || depth.is_some(),
-            "Render pass needs an attachment"
-        );
+        let target = colors
+            .first()
+            .copied()
+            .or(depth)
+            .expect("Render pass needs an attachment");
         let attachments: Vec<_> = colors.iter().map(|id| self.attachment(*id)).collect();
         let depth_attachment = depth.map(|id| self.attachment(id));
-        let target = colors.first().copied().or(depth).unwrap();
         let params = self.texture_params(target);
         let resolves = match resolves {
             Some(ids) => {
@@ -498,8 +406,10 @@ impl RenderingBackend for VulkanBackend {
     fn render_pass_resolve_texture(&self, pass: RenderPass) -> Option<TextureId> {
         let ctx = self.context.borrow();
         let pass = ctx.passes[pass.0].as_ref().expect("Deleted render pass");
-        assert_eq!(pass.resolves.len(), 1, "multiple resolve attachments");
-        pass.resolves[0].map(|texture| TextureId(TextureIdInner::Managed(texture.texture as usize)))
+        match pass.resolves.as_slice() {
+            [Some(texture)] => Some(TextureId(TextureIdInner::Managed(texture.texture as usize))),
+            _ => None,
+        }
     }
     fn delete_render_pass(&mut self, pass: RenderPass) {
         self.context.get_mut().delete_render_pass(pass.0);
@@ -593,7 +503,6 @@ impl RenderingBackend for VulkanBackend {
             BufferSource::Slice(arg) => arg,
             BufferSource::Empty { .. } => panic!("buffer_update requires data"),
         };
-        assert!(arg.size <= self.buffers[buffer.0]);
         self.context
             .get_mut()
             .update_buffer(buffer.0, arg.ptr as *const u8, arg.size);
@@ -616,12 +525,12 @@ impl RenderingBackend for VulkanBackend {
         indices: BufferId,
         images: &[TextureId],
     ) {
-        let bindings = Bindings {
-            vertex_buffers: vertices.to_vec(),
-            index_buffer: indices,
-            images: images.iter().map(|id| self.attachment(*id)).collect(),
-        };
-        self.context.get_mut().apply_bindings(&bindings);
+        let mut context = self.context.borrow_mut();
+        context.apply_bindings(
+            vertices,
+            indices,
+            images.iter().map(|id| self.texture_index(*id)),
+        );
     }
     fn apply_uniforms_from_bytes(&mut self, ptr: *const u8, size: usize) {
         unsafe { self.context.get_mut().apply_uniforms_from_bytes(ptr, size) };

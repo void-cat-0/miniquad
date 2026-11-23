@@ -27,7 +27,7 @@ type AcquireResult = Result<Option<PreparedImage>, vk::Result>;
 
 #[derive(Debug, PartialEq)]
 pub(super) struct PreparedImage {
-    pub swapchain: vk::SwapchainKHR,
+    pub slot: usize,
     pub image_index: u32,
     pub semaphore: vk::Semaphore,
     pub suboptimal: bool,
@@ -48,7 +48,7 @@ pub(super) struct FrameSubmission {
     pub image_index: u32,
     /// A semaphore whose previous GPU wait has finished. The next frame uses
     /// it only if the worker successfully acquires another image.
-    pub next_acquire: Option<vk::Semaphore>,
+    pub next_acquire: Option<(usize, vk::Semaphore)>,
 }
 
 impl FrameSubmission {
@@ -94,7 +94,7 @@ impl FrameSubmission {
                     return Err(error);
                 }
             }
-            if let Some(semaphore) = self.next_acquire {
+            if let Some((slot, semaphore)) = self.next_acquire {
                 let result = {
                     #[cfg(feature = "tracy")]
                     let _span = crate::tracy::span(crate::tracy::span_location!(
@@ -107,7 +107,7 @@ impl FrameSubmission {
                         vk::Fence::null(),
                     ) {
                         Ok((image_index, suboptimal)) => Ok(Some(PreparedImage {
-                            swapchain: self.swapchain,
+                            slot,
                             image_index,
                             semaphore,
                             suboptimal,
@@ -269,12 +269,6 @@ impl SubmissionWorker {
         ));
         let recreate = self.wait_while(|worker| worker.acquiring)?;
         Ok((self.prepared.take(), recreate))
-    }
-
-    /// Called after draining, before replacing swapchain/semaphore handles.
-    pub fn discard_prepared(&mut self) {
-        assert!(!self.acquiring);
-        self.prepared = None;
     }
 
     pub fn wait_slot(&mut self, slot: usize) -> PresentResult {

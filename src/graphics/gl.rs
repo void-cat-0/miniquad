@@ -396,19 +396,7 @@ fn narrow_widened_half(value: f32) -> u16 {
     }
 }
 
-// GL receives a pointer, not the slice length. Compare in pixels before
-// multiplying by the number of bytes per pixel.
-fn transfer_len(format: TextureFormat, width: GLsizei, height: GLsizei, available: usize) -> usize {
-    let pixels = u64::from(width.max(0) as u32) * u64::from(height.max(0) as u32);
-    let bytes_per_pixel = format.size(1, 1) as usize;
-    assert!(
-        pixels <= (available / bytes_per_pixel) as u64,
-        "texture transfer buffer is too small"
-    );
-    pixels as usize * bytes_per_pixel
-}
-
-fn mip_sizes(width: GLsizei, height: GLsizei) -> impl Iterator<Item = (GLsizei, GLsizei)> {
+fn mip_sizes(width: u32, height: u32) -> impl Iterator<Item = (u32, u32)> {
     std::iter::successors(Some((width, height)), |&(w, h)| {
         (w > 0 && h > 0 && (w > 1 || h > 1)).then(|| ((w / 2).max(1), (h / 2).max(1)))
     })
@@ -591,7 +579,11 @@ impl Texture {
         source: TextureSource,
         params: TextureParams,
     ) -> Texture {
-        let (width, height) = (params.width as GLsizei, params.height as GLsizei);
+        let (width, height) = (params.width, params.height);
+        assert!(
+            width <= GLsizei::MAX as u32 && height <= GLsizei::MAX as u32,
+            "texture dimensions exceed GL's signed size range"
+        );
         let faces = if params.kind == TextureKind::CubeMap {
             6
         } else {
@@ -619,10 +611,24 @@ impl Texture {
                     GL_RENDERBUFFER,
                     params.sample_count,
                     internal_format,
-                    width,
-                    height,
+                    width as GLsizei,
+                    height as GLsizei,
                 );
+                #[cfg(not(target_arch = "wasm32"))]
+                {
+                    params.sample_count = 0;
+                    glGetRenderbufferParameteriv(
+                        GL_RENDERBUFFER,
+                        GL_RENDERBUFFER_SAMPLES,
+                        &mut params.sample_count,
+                    );
+                }
                 glBindRenderbuffer(GL_RENDERBUFFER, previous);
+                #[cfg(not(target_arch = "wasm32"))]
+                if params.sample_count < 2 {
+                    glDeleteRenderbuffers(1, &renderbuffer);
+                    panic!("failed to allocate a multisampled GL renderbuffer");
+                }
             }
             return Texture {
                 raw: TextureOrRenderbuffer::Renderbuffer(renderbuffer),
@@ -635,12 +641,12 @@ impl Texture {
         match source {
             TextureSource::Empty => {}
             TextureSource::Bytes(bytes) => {
-                transfer_len(params.format, width, height, bytes.len());
+                params.format.transfer_len(width, height, bytes.len());
             }
             TextureSource::Array(array) => {
                 for mipmaps in array.iter().take(faces) {
                     for ((w, h), bytes) in mip_sizes(width, height).zip(*mipmaps) {
-                        transfer_len(params.format, w, h, bytes.len());
+                        params.format.transfer_len(w, h, bytes.len());
                     }
                 }
             }
@@ -654,13 +660,13 @@ impl Texture {
             if params.format == TextureFormat::Alpha && caps.alpha_swizzle {
                 glTexParameteri(gl_target, GL_TEXTURE_SWIZZLE_A, GL_RED as GLint);
             }
-            let upload = |target, level, w, h, bytes: Option<&[u8]>| {
+            let upload = |target, level, w: u32, h: u32, bytes: Option<&[u8]>| {
                 glTexImage2D(
                     target,
                     level,
                     internal_format as GLint,
-                    w,
-                    h,
+                    w as GLsizei,
+                    h as GLsizei,
                     0,
                     format,
                     pixel_type,
@@ -717,7 +723,7 @@ impl Texture {
             return;
         }
         if let Some(bytes) = source {
-            transfer_len(self.params.format, gl_width, gl_height, bytes.len());
+            self.params.format.transfer_len(width, height, bytes.len());
         }
         let raw = self
             .raw
@@ -756,7 +762,9 @@ impl Texture {
         if width <= 0 || height <= 0 || self.params.kind == TextureKind::CubeMap {
             return;
         }
-        transfer_len(self.params.format, width, height, source.len());
+        self.params
+            .format
+            .transfer_len(width as u32, height as u32, source.len());
         let raw = self
             .raw
             .texture()
@@ -799,7 +807,10 @@ impl Texture {
             .raw
             .texture()
             .expect("Texture readback is not supported for multisampled textures");
-        let len = transfer_len(self.params.format, width, height, bytes.len());
+        let len = self
+            .params
+            .format
+            .transfer_len(width as u32, height as u32, bytes.len());
 
         // GLES/WebGL guarantee RGBA/UNSIGNED_BYTE for normalized color buffers,
         // not a direct RGB or RED read. Keep the public bytes tightly packed.
@@ -1254,7 +1265,7 @@ fn gl_info() -> ContextInfo {
     let gl2 = gl_version_string.is_empty()
         || gl_version_string.starts_with("2")
         || gl_version_string.starts_with("OpenGL ES 2");
-    let webgl1 = gl_version_string == "WebGL 1.0";
+    let webgl1 = gl_version_string.starts_with("WebGL 1.");
 
     let features = Features {
         instancing: !gl2,
@@ -1268,14 +1279,12 @@ fn gl_info() -> ContextInfo {
     // It was tested on really old windows machines, virtual machines etc. glsl100 always works!
     glsl_support.v100 = true;
 
-    // on wasm miniquad always creates webgl1 context, with the only glsl available being version 100
     #[cfg(target_arch = "wasm32")]
     {
         // on web, miniquad always loads EXT_shader_texture_lod and OES_standard_derivatives
         glsl_support.v100_ext = true;
 
-        let webgl2 = gl_version_string.contains("WebGL 2.0");
-        if webgl2 {
+        if gl_version_string.starts_with("WebGL 2.") {
             glsl_support.v300es = true;
         }
     }
@@ -1350,8 +1359,15 @@ impl RenderingBackend for GlContext {
         &mut self,
         access: TextureAccess,
         source: TextureSource,
-        params: TextureParams,
+        mut params: TextureParams,
     ) -> TextureId {
+        if params.sample_count > 1 {
+            params.sample_count = if self.info.features.resolve_attachments {
+                params.sample_count.min(unsafe { gl_integer(GL_MAX_SAMPLES) }).max(1)
+            } else {
+                1
+            };
+        }
         let texture = Texture::new(&self.transfer_caps, access, source, params);
         TextureId(TextureIdInner::Managed(self.textures.0.add(texture)))
     }
@@ -1522,6 +1538,10 @@ impl RenderingBackend for GlContext {
         if color_img.is_empty() && depth_img.is_none() {
             panic!("Render pass should have at least one non-none target");
         }
+        let resolve_img = resolve_img.filter(|images| !images.is_empty());
+        if resolve_img.is_some() && !self.info.features.resolve_attachments {
+            panic!("MSAA resolves are unsupported by this GL context");
+        }
         let mut gl_fb = 0;
 
         let mut resolves = None;
@@ -1570,19 +1590,19 @@ impl RenderingBackend for GlContext {
                     );
                 }
             }
-            let mut attachments = vec![];
-            for i in 0..color_img.len() {
-                attachments.push(GL_COLOR_ATTACHMENT0 + i as u32);
-            }
-
             if color_img.len() > 1 {
-                glDrawBuffers(color_img.len() as _, attachments.as_ptr() as _);
+                let attachments: Vec<_> = (0..color_img.len())
+                    .map(|i| GL_COLOR_ATTACHMENT0 + i as u32)
+                    .collect();
+                glDrawBuffers(attachments.len() as _, attachments.as_ptr());
             }
 
             if let Some(resolve_img) = resolve_img {
                 resolves = Some(vec![]);
                 let resolves = resolves.as_mut().unwrap();
-                for (i, resolve_img) in resolve_img.iter().enumerate() {
+                for resolve_img in resolve_img {
+                    // Each destination has only one color output. The index
+                    // selects the source attachment when blitting, not the destination.
                     let mut resolve_fb = 0;
                     glGenFramebuffers(1, &mut resolve_fb as *mut _);
                     glBindFramebuffer(GL_FRAMEBUFFER, resolve_fb);
@@ -1591,14 +1611,11 @@ impl RenderingBackend for GlContext {
                     let raw = texture.raw.texture().unwrap();
                     glFramebufferTexture2D(
                         GL_FRAMEBUFFER,
-                        GL_COLOR_ATTACHMENT0 + i as u32,
+                        GL_COLOR_ATTACHMENT0,
                         GL_TEXTURE_2D,
                         raw,
                         0,
                     );
-                    let fb_status = glCheckFramebufferStatus(GL_FRAMEBUFFER);
-                    assert!(fb_status != 0);
-                    glDrawBuffers(1, attachments.as_ptr() as _);
                 }
             }
             glBindFramebuffer(GL_FRAMEBUFFER, self.default_framebuffer);
@@ -1616,10 +1633,10 @@ impl RenderingBackend for GlContext {
         &self.passes[render_pass.0].color_textures
     }
     fn render_pass_resolve_texture(&self, pass: RenderPass) -> Option<TextureId> {
-        self.passes[pass.0].resolves.as_ref().map(|resolves| {
-            assert_eq!(resolves.len(), 1, "multiple resolve attachments");
-            resolves[0].1
-        })
+        match self.passes[pass.0].resolves.as_deref() {
+            Some([(_, texture)]) => Some(*texture),
+            _ => None,
+        }
     }
     fn delete_render_pass(&mut self, render_pass: RenderPass) {
         let pass_id = render_pass.0;
@@ -1629,7 +1646,11 @@ impl RenderingBackend for GlContext {
         unsafe { glDeleteFramebuffers(1, &render_pass.gl_fb as *const _) }
 
         if let Some(resolves) = render_pass.resolves {
-            for (fb, _) in resolves { unsafe { glDeleteFramebuffers(1, &fb); } }
+            for (fb, _) in resolves {
+                unsafe {
+                    glDeleteFramebuffers(1, &fb);
+                }
+            }
         }
     }
 
@@ -2213,19 +2234,11 @@ mod transfer_tests {
     use super::*;
 
     #[test]
-    fn transfer_sizes_match_the_layout() {
-        assert_eq!(transfer_len(TextureFormat::RGB8, 1, 3, 16), 9);
-        assert_eq!(transfer_len(TextureFormat::RGBA16F, 4, 1, 32), 32);
+    fn mip_levels_shrink_each_axis_independently() {
         assert_eq!(
             mip_sizes(5, 2).collect::<Vec<_>>(),
             [(5, 2), (2, 1), (1, 1)]
         );
-    }
-
-    #[test]
-    #[should_panic(expected = "texture transfer buffer is too small")]
-    fn a_large_transfer_cannot_wrap_to_a_small_buffer() {
-        transfer_len(TextureFormat::RGBA16F, i32::MAX, i32::MAX, 64);
     }
 
     #[cfg(not(target_arch = "wasm32"))]

@@ -22,7 +22,8 @@ fn main() {
             miniquad::RenderingBackend::info(&ctx).gl_version_string
         );
         check_transfers(&mut ctx);
-        println!("OpenGL texture transfer checks passed");
+        check_resolves(&mut ctx);
+        println!("OpenGL texture transfer and resolve checks passed");
         Box::new(Stage)
     });
 }
@@ -172,6 +173,75 @@ fn check_transfers(ctx: &mut dyn miniquad::RenderingBackend) {
             );
         }
     }
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+fn check_resolves(ctx: &mut dyn miniquad::RenderingBackend) {
+    use miniquad::{gl::*, PassAction, TextureFormat, TextureParams};
+
+    let params = TextureParams {
+        width: 2,
+        height: 2,
+        ..Default::default()
+    };
+    let resolved = [
+        ctx.new_render_texture(params),
+        ctx.new_render_texture(params),
+    ];
+    let pass = ctx.new_render_pass(resolved[0], None);
+    assert_eq!(ctx.render_pass_resolve_texture(pass), None);
+    ctx.delete_render_pass(pass);
+
+    let mut max_samples = 0;
+    unsafe { glGetIntegerv(GL_MAX_SAMPLES, &mut max_samples) };
+    let sample_count = 4.min(max_samples);
+    if sample_count > 1 {
+        let params = TextureParams {
+            sample_count,
+            ..params
+        };
+        let colors = [
+            ctx.new_render_texture(params),
+            ctx.new_render_texture(params),
+        ];
+        let depth = ctx.new_render_texture(TextureParams {
+            format: TextureFormat::Depth,
+            ..params
+        });
+        let color_samples = ctx.texture_params(colors[0]).sample_count;
+        assert!(color_samples >= sample_count);
+        assert_eq!(ctx.texture_params(depth).sample_count, color_samples);
+
+        let single = ctx.new_render_pass_mrt(&colors[..1], Some(&resolved[..1]), Some(depth));
+        assert_eq!(ctx.render_pass_resolve_texture(single), Some(resolved[0]));
+        ctx.begin_pass(Some(single), PassAction::clear_color(1., 0., 0., 1.));
+        ctx.end_render_pass();
+        ctx.delete_render_pass(single);
+        let mut bytes = [0; 16];
+        ctx.texture_read_pixels(resolved[0], &mut bytes);
+        assert_eq!(bytes, [255, 0, 0, 255].repeat(4).as_slice());
+
+        let multiple = ctx.new_render_pass_mrt(&colors, Some(&resolved), Some(depth));
+        assert_eq!(ctx.render_pass_resolve_texture(multiple), None);
+        ctx.begin_pass(Some(multiple), PassAction::Nothing);
+        unsafe {
+            glClearBufferfv(GL_COLOR, 0, [0., 1., 0., 1.].as_ptr());
+            glClearBufferfv(GL_COLOR, 1, [0., 0., 1., 1.].as_ptr());
+        }
+        ctx.end_render_pass();
+        ctx.delete_render_pass(multiple);
+        for (&texture, pixel) in resolved.iter().zip([[0, 255, 0, 255], [0, 0, 255, 255]]) {
+            ctx.texture_read_pixels(texture, &mut bytes);
+            assert_eq!(bytes, pixel.repeat(4).as_slice());
+        }
+        for texture in [colors[0], colors[1], depth] {
+            ctx.delete_texture(texture);
+        }
+    }
+    for texture in resolved {
+        ctx.delete_texture(texture);
+    }
+    assert_eq!(unsafe { glGetError() }, GL_NO_ERROR);
 }
 
 #[cfg(target_arch = "wasm32")]

@@ -64,6 +64,8 @@ pub struct TextureModule {
     pub width: u32,
     pub height: u32,
     pub format: vk::Format,
+    source_format: TextureFormat,
+    usage: vk::ImageUsageFlags,
     pub layout: vk::ImageLayout,
     pub mip_levels: u32,
     pub filter: FilterMode,
@@ -92,6 +94,8 @@ pub(crate) fn empty_texture_module() -> TextureModule {
         width: 0,
         height: 0,
         format: vk::Format::UNDEFINED,
+        source_format: TextureFormat::RGBA8,
+        usage: vk::ImageUsageFlags::empty(),
         layout: vk::ImageLayout::UNDEFINED,
         mip_levels: 1,
         filter: FilterMode::Linear,
@@ -789,15 +793,17 @@ impl VulkanContext {
         size: usize,
         data: Option<*const u8>,
     ) -> BufferId {
+        let widen = index_type == Some(IndexType::Byte);
+        let element_bytes = if widen { 2 } else { 1 };
+        assert!(
+            size <= isize::MAX as usize / element_bytes,
+            "Buffer exceeds the address space"
+        );
+        let capacity = size * element_bytes;
         unsafe {
             let usage = match buffer_type {
                 BufferType::VertexBuffer => vk::BufferUsageFlags::VERTEX_BUFFER,
                 BufferType::IndexBuffer => vk::BufferUsageFlags::INDEX_BUFFER,
-            };
-            let capacity = if index_type == Some(IndexType::Byte) {
-                size * 2
-            } else {
-                size
             };
             let (buffer, memory) = self.create_buffer(
                 capacity.max(4) as vk::DeviceSize,
@@ -807,7 +813,7 @@ impl VulkanContext {
             let mut allocation = ResourceAllocation::buffer(&self.device, buffer, memory);
 
             if let Some(data) = data {
-                if index_type == Some(IndexType::Byte) {
+                if widen {
                     let wide = widen_indices(data, size);
                     self.write_buffer(memory, 0, wide.as_ptr(), wide.len());
                 } else {
@@ -828,7 +834,7 @@ impl VulkanContext {
                         index_type
                     }
                 }),
-                widen: index_type == Some(IndexType::Byte),
+                widen,
             };
             let index = if let Some(index) = self.free_buffers.pop() {
                 self.buffers[index] = module;
@@ -867,11 +873,17 @@ impl VulkanContext {
     }
 
     pub fn update_buffer(&mut self, index: usize, data: *const u8, size: usize) {
+        let module = &self.buffers[index];
         assert!(
-            self.buffers[index].buffer != vk::Buffer::null(),
+            module.buffer != vk::Buffer::null(),
             "Buffer has been deleted"
         );
-        let (buffer, offset) = if self.buffers[index].widen {
+        let logical_size = module.size as usize / if module.widen { 2 } else { 1 };
+        assert!(
+            size <= logical_size,
+            "Buffer update is larger than the buffer"
+        );
+        let (buffer, offset) = if module.widen {
             let wide = widen_indices(data, size);
             self.append_stream(wide.as_ptr(), wide.len())
         } else {
@@ -970,6 +982,13 @@ impl VulkanContext {
         access: TextureAccess,
         wrap_y: TextureWrap,
     ) -> usize {
+        self.validate_texture_extent(params);
+        let bytes = bytes.map(|bytes| {
+            let len = params
+                .format
+                .transfer_len(params.width, params.height, bytes.len());
+            &bytes[..len]
+        });
         unsafe {
             let format = vk_texture_format(params.format, access);
             let depth =
@@ -1053,6 +1072,8 @@ impl VulkanContext {
                 width: params.width,
                 height: params.height,
                 format,
+                source_format: params.format,
+                usage,
                 layout: vk::ImageLayout::UNDEFINED,
                 mip_levels,
                 filter: params.min_filter,
@@ -1069,11 +1090,13 @@ impl VulkanContext {
                 Some(bytes) => {
                     self.upload_texture(
                         index,
-                        0,
-                        0,
-                        params.width as i32,
-                        params.height as i32,
-                        bytes,
+                        TextureUpdateRegion {
+                            x: 0,
+                            y: 0,
+                            width: params.width as i32,
+                            height: params.height as i32,
+                            bytes,
+                        },
                     );
                     if access == TextureAccess::RenderTarget && !depth {
                         let from = self.textures[index].layout;
@@ -1183,7 +1206,15 @@ impl VulkanContext {
         );
     }
 
-    pub fn resize_texture(&mut self, index: usize, params: TextureParams, bytes: Option<&[u8]>) {
+    pub fn resize_texture(
+        &mut self,
+        index: usize,
+        mut params: TextureParams,
+        bytes: Option<&[u8]>,
+    ) {
+        params.sample_count = self
+            .texture_sample_count(params.format, params.sample_count.max(1) as u32)
+            .as_raw() as i32;
         self.resize_texture_with_wrap_y(index, params, bytes, params.wrap);
     }
 
@@ -1196,7 +1227,11 @@ impl VulkanContext {
     ) {
         self.synchronize_resources();
         let fresh = if params.sample_count > 1 {
-            self.new_multisample_texture(params, params.sample_count as u32)
+            assert!(bytes.is_none(), "Multisampled textures cannot be uploaded");
+            self.new_attachment_texture(
+                params,
+                vk::SampleCountFlags::from_raw(params.sample_count as u32),
+            )
         } else {
             self.new_texture_with_wrap_y(bytes, params, self.textures[index].access, wrap_y)
         };
@@ -1241,7 +1276,61 @@ impl VulkanContext {
         bytes: &[u8],
         _format: TextureFormat,
     ) {
-        self.upload_texture(index, x_offset, y_offset, width, height, bytes);
+        self.update_texture_regions(
+            index,
+            &[TextureUpdateRegion {
+                x: x_offset,
+                y: y_offset,
+                width,
+                height,
+                bytes,
+            }],
+        );
+    }
+
+    pub(super) fn update_texture_regions(
+        &mut self,
+        index: usize,
+        regions: &[TextureUpdateRegion<'_>],
+    ) {
+        let texture = &self.textures[index];
+        assert!(
+            texture.usage.contains(vk::ImageUsageFlags::TRANSFER_DST),
+            "Texture does not support transfer writes"
+        );
+        let bpp = texture.source_format.bytes_per_pixel();
+        for region in regions {
+            let TextureUpdateRegion {
+                x,
+                y,
+                width,
+                height,
+                bytes,
+            } = *region;
+            assert!(
+                x >= 0
+                    && y >= 0
+                    && width > 0
+                    && height > 0
+                    && x as u32 + width as u32 <= texture.width
+                    && y as u32 + height as u32 <= texture.height,
+                "texture update region is outside the texture",
+            );
+            let pixels = u64::from(width as u32) * u64::from(height as u32);
+            // Compare pixels first; the byte count could overflow on 32-bit.
+            assert!(
+                pixels == (bytes.len() / bpp) as u64 && bytes.len() % bpp == 0,
+                "texture update data must be tightly packed",
+            );
+        }
+        // Regions in one copy have no ordering. Overlapping uploads must run in slice order.
+        if texture.source_format == TextureFormat::RGBA8 && !regions_overlap(regions) {
+            self.upload_rgba8_regions(index, regions);
+        } else {
+            for &region in regions {
+                self.upload_texture(index, region);
+            }
+        }
     }
 
     pub fn delete_texture(&mut self, index: usize) {
@@ -1411,37 +1500,45 @@ impl VulkanContext {
         }
     }
 
-    pub(crate) fn read_texture_pixels(
-        &mut self,
-        index: usize,
-        width: u32,
-        height: u32,
-        format: TextureFormat,
-        bytes: &mut [u8],
-    ) {
+    pub(super) fn read_texture_pixels(&mut self, index: usize, bytes: &mut [u8]) {
+        let texture = &self.textures[index];
+        let (width, height) = (texture.width, texture.height);
+        let len = texture
+            .source_format
+            .transfer_len(width, height, bytes.len());
+        let bytes = &mut bytes[..len];
+        assert!(
+            texture.usage.contains(vk::ImageUsageFlags::TRANSFER_SRC),
+            "Texture does not support transfer reads"
+        );
+        let from_layout = texture.layout;
+        assert_ne!(
+            from_layout,
+            vk::ImageLayout::UNDEFINED,
+            "Cannot read an uninitialized texture"
+        );
+        let image = texture.image;
+        let aspect_mask = if is_depth_format(texture.format) {
+            vk::ImageAspectFlags::DEPTH
+        } else {
+            vk::ImageAspectFlags::COLOR
+        };
+        // RGB8 storage is RGBA8. Let the array allocation check that the
+        // expanded size fits the address space before using it for staging.
+        let packed = texture.source_format == TextureFormat::RGB8;
+        let mut rgba = if packed {
+            vec![[0u8; 4]; len / 3]
+        } else {
+            Vec::new()
+        };
+        let pixels = if packed {
+            rgba.as_flattened_mut()
+        } else {
+            &mut *bytes
+        };
+        let pixel_len = pixels.len();
         self.drain_submissions();
         unsafe {
-            let image = self.textures[index].image;
-            let from_layout = self.textures[index].layout;
-            let aspect_mask = if is_depth_format(self.textures[index].format) {
-                vk::ImageAspectFlags::DEPTH
-            } else {
-                vk::ImageAspectFlags::COLOR
-            };
-            // An `RGB8` render target is stored with four channels, so it is
-            // read back into a matching buffer and packed afterwards.
-            let packed = self.textures[index].format == vk::Format::R8G8B8A8_UNORM
-                && format == TextureFormat::RGB8;
-            let mut rgba = if packed {
-                vec![0; width as usize * height as usize * 4]
-            } else {
-                Vec::new()
-            };
-            let (pixels, pixel_len) = if packed {
-                (rgba.as_mut_ptr(), rgba.len())
-            } else {
-                (bytes.as_mut_ptr(), bytes.len())
-            };
             self.ensure_readback(pixel_len);
             let staging = self.readback_buffer;
 
@@ -1535,12 +1632,11 @@ impl VulkanContext {
 
             // Texture targets use a positive-height viewport, so image row zero
             // already matches OpenGL's bottom row and glReadPixels row order.
-            ptr::copy_nonoverlapping(self.readback_mapped, pixels, pixel_len);
-            if packed {
-                let out = bytes.as_mut_ptr();
-                for i in 0..width as usize * height as usize {
-                    ptr::copy_nonoverlapping(pixels.add(i * 4), out.add(i * 3), 3);
-                }
+            ptr::copy_nonoverlapping(self.readback_mapped, pixels.as_mut_ptr(), pixel_len);
+        }
+        if packed {
+            for (dst, src) in bytes.chunks_exact_mut(3).zip(rgba) {
+                dst.copy_from_slice(&src[..3]);
             }
         }
     }
@@ -1559,24 +1655,21 @@ impl VulkanContext {
         self.textures[index].layout = to;
     }
 
-    fn upload_texture(
-        &mut self,
-        index: usize,
-        x_offset: i32,
-        y_offset: i32,
-        width: i32,
-        height: i32,
-        bytes: &[u8],
-    ) {
+    fn upload_texture(&mut self, index: usize, region: TextureUpdateRegion<'_>) {
+        let TextureUpdateRegion {
+            x,
+            y,
+            width,
+            height,
+            bytes,
+        } = region;
         let expanded;
-        let bytes = if self.textures[index].format == vk::Format::R8G8B8A8_UNORM
-            && bytes.len() == width as usize * height as usize * 3
-        {
+        let bytes = if self.textures[index].source_format == TextureFormat::RGB8 {
             expanded = bytes
                 .chunks_exact(3)
-                .flat_map(|pixel| [pixel[0], pixel[1], pixel[2], u8::MAX])
-                .collect::<Vec<u8>>();
-            &expanded[..]
+                .map(|pixel| [pixel[0], pixel[1], pixel[2], u8::MAX])
+                .collect::<Vec<_>>();
+            expanded.as_flattened()
         } else {
             bytes
         };
@@ -1585,7 +1678,7 @@ impl VulkanContext {
         } else {
             vk::ImageAspectFlags::COLOR
         };
-        let region = texture_upload_copy(x_offset, y_offset, width, height, aspect, 0);
+        let region = texture_upload_copy(x, y, width, height, aspect, 0);
         self.submit_texture_upload(
             index,
             aspect,
@@ -1595,14 +1688,9 @@ impl VulkanContext {
         );
     }
 
-    pub(super) fn upload_rgba8_regions(
-        &mut self,
-        index: usize,
-        regions: &[TextureUpdateRegion<'_>],
-    ) {
-        debug_assert_eq!(self.textures[index].format, vk::Format::R8G8B8A8_UNORM);
+    fn upload_rgba8_regions(&mut self, index: usize, regions: &[TextureUpdateRegion<'_>]) {
         let aspect = vk::ImageAspectFlags::COLOR;
-        let mut size = 0usize;
+        let mut size = 0;
         let mut copies = Vec::with_capacity(regions.len());
         for region in regions {
             // Each validated RGBA8 slice is a whole number of four-byte texels.
@@ -1614,11 +1702,15 @@ impl VulkanContext {
                 aspect,
                 size,
             ));
-            size = size
-                .checked_add(region.bytes.len())
-                .expect("Texture staging size overflow");
+            size += region.bytes.len() as vk::DeviceSize;
         }
-        if let Some((staging, mapped, base)) = self.reserve_texture_upload(index, size) {
+        // Rectangles are disjoint and the image's dimensions fit in i32, so
+        // the RGBA8 total fits in VkDeviceSize. Mapped pointer offsets are narrower.
+        assert!(
+            size <= isize::MAX as vk::DeviceSize,
+            "Texture staging size exceeds the address space"
+        );
+        if let Some((staging, mapped, base)) = self.reserve_texture_upload(index, size as usize) {
             for (copy, region) in copies.iter_mut().zip(regions) {
                 copy.buffer_offset += base;
                 unsafe {
@@ -1634,7 +1726,7 @@ impl VulkanContext {
             self.submit_texture_upload(
                 index,
                 aspect,
-                size,
+                size as usize,
                 &copies,
                 regions.iter().map(|r| r.bytes),
             );
@@ -1681,7 +1773,6 @@ impl VulkanContext {
         }
         // This path stages whole RGBA8 texels; each region and batch consumes
         // a multiple of four bytes, so every VkBufferImageCopy stays aligned.
-        debug_assert_eq!(end % 4, 0);
         arena.offset = end;
         Some((arena.buffer, arena.mapped, base))
     }
@@ -1758,7 +1849,6 @@ impl VulkanContext {
                 .cast::<u8>();
             for (copy, bytes) in copies.iter().zip(sources) {
                 let offset = copy.buffer_offset as usize;
-                debug_assert!(offset <= size && bytes.len() <= size - offset);
                 ptr::copy_nonoverlapping(bytes.as_ptr(), mapped.add(offset), bytes.len());
             }
             self.device.unmap_memory(memory);
@@ -1867,13 +1957,22 @@ impl VulkanContext {
         }
         if self.cur_target == Some(index) {
             self.cur_target = None;
-            self.cur_pass = None;
         }
     }
 
     /// Colour attachment holding `samples` samples per pixel. It is only
     /// usable through the render pass `new_multisampled_render_pass` makes.
     pub fn new_multisample_texture(&mut self, params: TextureParams, samples: u32) -> usize {
+        let samples = self.texture_sample_count(params.format, samples);
+        self.new_attachment_texture(params, samples)
+    }
+
+    pub(super) fn new_attachment_texture(
+        &mut self,
+        params: TextureParams,
+        samples: vk::SampleCountFlags,
+    ) -> usize {
+        self.validate_texture_extent(params);
         unsafe {
             let format = vk_texture_format(params.format, TextureAccess::RenderTarget);
             let depth = is_depth_format(format);
@@ -1882,9 +1981,8 @@ impl VulkanContext {
             } else {
                 vk::ImageUsageFlags::COLOR_ATTACHMENT
             };
-            let sample_count = self.texture_sample_count(params.format, samples);
             let (image, memory) =
-                self.create_image(params.width, params.height, format, usage, 1, sample_count);
+                self.create_image(params.width, params.height, format, usage, 1, samples);
             let mut allocation = ResourceAllocation::new(&self.device, image, memory);
             let view = self.create_image_view(image, format, depth, 1, params.format, false);
             allocation.views.push(view);
@@ -1898,6 +1996,8 @@ impl VulkanContext {
                 width: params.width,
                 height: params.height,
                 format,
+                source_format: params.format,
+                usage,
                 layout: vk::ImageLayout::UNDEFINED,
                 mip_levels: 1,
                 filter: params.min_filter,
@@ -1920,6 +2020,19 @@ impl VulkanContext {
             );
             index
         }
+    }
+
+    fn validate_texture_extent(&self, params: TextureParams) {
+        assert_eq!(
+            params.kind,
+            TextureKind::Texture2D,
+            "Vulkan currently supports 2D textures"
+        );
+        let limit = 1..=self.max_texture_size.min(i32::MAX as u32);
+        assert!(
+            limit.contains(&params.width) && limit.contains(&params.height),
+            "texture dimensions exceed the Vulkan device limit",
+        );
     }
 
     pub(crate) fn texture_sample_count(
@@ -2192,16 +2305,28 @@ fn std140_layout_with_arrays(
 // State translation
 // ---------------------------------------------------------------------
 
+// Each edge adds two nonnegative i32 values and fits in u32.
+fn regions_overlap(regions: &[TextureUpdateRegion<'_>]) -> bool {
+    regions.iter().enumerate().any(|(i, a)| {
+        let (x, y) = (a.x as u32, a.y as u32);
+        let (right, bottom) = (x + a.width as u32, y + a.height as u32);
+        regions[..i].iter().any(|b| {
+            let (bx, by) = (b.x as u32, b.y as u32);
+            x < bx + b.width as u32 && bx < right && y < by + b.height as u32 && by < bottom
+        })
+    })
+}
+
 fn texture_upload_copy(
     x: i32,
     y: i32,
     width: i32,
     height: i32,
     aspect_mask: vk::ImageAspectFlags,
-    byte_offset: usize,
+    byte_offset: vk::DeviceSize,
 ) -> vk::BufferImageCopy {
     vk::BufferImageCopy {
-        buffer_offset: byte_offset as vk::DeviceSize,
+        buffer_offset: byte_offset,
         image_subresource: vk::ImageSubresourceLayers {
             aspect_mask,
             layer_count: 1,

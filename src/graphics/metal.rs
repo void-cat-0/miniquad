@@ -223,7 +223,6 @@ struct RenderPassInternal {
     render_pass_desc: ObjcId,
     texture: Vec<TextureId>,
     _depth_texture: Option<TextureId>,
-    resolve_textures: Option<Vec<TextureId>>,
 }
 
 #[derive(Clone, Debug)]
@@ -571,7 +570,6 @@ impl RenderingBackend for MetalContext {
                 render_pass_desc,
                 texture: color_img.to_vec(),
                 _depth_texture: depth_img,
-                resolve_textures: resolve_img.map(|textures| textures.to_vec()),
             };
 
             self.passes.push(pass);
@@ -580,12 +578,6 @@ impl RenderingBackend for MetalContext {
         }
     }
 
-    fn render_pass_resolve_texture(&self, pass: RenderPass) -> Option<TextureId> {
-        self.passes[pass.0].resolve_textures.as_ref().map(|textures| {
-            assert_eq!(textures.len(), 1, "multiple resolve attachments");
-            textures[0]
-        })
-    }
     fn delete_render_pass(&mut self, render_pass: RenderPass) {
         let render_pass = &self.passes[render_pass.0];
         unsafe {
@@ -799,11 +791,6 @@ impl RenderingBackend for MetalContext {
         match bytes {
             TextureSource::Empty => {}
             TextureSource::Bytes(bytes) => {
-                assert_eq!(
-                    params.format.size(params.width, params.height) as usize,
-                    bytes.len()
-                );
-
                 self.texture_update_part(
                     texture,
                     0,
@@ -855,7 +842,17 @@ impl RenderingBackend for MetalContext {
         height: i32,
         bytes: &[u8],
     ) {
-        let raw_texture = self.textures.get(texture).texture;
+        if width <= 0 || height <= 0 {
+            return;
+        }
+        let texture = self.textures.get(texture);
+        let raw_texture = texture.texture;
+        let format = texture.params.format;
+        // Metal's combined depth/stencil storage does not match Miniquad's
+        // two-byte depth upload format.
+        assert!(format != TextureFormat::Depth, "Metal depth texture uploads are unsupported");
+        format.transfer_len(width as u32, height as u32, bytes.len());
+        let stride = width as u64 * format.bytes_per_pixel() as u64;
         let region = MTLRegion {
             origin: MTLOrigin {
                 x: x_offset as u64,
@@ -872,7 +869,7 @@ impl RenderingBackend for MetalContext {
             msg_send_![raw_texture, replaceRegion:region
                        mipmapLevel:0
                        withBytes:bytes.as_ptr()
-                       bytesPerRow:(width * 4) as u64];
+                       bytesPerRow:stride];
         }
     }
 

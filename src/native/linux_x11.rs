@@ -802,7 +802,7 @@ unsafe fn vulkan_main_loop<F>(
     conf: &crate::conf::Conf,
     f: &mut Option<F>,
     screen: i32,
-) -> Result<(), X11Display>
+)
 where
     F: 'static + FnOnce() -> Box<dyn EventHandler>,
 {
@@ -879,8 +879,6 @@ where
     (display.libx11.XUnmapWindow)(display.display, display.window);
     (display.libx11.XDestroyWindow)(display.display, display.window);
     (display.libx11.XCloseDisplay)(display.display);
-
-    Ok(())
 }
 
 unsafe fn glx_main_loop<F>(
@@ -1164,7 +1162,7 @@ where
 
         #[cfg(feature = "vulkan")]
         if conf.platform.rendering_backend == crate::conf::RenderingBackend::Vulkan {
-            vulkan_main_loop(display, conf, f, x11_screen).ok().unwrap();
+            vulkan_main_loop(display, conf, f, x11_screen);
             return Ok(());
         }
 
