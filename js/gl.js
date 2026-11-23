@@ -368,7 +368,10 @@ function _webglGet(name_, p, type) {
                         case 0x8B8D: // CURRENT_PROGRAM
                         case 0x8895: // ELEMENT_ARRAY_BUFFER_BINDING
                         case 0x8CA6: // FRAMEBUFFER_BINDING
+                        case 0x8CAA: // READ_FRAMEBUFFER_BINDING
                         case 0x8CA7: // RENDERBUFFER_BINDING
+                        case 0x88ED: // PIXEL_PACK_BUFFER_BINDING
+                        case 0x88EF: // PIXEL_UNPACK_BUFFER_BINDING
                         case 0x8069: // TEXTURE_BINDING_2D
                         case 0x85B5: // WebGL 2 GL_VERTEX_ARRAY_BINDING, or WebGL 1 extension OES_vertex_array_object GL_VERTEX_ARRAY_BINDING_OES
                         case 0x8919: // GL_SAMPLER_BINDING

@@ -314,16 +314,19 @@ impl Display for ShaderError {
 
 impl Error for ShaderError {}
 
-/// List of all the possible formats of input data when uploading to texture.
-/// The list is built by intersection of texture formats supported by 3.3 core profile and webgl1.
+/// Texture formats recognized by Miniquad. Transfer and render-target support
+/// depend on the graphics backend and context.
 #[repr(u8)]
 #[derive(Debug, PartialEq, Eq, Clone, Copy, Hash)]
 pub enum TextureFormat {
     RGB8,
     RGBA8,
+    /// Four native-endian IEEE binary16 components per pixel.
     RGBA16F,
     Depth,
     Depth32,
+    /// One byte per pixel. Some legacy native GL contexts with red-channel
+    /// storage but no texture swizzle expose this value in the red channel.
     Alpha,
 }
 impl TextureFormat {
@@ -1172,8 +1175,7 @@ pub trait RenderingBackend {
     /// Get OpenGL's GLuint texture ID or metals ObjcId
     unsafe fn texture_raw_id(&self, texture: TextureId) -> RawId;
 
-    /// Update whole texture content
-    /// bytes should be width * height * 4 size - non rgba8 textures are not supported yet anyway
+    /// Update the whole texture with tightly packed pixels in its format.
     fn texture_update(&mut self, texture: TextureId, bytes: &[u8]) {
         let (width, height) = self.texture_size(texture);
         self.texture_update_part(texture, 0 as _, 0 as _, width as _, height as _, bytes)
@@ -1201,8 +1203,14 @@ pub trait RenderingBackend {
     /// Also note that if MipmapFilter is set to None, mipmaps will not be visible, even if
     /// generated.
     fn texture_generate_mipmaps(&mut self, texture: TextureId);
+    /// Resize the texture, optionally providing tightly packed level-zero pixels.
     fn texture_resize(&mut self, texture: TextureId, width: u32, height: u32, bytes: Option<&[u8]>);
+    /// Read a 2D texture into a buffer large enough to hold its tightly packed pixels.
+    ///
+    /// OpenGL readback does not support multisampled textures, legacy Alpha
+    /// textures, depth formats on GLES/WebGL, or RGBA16F on WebGL.
     fn texture_read_pixels(&mut self, texture: TextureId, bytes: &mut [u8]);
+    /// Update an in-bounds rectangle with tightly packed pixels in its format.
     fn texture_update_part(
         &mut self,
         texture: TextureId,

@@ -57,7 +57,10 @@ rustup target add wasm32-unknown-unknown
 cargo build --example quad --target wasm32-unknown-unknown
 ```
 
-And then use the following .html to load .wasm:
+And then use the following .html to load .wasm. If you build from this fork,
+serve the matching `js/gl.js` from your checkout instead of the upstream CDN
+script below. WebGL 2 texture transfers rely on the host's framebuffer and
+pixel-buffer binding queries.
 
 <details><summary>index.html</summary>
 
