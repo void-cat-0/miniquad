@@ -652,11 +652,11 @@ pub fn load_mouse_cursor(cursor: CursorIcon) -> ObjcId {
 // }
 
 macro_rules! msg_send_ {
-    ($obj:expr, $name:ident) => ({
+    ($obj:expr_2021, $name:ident) => ({
         let res: ObjcId = msg_send!($obj, $name);
         res
     });
-    ($obj:expr, $($name:ident : $arg:expr)+) => ({
+    ($obj:expr_2021, $($name:ident : $arg:expr_2021)+) => ({
         let res: ObjcId = msg_send!($obj, $($name: $arg)*);
         res
     });

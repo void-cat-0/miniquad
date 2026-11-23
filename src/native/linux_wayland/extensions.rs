@@ -1,4 +1,4 @@
-#![allow(unused_variables, dead_code, non_upper_case_globals, static_mut_refs)]
+#![allow(unused_variables, dead_code, non_upper_case_globals)]
 
 pub mod cursor;
 pub mod libdecor;
@@ -15,9 +15,9 @@ macro_rules! count {
 
 #[macro_export]
 macro_rules! method_consts {
-    ($x:expr, ()) => {
+    ($x:expr_2021, ()) => {
     };
-    ($x:expr, ($next:ident, $($rest:ident,)*)) => {
+    ($x:expr_2021, ($next:ident, $($rest:ident,)*)) => {
         pub const $next: u32 = $x;
         $crate::method_consts!(($x + 1), ($($rest,)*));
     };
@@ -25,15 +25,15 @@ macro_rules! method_consts {
 
 #[macro_export]
 macro_rules! wayland_interface {
-    ($name:ident, $struct_name:ident, $version:expr,
+    ($name:ident, $struct_name:ident, $version:expr_2021,
      [
          $(
-             ($method_name:ident, $method_sign:expr, ($($method_argument_name:expr),*))
+             ($method_name:ident, $method_sign:expr_2021, ($($method_argument_name:expr_2021),*))
          ),*
      ],
      [
          $(
-             ($event_name:ident, $event_sign:expr, ($($event_argument_name:expr),*))
+             ($event_name:ident, $event_sign:expr_2021, ($($event_argument_name:expr_2021),*))
          ),*
      ]) => {
         mod $name {
@@ -45,7 +45,7 @@ macro_rules! wayland_interface {
 
                     pub static mut METHOD_ARGUMENTS_TYPES:
                         [*const wl_interface; $crate::count!($($method_argument_name)*)] =
-                        [$(unsafe { &$method_argument_name as *const _},)*];
+                        [$(&raw const $method_argument_name,)*];
 
                 }
             )*
@@ -53,7 +53,7 @@ macro_rules! wayland_interface {
             static mut requests: [wl_message; $crate::count!($($method_name)*)] = [$(wl_message {
                 name: concat!(stringify!($method_name), '\0').as_ptr() as _,
                 signature: concat!($method_sign, '\0').as_ptr() as _,
-                types: unsafe { $method_name::METHOD_ARGUMENTS_TYPES.as_ptr() as _ }
+                types: (&raw mut $method_name::METHOD_ARGUMENTS_TYPES).cast()
             }), *];
 
             $(
@@ -62,23 +62,23 @@ macro_rules! wayland_interface {
 
                     pub static mut EVENT_ARGUMENTS_TYPES:
                         [*const wl_interface; $crate::count!($($event_argument_name)*)] =
-                        [$(unsafe { &$event_argument_name as *const _},)*];
+                        [$(&raw const $event_argument_name,)*];
                 }
             )*
 
             static mut events: [wl_message; $crate::count!($($event_name)*)] = [$(wl_message {
                 name: concat!(stringify!($event_name), '\0').as_ptr() as _,
                 signature: concat!($event_sign, '\0').as_ptr() as _,
-                types: unsafe { $event_name::EVENT_ARGUMENTS_TYPES.as_ptr() as _ }
+                types: (&raw mut $event_name::EVENT_ARGUMENTS_TYPES).cast()
             }),*];
 
             pub static mut $name: wl_interface = wl_interface {
                 name: concat!(stringify!($struct_name), '\0').as_ptr() as *const _,
                 version: $version,
                 method_count: $crate::count!($($method_name)*) as i32,
-                methods: unsafe { requests.as_ptr() },
+                methods: (&raw const requests).cast(),
                 event_count: $crate::count!($($event_name)*) as i32,
-                events: unsafe { events.as_ptr() },
+                events: (&raw const events).cast(),
             };
         }
 

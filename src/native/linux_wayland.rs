@@ -1,4 +1,4 @@
-#![allow(dead_code, static_mut_refs)]
+#![allow(dead_code)]
 
 mod libwayland_client;
 mod libwayland_egl;
@@ -285,7 +285,7 @@ impl WaylandPayload {
         DATA_DEVICE_LISTENER.selection = clipboard::data_device_handle_selection;
         (self.client.wl_proxy_add_listener)(
             self.data_device as _,
-            &DATA_DEVICE_LISTENER as *const _ as _,
+            (&raw mut DATA_DEVICE_LISTENER).cast(),
             self as *mut _ as _,
         );
     }
@@ -295,7 +295,7 @@ impl WaylandPayload {
                 self.client,
                 self.pointer_context.cursor_shape_manager,
                 extensions::cursor::CURSOR_SHAPE_MANAGER_GET_POINTER,
-                &extensions::cursor::wp_cursor_shape_device_v1_interface,
+                &raw const extensions::cursor::wp_cursor_shape_device_v1_interface,
                 self.pointer_context.pointer
             );
             assert!(!self.pointer_context.cursor_shape_device.is_null());
@@ -311,7 +311,7 @@ impl WaylandPayload {
             self.client,
             self.text_input_manager,
             extensions::text_input::zwp_text_input_manager_v3::get_text_input,
-            &extensions::text_input::zwp_text_input_v3_interface,
+            &raw const extensions::text_input::zwp_text_input_v3_interface,
             self.seat
         ) as *mut extensions::text_input::zwp_text_input_v3;
         if self.text_input.is_null() {
@@ -326,7 +326,7 @@ impl WaylandPayload {
         TEXT_INPUT_LISTENER.done = text_input_handle_done;
         (self.client.wl_proxy_add_listener)(
             self.text_input as _,
-            &TEXT_INPUT_LISTENER as *const _ as _,
+            (&raw mut TEXT_INPUT_LISTENER).cast(),
             self as *mut _ as _,
         );
     }
@@ -551,7 +551,7 @@ impl PointerContext {
                         display.client,
                         self.pointer_constraints,
                         extensions::cursor::POINTER_CONSTRAINTS_LOCK_POINTER,
-                        &extensions::cursor::zwp_locked_pointer_v1_interface,
+                        &raw const extensions::cursor::zwp_locked_pointer_v1_interface,
                         display.surface,
                         self.pointer,
                         std::ptr::null_mut::<wl_region>(),
@@ -569,7 +569,7 @@ impl PointerContext {
                         display.client,
                         self.relative_pointer_manager,
                         extensions::cursor::RELATIVE_POINTER_MANAGER_GET_RELATIVE_POINTER,
-                        &extensions::cursor::zwp_relative_pointer_v1_interface,
+                        &raw const extensions::cursor::zwp_relative_pointer_v1_interface,
                         self.pointer
                     );
                     assert!(!self.relative_pointer.is_null());
@@ -577,7 +577,7 @@ impl PointerContext {
                         relative_pointer_handle_relative_motion;
                     (display.client.wl_proxy_add_listener)(
                         self.relative_pointer as _,
-                        &RELATIVE_POINTER_LISTENER as *const _ as _,
+                        (&raw mut RELATIVE_POINTER_LISTENER).cast(),
                         data,
                     );
                 } else {
@@ -635,7 +635,7 @@ unsafe extern "C" fn seat_handle_capabilities(
         POINTER_LISTENER.leave = pointer_handle_leave;
         (display.client.wl_proxy_add_listener)(
             display.pointer_context.pointer as _,
-            &POINTER_LISTENER as *const _ as _,
+            (&raw mut POINTER_LISTENER).cast(),
             data,
         );
     }
@@ -656,7 +656,7 @@ unsafe extern "C" fn seat_handle_capabilities(
         KEYBOARD_LISTENER.leave = keyboard_handle_leave;
         (display.client.wl_proxy_add_listener)(
             display.keyboard as _,
-            &KEYBOARD_LISTENER as *const _ as _,
+            (&raw mut KEYBOARD_LISTENER).cast(),
             data,
         );
     }
@@ -675,7 +675,7 @@ unsafe extern "C" fn seat_handle_capabilities(
         TOUCH_LISTENER.cancel = touch_handle_cancel;
         (display.client.wl_proxy_add_listener)(
             display.touch as _,
-            &TOUCH_LISTENER as *const _ as _,
+            (&raw mut TOUCH_LISTENER).cast(),
             data,
         );
     }
@@ -1174,7 +1174,7 @@ unsafe extern "C" fn registry_add_object(
             OUTPUT_LISTENER.scale = output_handle_scale;
             (display.client.wl_proxy_add_listener)(
                 wl_output as _,
-                &OUTPUT_LISTENER as *const _ as _,
+                (&raw mut OUTPUT_LISTENER).cast(),
                 display as *mut _ as _,
             );
         }
@@ -1207,14 +1207,14 @@ unsafe extern "C" fn registry_add_object(
             display.xdg_wm_base = display.client.wl_registry_bind(
                 registry,
                 name,
-                &extensions::xdg_shell::xdg_wm_base_interface,
+                &raw const extensions::xdg_shell::xdg_wm_base_interface,
                 1,
             ) as _;
             assert!(!display.xdg_wm_base.is_null());
             XDG_WM_BASE_LISTENER.ping = xdg_wm_base_handle_ping;
             (display.client.wl_proxy_add_listener)(
                 display.xdg_wm_base as _,
-                &XDG_WM_BASE_LISTENER as *const _ as _,
+                (&raw mut XDG_WM_BASE_LISTENER).cast(),
                 display as *mut _ as _,
             );
         }
@@ -1222,7 +1222,7 @@ unsafe extern "C" fn registry_add_object(
             display.decoration_manager = display.client.wl_registry_bind(
                 registry,
                 name,
-                &extensions::xdg_decoration::zxdg_decoration_manager_v1_interface,
+                &raw const extensions::xdg_decoration::zxdg_decoration_manager_v1_interface,
                 1,
             ) as _;
         }
@@ -1230,7 +1230,7 @@ unsafe extern "C" fn registry_add_object(
             display.viewporter = display.client.wl_registry_bind(
                 registry,
                 name,
-                &extensions::viewporter::wp_viewporter_interface,
+                &raw const extensions::viewporter::wp_viewporter_interface,
                 1,
             ) as _;
         }
@@ -1238,7 +1238,7 @@ unsafe extern "C" fn registry_add_object(
             display.pointer_context.cursor_shape_manager = display.client.wl_registry_bind(
                 registry,
                 name,
-                &extensions::cursor::wp_cursor_shape_manager_v1_interface as _,
+                &raw const extensions::cursor::wp_cursor_shape_manager_v1_interface,
                 1,
             ) as _;
         }
@@ -1246,7 +1246,7 @@ unsafe extern "C" fn registry_add_object(
             display.pointer_context.pointer_constraints = display.client.wl_registry_bind(
                 registry,
                 name,
-                &extensions::cursor::zwp_pointer_constraints_v1_interface as _,
+                &raw const extensions::cursor::zwp_pointer_constraints_v1_interface,
                 1,
             ) as _;
         }
@@ -1254,7 +1254,7 @@ unsafe extern "C" fn registry_add_object(
             display.pointer_context.relative_pointer_manager = display.client.wl_registry_bind(
                 registry,
                 name,
-                &extensions::cursor::zwp_relative_pointer_manager_v1_interface as _,
+                &raw const extensions::cursor::zwp_relative_pointer_manager_v1_interface,
                 1,
             ) as _;
         }
@@ -1277,7 +1277,7 @@ unsafe extern "C" fn registry_add_object(
             SEAT_LISTENER.capabilities = seat_handle_capabilities;
             (display.client.wl_proxy_add_listener)(
                 display.seat as _,
-                &SEAT_LISTENER as *const _ as _,
+                (&raw mut SEAT_LISTENER).cast(),
                 data,
             );
         }
@@ -1294,7 +1294,7 @@ unsafe extern "C" fn registry_add_object(
             display.text_input_manager = display.client.wl_registry_bind(
                 registry,
                 name,
-                &extensions::text_input::zwp_text_input_manager_v3_interface,
+                &raw const extensions::text_input::zwp_text_input_manager_v3_interface,
                 1.min(version),
             ) as _;
         }
@@ -1329,7 +1329,7 @@ unsafe extern "C" fn data_device_handle_data_offer(
     assert_eq!(data_device, display.data_device);
     (display.client.wl_proxy_add_listener)(
         data_offer as _,
-        &DATA_OFFER_LISTENER as *const _ as _,
+        (&raw mut DATA_OFFER_LISTENER).cast(),
         data,
     );
 }

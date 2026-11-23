@@ -1,3 +1,6 @@
+// Legacy FFI helpers use their unsafe function bodies as the unsafe scope.
+#![allow(unsafe_op_in_unsafe_fn)]
+
 /// This module is disabled by default
 ///
 /// Most of the code gleaned from log-rs crate
@@ -68,7 +71,7 @@ impl Ord for Level {
 
 #[macro_export(local_inner_macros)]
 macro_rules! log {
-    (target: $target:expr, $lvl:expr, $message:expr) => ({
+    (target: $target:expr_2021, $lvl:expr_2021, $message:expr_2021) => ({
         let lvl = $lvl;
         //if lvl <= $crate::STATIC_MAX_LEVEL && lvl <= $crate::max_level() {
             // ensure that $message is a valid format string literal
@@ -80,7 +83,7 @@ macro_rules! log {
             );
         //}
     });
-    (target: $target:expr, $lvl:expr, $($arg:tt)+) => ({
+    (target: $target:expr_2021, $lvl:expr_2021, $($arg:tt)+) => ({
         let lvl = $lvl;
         //if lvl <= $crate::STATIC_MAX_LEVEL && lvl <= $crate::max_level() {
             $crate::log::__private_api_log_lit(
@@ -90,12 +93,12 @@ macro_rules! log {
             );
         //}
     });
-    ($lvl:expr, $($arg:tt)+) => (log!(target: __log_module_path!(), $lvl, $($arg)+))
+    ($lvl:expr_2021, $($arg:tt)+) => (log!(target: __log_module_path!(), $lvl, $($arg)+))
 }
 
 #[macro_export(local_inner_macros)]
 macro_rules! error {
-    (target: $target:expr, $($arg:tt)+) => (
+    (target: $target:expr_2021, $($arg:tt)+) => (
         log!(target: $target, $crate::Level::Error, $($arg)+);
     );
     ($($arg:tt)+) => (
@@ -105,7 +108,7 @@ macro_rules! error {
 
 #[macro_export(local_inner_macros)]
 macro_rules! warn {
-    (target: $target:expr, $($arg:tt)+) => (
+    (target: $target:expr_2021, $($arg:tt)+) => (
         log!(target: $target, $crate::Level::Warn, $($arg)+);
     );
     ($($arg:tt)+) => (
@@ -115,7 +118,7 @@ macro_rules! warn {
 
 #[macro_export(local_inner_macros)]
 macro_rules! info {
-    (target: $target:expr, $($arg:tt)+) => (
+    (target: $target:expr_2021, $($arg:tt)+) => (
         log!(target: $target, $crate::Level::Info, $($arg)+);
     );
     ($($arg:tt)+) => (
@@ -125,7 +128,7 @@ macro_rules! info {
 
 #[macro_export(local_inner_macros)]
 macro_rules! debug {
-    (target: $target:expr, $($arg:tt)+) => (
+    (target: $target:expr_2021, $($arg:tt)+) => (
         log!(target: $target, $crate::Level::Debug, $($arg)+);
     );
     ($($arg:tt)+) => (
@@ -135,7 +138,7 @@ macro_rules! debug {
 
 #[macro_export(local_inner_macros)]
 macro_rules! trace {
-    (target: $target:expr, $($arg:tt)+) => (
+    (target: $target:expr_2021, $($arg:tt)+) => (
         log!(target: $target, $crate::Level::Trace, $($arg)+);
     );
     ($($arg:tt)+) => (

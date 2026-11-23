@@ -1,3 +1,5 @@
+// Legacy FFI helpers use their unsafe function bodies as the unsafe scope.
+#![allow(unsafe_op_in_unsafe_fn)]
 #![allow(dead_code)]
 
 #[cfg(not(target_os = "android"))]

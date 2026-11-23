@@ -568,7 +568,7 @@ unsafe fn get_proc_address(name: *const u8) -> Option<unsafe extern "C" fn()> {
         use std::ffi::{c_char, c_int, c_void};
 
         pub const RTLD_LAZY: c_int = 1;
-        extern "C" {
+        unsafe extern "C" {
             pub fn dlopen(filename: *const c_char, flag: c_int) -> *mut c_void;
             pub fn dlsym(handle: *mut c_void, symbol: *const c_char) -> *mut c_void;
         }

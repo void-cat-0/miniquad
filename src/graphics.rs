@@ -1,3 +1,6 @@
+// Legacy FFI helpers use their unsafe function bodies as the unsafe scope.
+#![allow(unsafe_op_in_unsafe_fn)]
+
 //mod texture;
 
 use crate::native::gl::*;

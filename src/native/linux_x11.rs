@@ -1100,7 +1100,7 @@ where
         (libx11.XrmInitialize)();
 
         libc::setlocale(libc::LC_ALL, b"\0".as_ptr() as _);
-        let loc_res = libc::setlocale(libc::LC_CTYPE, b"\0".as_ptr() as _);
+        libc::setlocale(libc::LC_CTYPE, b"\0".as_ptr() as _);
 
         let mod_res = (libx11.XSetLocaleModifiers)(b"\0".as_ptr() as _);
         if mod_res.is_null() {

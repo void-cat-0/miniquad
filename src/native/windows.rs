@@ -84,7 +84,7 @@ struct CANDIDATEFORM {
 
 // Link to imm32.dll for IME support
 #[link(name = "imm32")]
-extern "system" {
+unsafe extern "system" {
     fn ImmGetCompositionStringW(
         himc: HIMC,
         index: DWORD,

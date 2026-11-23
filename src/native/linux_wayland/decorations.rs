@@ -6,8 +6,6 @@
 //! decorations as the X11 backend. If it's not available then no decorations
 //! will be drawn at all.
 
-#![allow(static_mut_refs)]
-
 use super::*;
 use crate::{wl_request, wl_request_constructor};
 use core::ffi::{c_char, c_int, c_void};
@@ -35,13 +33,13 @@ unsafe fn create_xdg_toplevel(display: &mut WaylandPayload) {
         display.client,
         display.xdg_wm_base,
         extensions::xdg_shell::xdg_wm_base::get_xdg_surface,
-        &xdg_surface_interface,
+        &raw const xdg_surface_interface,
         display.surface
     );
     assert!(!xdg_surface.is_null());
     (display.client.wl_proxy_add_listener)(
         xdg_surface as _,
-        &XDG_SURFACE_LISTENER as *const _ as _,
+        (&raw mut XDG_SURFACE_LISTENER).cast(),
         display as *mut _ as _,
     );
 
@@ -49,12 +47,12 @@ unsafe fn create_xdg_toplevel(display: &mut WaylandPayload) {
         display.client,
         xdg_surface,
         extensions::xdg_shell::xdg_surface::get_toplevel,
-        &extensions::xdg_shell::xdg_toplevel_interface
+        &raw const extensions::xdg_shell::xdg_toplevel_interface
     );
     assert!(!display.xdg_toplevel.is_null());
     (display.client.wl_proxy_add_listener)(
         display.xdg_toplevel as _,
-        &XDG_TOPLEVEL_LISTENER as *const _ as _,
+        (&raw mut XDG_TOPLEVEL_LISTENER).cast(),
         display as *mut _ as _,
     );
 }
@@ -125,7 +123,7 @@ impl Decorations {
             display.client,
             display.decoration_manager,
             extensions::xdg_decoration::zxdg_decoration_manager_v1::get_toplevel_decoration,
-            &extensions::xdg_decoration::zxdg_toplevel_decoration_v1_interface,
+            &raw const extensions::xdg_decoration::zxdg_toplevel_decoration_v1_interface,
             display.xdg_toplevel
         );
         assert!(!server_decoration.is_null());
@@ -141,11 +139,11 @@ impl Decorations {
 
     unsafe fn try_libdecor(display: &mut WaylandPayload, resizable: bool) -> Self {
         if let Ok(libdecor) = LibDecor::try_load() {
-            let context = (libdecor.libdecor_new)(display.display, &mut LIBDECOR_INTERFACE as _);
+            let context = (libdecor.libdecor_new)(display.display, &raw mut LIBDECOR_INTERFACE);
             let frame = (libdecor.libdecor_decorate)(
                 context,
                 display.surface,
-                &mut LIBDECOR_FRAME_INTERFACE as _,
+                &raw mut LIBDECOR_FRAME_INTERFACE,
                 display as *mut _ as _,
             );
             (libdecor.libdecor_frame_map)(frame);
@@ -390,7 +388,7 @@ mod fallback {
             display.client,
             display.viewporter,
             wp_viewporter::get_viewport,
-            &wp_viewport_interface,
+            &raw const wp_viewport_interface,
             surface
         );
 

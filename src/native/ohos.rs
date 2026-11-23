@@ -571,8 +571,10 @@ where
 {
     use std::panic;
     panic::set_hook(Box::new(|info| hilog_fatal!(info)));
-    let env = OHOS_ENV.as_ref().expect("OHOS_ENV is not initialized");
-    let exports = OHOS_EXPORTS
+    let env = (*(&raw const OHOS_ENV))
+        .as_ref()
+        .expect("OHOS_ENV is not initialized");
+    let exports = (*(&raw const OHOS_EXPORTS))
         .as_ref()
         .expect("OHOS_EXPORTS is not initialized");
     let xcomponent = XComponent::init(*env, *exports).expect("Failed to initialize XComponent");
@@ -585,6 +587,12 @@ where
     save_2in1_device();
     struct SendHack<F>(F);
     unsafe impl<F> Send for SendHack<F> {}
+    impl<F: FnOnce() -> Box<dyn EventHandler>> SendHack<F> {
+        // Capture the wrapper, not just its non-Send field, when spawning.
+        fn call(self) -> Box<dyn EventHandler> {
+            (self.0)()
+        }
+    }
     let f = SendHack(f);
 
     let (tx, rx) = mpsc::channel();
@@ -674,7 +682,7 @@ where
                 clipboard,
             )
         });
-        let event_handler = f.0();
+        let event_handler = f.call();
         let mut s = MainThreadState {
             libegl,
             egl_display,
@@ -832,7 +840,7 @@ pub fn set_interceptor_state(state: bool) -> bool {
     return true;
 }
 
-#[no_mangle]
+#[unsafe(no_mangle)]
 unsafe extern "C" fn touch_event_callback(touch_event: *const Input_TouchEvent) {
     if INTERCEPTOR.load(Ordering::Acquire) == 0 {
         return;

@@ -30,6 +30,8 @@ Miniquad aims to provide a graphics abstraction that works the same way on any p
 
 # Building examples
 
+This branch uses Rust 2024 and requires Rust 1.90 or newer on all targets.
+
 ## Linux
 
 ```bash
@@ -105,7 +107,8 @@ basic-http-server .
 ## Android
 
 Recommended way to build for android is using Docker.<br/>
-miniquad uses slightly modifed version of `cargo-apk`
+Miniquad uses a slightly modified version of `cargo-apk`. Use an image or
+local toolchain with Rust 1.90 or newer; older images may not support this branch.
 
 ```no-run
 docker run --rm -v $(pwd)":/root/src" -w /root/src notfl3/cargo-apk cargo quad-apk build --example quad

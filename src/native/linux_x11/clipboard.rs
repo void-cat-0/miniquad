@@ -7,6 +7,7 @@
 //! so use this with caution.
 
 use super::libx11::*;
+use std::sync::Mutex;
 
 unsafe fn get_clipboard(
     libx11: &mut LibX11,
@@ -128,7 +129,7 @@ pub(crate) unsafe fn get_property_bytes(
 }
 
 // Next message for clipboard request
-static mut MESSAGE: Option<String> = None;
+static MESSAGE: Mutex<String> = Mutex::new(String::new());
 
 /// Claim that our app is X11 clipboard owner
 /// Now when some other linux app will ask X11 for clipboard content - it will be redirected to our app
@@ -145,7 +146,7 @@ unsafe fn claim_clipboard_ownership(
         CurrentTime as Time,
     );
 
-    MESSAGE = Some(message);
+    *MESSAGE.lock().unwrap() = message;
 }
 
 /// this function is supposed to be called from sapp's event loop
@@ -157,9 +158,6 @@ pub(crate) unsafe fn respond_to_clipboard_request(
     event: *const XEvent,
 ) {
     assert!((*event).type_0 == SelectionRequest); // is it really SelectionRequest
-
-    let empty_message = String::new();
-    let message = MESSAGE.as_ref().unwrap_or(&empty_message);
 
     let utf8_string = libx11.extensions.utf8_string;
     let xselectionrequest = (*event).xselectionrequest;
@@ -177,16 +175,19 @@ pub(crate) unsafe fn respond_to_clipboard_request(
 
     // only UTF8 requests are supported
     if xselectionrequest.target == utf8_string {
-        (libx11.XChangeProperty)(
-            xselectionrequest.display,
-            xselectionrequest.requestor,
-            xselectionrequest.property,
-            utf8_string,
-            8 as libc::c_int,
-            PropModeReplace,
-            message.as_bytes().as_ptr(),
-            message.len() as _,
-        );
+        {
+            let message = MESSAGE.lock().unwrap();
+            (libx11.XChangeProperty)(
+                xselectionrequest.display,
+                xselectionrequest.requestor,
+                xselectionrequest.property,
+                utf8_string,
+                8 as libc::c_int,
+                PropModeReplace,
+                message.as_ptr(),
+                message.len() as _,
+            );
+        }
 
         (libx11.XSendEvent)(
             display,

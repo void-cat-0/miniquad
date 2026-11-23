@@ -7,7 +7,7 @@
 /// on $obj class
 /// and call a NewObject jni function with given extra arguments
 macro_rules! new_object {
-    ($env:expr, $class:expr, $sig:expr $(, $args:expr)*) => {{
+    ($env:expr_2021, $class:expr_2021, $sig:expr_2021 $(, $args:expr_2021)*) => {{
         let find_class = (**$env).FindClass.unwrap();
         let get_method_id = (**$env).GetMethodID.unwrap();
         let new_object = (**$env).NewObject.unwrap();
@@ -24,7 +24,7 @@ macro_rules! new_object {
 
 #[macro_export]
 macro_rules! call_method {
-    ($fn:tt, $env:expr, $obj:expr, $method:expr, $sig:expr $(, $args:expr)*) => {{
+    ($fn:tt, $env:expr_2021, $obj:expr_2021, $method:expr_2021, $sig:expr_2021 $(, $args:expr_2021)*) => {{
         let get_object_class = (**$env).GetObjectClass.unwrap();
         let get_method_id = (**$env).GetMethodID.unwrap();
         let call_object_method = (**$env).$fn.unwrap();
@@ -44,35 +44,35 @@ macro_rules! call_method {
 
 #[macro_export]
 macro_rules! call_object_method {
-    ($env:expr, $obj:expr, $method:expr, $sig:expr $(, $args:expr)*) => {{
+    ($env:expr_2021, $obj:expr_2021, $method:expr_2021, $sig:expr_2021 $(, $args:expr_2021)*) => {{
         $crate::call_method!(CallObjectMethod, $env, $obj, $method, $sig $(, $args)*)
     }};
 }
 
 #[macro_export]
 macro_rules! call_int_method {
-    ($env:expr, $obj:expr, $method:expr, $sig:expr $(, $args:expr)*) => {{
+    ($env:expr_2021, $obj:expr_2021, $method:expr_2021, $sig:expr_2021 $(, $args:expr_2021)*) => {{
         $crate::call_method!(CallIntMethod, $env, $obj, $method, $sig $(, $args)*)
     }};
 }
 
 #[macro_export]
 macro_rules! call_void_method {
-    ($env:expr, $obj:expr, $method:expr, $sig:expr $(, $args:expr)*) => {{
+    ($env:expr_2021, $obj:expr_2021, $method:expr_2021, $sig:expr_2021 $(, $args:expr_2021)*) => {{
         $crate::call_method!(CallVoidMethod, $env, $obj, $method, $sig $(, $args)*)
     }};
 }
 
 #[macro_export]
 macro_rules! call_bool_method {
-    ($env:expr, $obj:expr, $method:expr, $sig:expr $(, $args:expr)*) => {{
+    ($env:expr_2021, $obj:expr_2021, $method:expr_2021, $sig:expr_2021 $(, $args:expr_2021)*) => {{
         $crate::call_method!(CallBooleanMethod, $env, $obj, $method, $sig $(, $args)*)
     }};
 }
 
 #[macro_export]
 macro_rules! get_utf_str {
-    ($env:expr, $obj:expr) => {{
+    ($env:expr_2021, $obj:expr_2021) => {{
         let cstr_dat = (**$env).GetStringUTFChars.unwrap()($env, $obj, std::ptr::null_mut());
         let string = std::ffi::CStr::from_ptr(cstr_dat)
             .to_str()
@@ -85,14 +85,14 @@ macro_rules! get_utf_str {
 
 #[macro_export]
 macro_rules! new_global_ref {
-    ($env:expr, $obj:expr) => {{
+    ($env:expr_2021, $obj:expr_2021) => {{
         (**$env).NewGlobalRef.unwrap()($env, $obj)
     }};
 }
 
 #[macro_export]
 macro_rules! new_local_ref {
-    ($env:expr, $obj:expr) => {{
+    ($env:expr_2021, $obj:expr_2021) => {{
         (**$env).NewLocalRef.unwrap()($env, $obj)
     }};
 }

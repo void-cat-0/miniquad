@@ -335,13 +335,14 @@ pub struct __GLsync {
 pub type GLsync = *mut __GLsync;
 
 #[link(wasm_import_module = "env")]
-extern "C" {
+unsafe extern "C" {
     pub fn glGetError() -> GLenum;
     // Zero is reserved for the missing-import stub in older hosts.
     pub(crate) fn sapp_gl_get_error() -> GLenum;
 }
 
-extern "C" {
+#[link(wasm_import_module = "env")]
+unsafe extern "C" {
     pub fn glActiveTexture(texture: GLenum);
     pub fn glAttachShader(program: GLuint, shader: GLuint);
     pub fn glBindAttribLocation(program: GLuint, index: GLuint, name: *const GLchar);

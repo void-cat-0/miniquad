@@ -667,11 +667,11 @@ impl LibWaylandClient {
 
 #[macro_export]
 macro_rules! wl_request_constructor {
-    ($libwayland:expr, $instance:expr, $request_name:expr, $interface:expr) => {
+    ($libwayland:expr_2021, $instance:expr_2021, $request_name:expr_2021, $interface:expr_2021) => {
         wl_request_constructor!($libwayland, $instance, $request_name, $interface, ())
     };
 
-    ($libwayland:expr, $instance:expr, $request_name:expr, $interface:expr, $($arg:expr),*) => {{
+    ($libwayland:expr_2021, $instance:expr_2021, $request_name:expr_2021, $interface:expr_2021, $($arg:expr_2021),*) => {{
         let id: *mut wl_proxy;
 
         id = ($libwayland.wl_proxy_marshal_constructor)(
@@ -688,11 +688,11 @@ macro_rules! wl_request_constructor {
 
 #[macro_export]
 macro_rules! wl_request {
-    ($libwayland:expr, $instance:expr, $request_name:expr) => {
+    ($libwayland:expr_2021, $instance:expr_2021, $request_name:expr_2021) => {
         wl_request!($libwayland, $instance, $request_name, ())
     };
 
-    ($libwayland:expr, $instance:expr, $request_name:expr, $($arg:expr),*) => {{
+    ($libwayland:expr_2021, $instance:expr_2021, $request_name:expr_2021, $($arg:expr_2021),*) => {{
         ($libwayland.wl_proxy_marshal)(
             $instance as _,
             $request_name,

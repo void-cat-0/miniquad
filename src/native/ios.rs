@@ -477,7 +477,7 @@ unsafe fn get_proc_address(name: *const u8) -> Option<unsafe extern "C" fn()> {
         use std::ffi::{c_char, c_int, c_void};
 
         pub const RTLD_LAZY: c_int = 1;
-        extern "C" {
+        unsafe extern "C" {
             pub fn dlopen(filename: *const c_char, flag: c_int) -> *mut c_void;
             pub fn dlsym(handle: *mut c_void, symbol: *const c_char) -> *mut c_void;
         }
@@ -929,7 +929,7 @@ pub fn define_app_delegate() -> *const Class {
         _: ObjcId,
     ) -> BOOL {
         unsafe {
-            let (f, conf) = RUN_ARGS.take().unwrap();
+            let (f, conf) = RUN_ARGS.with(|args| args.take().unwrap());
 
             let main_screen: ObjcId = msg_send![class!(UIScreen), mainScreen];
             let screen_rect: NSRect = msg_send![main_screen, bounds];
@@ -1391,16 +1391,18 @@ pub fn load_file<F: Fn(crate::fs::Response) + 'static>(path: &str, on_loaded: F)
     }
 }
 
-// this is the way to pass argument to UiApplicationMain
-// this static will be used exactly once, to .take() the "run" arguments
-#[allow(clippy::type_complexity)]
-static mut RUN_ARGS: Option<(Box<dyn FnOnce() -> Box<dyn EventHandler>>, Conf)> = None;
+// UIKit takes the arguments once from its main-thread launch callback.
+thread_local! {
+    #[allow(clippy::type_complexity)]
+    static RUN_ARGS: std::cell::Cell<Option<(Box<dyn FnOnce() -> Box<dyn EventHandler>>, Conf)>> =
+        const { std::cell::Cell::new(None) };
+}
 
 pub unsafe fn run<F>(conf: Conf, f: F)
 where
     F: 'static + FnOnce() -> Box<dyn EventHandler>,
 {
-    RUN_ARGS = Some((Box::new(f), conf));
+    RUN_ARGS.with(|args| args.set(Some((Box::new(f), conf))));
 
     std::panic::set_hook(Box::new(|info| {
         let nsstring = apple_util::str_to_nsstring(&format!("{:?}", info));

@@ -12,11 +12,16 @@ pub(super) unsafe extern "C" fn data_device_handle_selection(
 ) {
     let display: &mut WaylandPayload = &mut *(data as *mut _);
     assert_eq!(data_device, display.data_device);
-    CLIPBOARD.get_mut().unwrap().data_offer = (!data_offer.is_null()).then_some(data_offer);
+    clipboard_context().data_offer = (!data_offer.is_null()).then_some(data_offer);
 }
 
 use std::sync::OnceLock;
 static mut CLIPBOARD: OnceLock<ClipboardContext> = OnceLock::new();
+
+// The native backend manages the lifetime of the Wayland clipboard state.
+unsafe fn clipboard_context() -> &'static mut ClipboardContext {
+    (*(&raw mut CLIPBOARD)).get_mut().unwrap()
+}
 
 // Contains the owned clipboard and the `data_source` (object in Wayland that indicates clipboard
 // ownership). There is a static instance `CLIPBOARD` available globally, initialized when creating
@@ -100,7 +105,7 @@ impl ClipboardContext {
         DATA_SOURCE_LISTENER.cancelled = data_source_handle_cancelled;
         (display.client.wl_proxy_add_listener)(
             data_source as _,
-            &DATA_SOURCE_LISTENER as *const _ as _,
+            (&raw mut DATA_SOURCE_LISTENER).cast(),
             self.display as *const _ as _,
         );
         self.data_source = Some(data_source);
@@ -118,7 +123,7 @@ unsafe extern "C" fn data_source_handle_send(
     fd: c_int,
 ) {
     let mime_type = core::ffi::CStr::from_ptr(mime_type).to_str().unwrap();
-    let ctx = CLIPBOARD.get_mut().unwrap();
+    let ctx = clipboard_context();
     assert!(ctx.data_source == Some(data_source));
     ctx.respond_to_clipboard_request(mime_type, fd);
 }
@@ -128,7 +133,7 @@ unsafe extern "C" fn data_source_handle_cancelled(
     _data: *mut c_void,
     data_source: *mut wl_data_source,
 ) {
-    let ctx = CLIPBOARD.get_mut().unwrap();
+    let ctx = clipboard_context();
     assert!(ctx.data_source == Some(data_source));
     ctx.destroy_data_source();
 }
@@ -141,7 +146,7 @@ impl WaylandClipboard {
     pub(super) fn new(display: *mut WaylandPayload) -> Self {
         // initialize the global context
         unsafe {
-            CLIPBOARD
+            (*(&raw const CLIPBOARD))
                 .set(ClipboardContext {
                     display,
                     content: String::new(),
@@ -156,12 +161,12 @@ impl WaylandClipboard {
 
 impl crate::native::Clipboard for WaylandClipboard {
     fn get(&mut self) -> Option<String> {
-        let bytes = unsafe { CLIPBOARD.get_mut().unwrap().get_clipboard("UTF8_STRING")? };
+        let bytes = unsafe { clipboard_context().get_clipboard("UTF8_STRING")? };
         Some(std::str::from_utf8(&bytes).ok()?.to_string())
     }
     fn set(&mut self, data: &str) {
         unsafe {
-            CLIPBOARD.get_mut().unwrap().set(data);
+            clipboard_context().set(data);
         }
     }
 }
