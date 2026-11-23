@@ -414,7 +414,8 @@ pub extern "C" fn resize(width: i32, height: i32) {
 pub extern "C" fn touch(phase: u32, id: u32, x: f32, y: f32) {
     let phase = keycodes::translate_touch_phase(phase as _);
     tl_event_handler(|event_handler| {
-        event_handler.touch_event(phase, id as _, x as _, y as _);
+        // Timestamp receipt here so existing JavaScript hosts keep the same ABI.
+        event_handler.touch_event(phase, id as _, x as _, y as _, crate::date::now());
     });
 }
 
