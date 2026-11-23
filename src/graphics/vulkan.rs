@@ -1,4 +1,5 @@
 use std::ffi::CStr;
+use std::num::NonZeroU32;
 use std::os::raw::c_char;
 
 use ash::extensions::ext::DebugUtils;
@@ -143,8 +144,11 @@ pub struct VulkanContext {
     pub surface: vk::SurfaceKHR,
     pub physical_device: vk::PhysicalDevice,
     pub memory_properties: vk::PhysicalDeviceMemoryProperties,
-    /// `VkPhysicalDeviceLimits::maxImageDimension2D`.
+    /// Effective limit for managed textures at creation. This field is
+    /// informational; changing it does not affect allocation or resize.
     pub max_texture_size: u32,
+    texture_size_limit: TextureSizeLimit,
+    device_texture_size_limit: TextureSizeLimit,
     /// `VkPhysicalDeviceLimits::minUniformBufferOffsetAlignment`.
     pub uniform_alignment: vk::DeviceSize,
     /// `VkPhysicalDeviceLimits::framebufferColorSampleCounts`; sample counts a
@@ -316,6 +320,15 @@ impl VulkanContext {
         window: RawWindowHandle,
         window_size: (u32, u32),
     ) -> VulkanContext {
+        Self::with_texture_size_limit(display, window, window_size, NonZeroU32::MAX)
+    }
+
+    fn with_texture_size_limit(
+        display: RawDisplayHandle,
+        window: RawWindowHandle,
+        window_size: (u32, u32),
+        max_size: NonZeroU32,
+    ) -> Self {
         unsafe {
             let entry = Entry::load().expect("Failed to load the Vulkan loader");
             let app_name = CStr::from_bytes_with_nul_unchecked(b"miniquad\0");
@@ -517,7 +530,11 @@ impl VulkanContext {
                 .map(|family| device.get_device_queue(family, 0))
                 .unwrap_or(vk::Queue::null());
             let memory_properties = instance.get_physical_device_memory_properties(physical_device);
-            let max_texture_size = properties.limits.max_image_dimension2_d;
+            // Texture operations also use signed Vulkan offsets.
+            let device_texture_size_limit =
+                TextureSizeLimit::new(properties.limits.max_image_dimension2_d.min(i32::MAX as u32));
+            let texture_size_limit =
+                TextureSizeLimit::new(device_texture_size_limit.max().min(max_size.get()));
             let uniform_alignment = properties.limits.min_uniform_buffer_offset_alignment;
             let color_sample_counts = properties.limits.framebuffer_color_sample_counts;
             let swapchain_loader = Swapchain::new(&instance, &device);
@@ -573,7 +590,9 @@ impl VulkanContext {
                 surface,
                 physical_device,
                 memory_properties,
-                max_texture_size,
+                max_texture_size: texture_size_limit.max(),
+                texture_size_limit,
+                device_texture_size_limit,
                 uniform_alignment,
                 color_sample_counts,
                 device,
@@ -1102,7 +1121,7 @@ impl VulkanContext {
             ..Default::default()
         };
         self.default_depth = Texture {
-            texture: self.new_multisample_texture(params, 1) as GLuint,
+            texture: self.new_swapchain_depth_texture(params) as GLuint,
             width,
             height,
             format: TextureFormat::Depth,

@@ -6,6 +6,7 @@ use crate::native::apple::{
 };
 
 use super::*;
+use std::num::NonZeroU32;
 
 // https://developer.apple.com/metal/Metal-Feature-Set-Tables.pdf
 const MAX_UNIFORM_BUFFER_SIZE: u64 = 4 * 1024 * 1024;
@@ -266,6 +267,7 @@ pub struct MetalContext {
     shaders: Vec<ShaderInternal>,
     pipelines: Vec<PipelineInternal>,
     textures: Textures,
+    texture_size_limit: Option<TextureSizeLimit>,
     passes: Vec<RenderPassInternal>,
     command_queue: ObjcId,
     command_buffer: Option<ObjcId>,
@@ -289,6 +291,15 @@ impl Default for MetalContext {
 
 impl MetalContext {
     pub fn new() -> MetalContext {
+        Self::new_with_texture_size_limit(None)
+    }
+
+    pub(crate) fn with_texture_size_limit(max_size: NonZeroU32) -> Self {
+        let limit = (max_size != NonZeroU32::MAX).then(|| TextureSizeLimit::new(max_size.get()));
+        Self::new_with_texture_size_limit(limit)
+    }
+
+    fn new_with_texture_size_limit(texture_size_limit: Option<TextureSizeLimit>) -> Self {
         unsafe {
             let view = crate::window::apple_view();
             assert!(!view.is_null());
@@ -367,6 +378,7 @@ impl MetalContext {
                 shaders: vec![],
                 pipelines: vec![],
                 textures: Textures(Vec::new()),
+                texture_size_limit,
                 passes: vec![],
                 index_buffer: None,
                 current_pipeline: None,
@@ -695,6 +707,17 @@ impl RenderingBackend for MetalContext {
         bytes: TextureSource,
         params: TextureParams,
     ) -> TextureId {
+        if let Some(limit) = self.texture_size_limit {
+            if !limit.contains(params.width, params.height) {
+                panic!(
+                    "Metal texture dimensions {}x{} must be in 1..={}",
+                    params.width,
+                    params.height,
+                    limit.max()
+                );
+            }
+        }
+
         let descriptor = unsafe {
             msg_send_![class!(MTLTextureDescriptor),
                        texture2DDescriptorWithPixelFormat:MTLPixelFormat::from(params.format)
@@ -752,6 +775,15 @@ impl RenderingBackend for MetalContext {
         }
 
         let texture = unsafe {
+            let raw_texture = msg_send_![self.device, newTextureWithDescriptor: descriptor];
+            if raw_texture.is_null() {
+                panic!(
+                    "Metal failed to allocate a {}x{} texture",
+                    params.width, params.height
+                );
+            }
+            msg_send_![raw_texture, retain];
+
             let sampler_descriptor = msg_send_![class!(MTLSamplerDescriptor), new];
             msg_send_![sampler_descriptor, retain];
             let min_filter = match params.min_filter {
@@ -777,8 +809,6 @@ impl RenderingBackend for MetalContext {
                 self.device,
                 newSamplerStateWithDescriptor: sampler_descriptor
             ];
-            let raw_texture = msg_send_![self.device, newTextureWithDescriptor: descriptor];
-            msg_send_![raw_texture, retain];
             self.textures.0.push(Texture {
                 sampler: sampler_state,
                 texture: raw_texture,

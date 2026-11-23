@@ -235,6 +235,7 @@ pub const GL_RGB16_SNORM: u32 = 0x8F9A;
 pub const GL_RGBA16_SNORM: u32 = 0x8F9B;
 pub const GL_RGBA16: u32 = 0x805B;
 pub const GL_MAX_TEXTURE_SIZE: u32 = 0x0D33;
+pub const GL_MAX_RENDERBUFFER_SIZE: u32 = 0x84E8;
 pub const GL_MAX_CUBE_MAP_TEXTURE_SIZE: u32 = 0x851C;
 pub const GL_MAX_3D_TEXTURE_SIZE: u32 = 0x8073;
 pub const GL_MAX_ARRAY_TEXTURE_LAYERS: u32 = 0x88FF;
@@ -332,6 +333,13 @@ pub struct __GLsync {
     _unused: [u8; 0],
 }
 pub type GLsync = *mut __GLsync;
+
+#[link(wasm_import_module = "env")]
+extern "C" {
+    pub fn glGetError() -> GLenum;
+    // Zero is reserved for the missing-import stub in older hosts.
+    pub(crate) fn sapp_gl_get_error() -> GLenum;
+}
 
 extern "C" {
     pub fn glActiveTexture(texture: GLenum);
@@ -483,7 +491,6 @@ extern "C" {
     pub fn glGetAttribLocation(program: GLuint, name: *const GLchar) -> GLint;
     pub fn glGetBooleanv(pname: GLenum, data: *mut GLboolean);
     pub fn glGetBufferParameteriv(target: GLenum, pname: GLenum, params: *mut GLint);
-    pub fn glGetError() -> GLenum;
     pub fn glGetFloatv(pname: GLenum, data: *mut GLfloat);
     pub fn glGetFramebufferAttachmentParameteriv(
         target: GLenum,

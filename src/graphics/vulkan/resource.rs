@@ -972,6 +972,7 @@ impl VulkanContext {
         params: TextureParams,
         access: TextureAccess,
     ) -> usize {
+        Self::validate_texture_extent(self.texture_size_limit, params);
         self.new_texture_with_wrap_y(bytes, params, access, params.wrap)
     }
 
@@ -982,7 +983,6 @@ impl VulkanContext {
         access: TextureAccess,
         wrap_y: TextureWrap,
     ) -> usize {
-        self.validate_texture_extent(params);
         let bytes = bytes.map(|bytes| {
             let len = params
                 .format
@@ -1225,10 +1225,11 @@ impl VulkanContext {
         bytes: Option<&[u8]>,
         wrap_y: TextureWrap,
     ) {
+        Self::validate_texture_extent(self.texture_size_limit, params);
         self.synchronize_resources();
         let fresh = if params.sample_count > 1 {
             assert!(bytes.is_none(), "Multisampled textures cannot be uploaded");
-            self.new_attachment_texture(
+            self.create_attachment_texture(
                 params,
                 vk::SampleCountFlags::from_raw(params.sample_count as u32),
             )
@@ -1972,7 +1973,21 @@ impl VulkanContext {
         params: TextureParams,
         samples: vk::SampleCountFlags,
     ) -> usize {
-        self.validate_texture_extent(params);
+        Self::validate_texture_extent(self.texture_size_limit, params);
+        self.create_attachment_texture(params, samples)
+    }
+
+    pub(super) fn new_swapchain_depth_texture(&mut self, params: TextureParams) -> usize {
+        // The default pass follows the window size, not the application's texture cap.
+        Self::validate_texture_extent(self.device_texture_size_limit, params);
+        self.create_attachment_texture(params, vk::SampleCountFlags::TYPE_1)
+    }
+
+    fn create_attachment_texture(
+        &mut self,
+        params: TextureParams,
+        samples: vk::SampleCountFlags,
+    ) -> usize {
         unsafe {
             let format = vk_texture_format(params.format, TextureAccess::RenderTarget);
             let depth = is_depth_format(format);
@@ -2022,17 +2037,18 @@ impl VulkanContext {
         }
     }
 
-    fn validate_texture_extent(&self, params: TextureParams) {
+    fn validate_texture_extent(limit: TextureSizeLimit, params: TextureParams) {
         assert_eq!(
             params.kind,
             TextureKind::Texture2D,
             "Vulkan currently supports 2D textures"
         );
-        let limit = 1..=self.max_texture_size.min(i32::MAX as u32);
-        assert!(
-            limit.contains(&params.width) && limit.contains(&params.height),
-            "texture dimensions exceed the Vulkan device limit",
-        );
+        if !limit.contains(params.width, params.height) {
+            panic!(
+                "Vulkan texture dimensions {}x{} must be in 1..={}",
+                params.width, params.height, limit.max()
+            );
+        }
     }
 
     pub(crate) fn texture_sample_count(

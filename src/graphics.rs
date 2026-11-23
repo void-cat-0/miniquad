@@ -425,6 +425,23 @@ pub enum TextureKind {
     CubeMap,
 }
 
+#[derive(Clone, Copy)]
+pub(crate) struct TextureSizeLimit(u32);
+
+impl TextureSizeLimit {
+    pub(crate) const fn new(max: u32) -> Self {
+        Self(max)
+    }
+
+    pub(crate) const fn max(self) -> u32 {
+        self.0
+    }
+
+    pub(crate) fn contains(self, width: u32, height: u32) -> bool {
+        (1..=self.0).contains(&width) && (1..=self.0).contains(&height)
+    }
+}
+
 #[derive(Debug, Copy, Clone)]
 pub struct TextureParams {
     pub kind: TextureKind,
@@ -479,9 +496,9 @@ pub(crate) enum TextureIdInner {
 pub struct TextureId(TextureIdInner);
 
 impl TextureId {
-    /// Wrap raw platform texture into a TextureId acceptable for miniquad
-    /// Without allocating any miniquad memory and without letting miniquad
-    /// manage the texture.
+    /// Wrap a raw platform texture without registering its storage. A raw name
+    /// does not carry Miniquad's size or format metadata and cannot be used for
+    /// size queries, resizing or pixel readback.
     pub fn from_raw_id(raw_id: RawId) -> TextureId {
         TextureId(TextureIdInner::Raw(raw_id))
     }
@@ -1270,10 +1287,8 @@ pub trait RenderingBackend {
 
     fn info(&self) -> ContextInfo;
 
-    /// Maximum supported 2D texture dimension when the backend exposes it.
-    ///
-    /// This keeps callers from reaching through the OpenGL bindings for a
-    /// capability that is also needed by explicit APIs such as Vulkan.
+    /// Maximum supported 2D texture dimension when the backend exposes it,
+    /// including any limit set when creating the backend.
     fn max_texture_size(&self) -> Option<u32> {
         None
     }
@@ -1315,6 +1330,12 @@ pub trait RenderingBackend {
     ) -> TextureId;
     fn new_render_texture(&mut self, params: TextureParams) -> TextureId {
         self.new_texture(TextureAccess::RenderTarget, TextureSource::Empty, params)
+    }
+    /// Allocate an empty render texture, returning `None` for invalid
+    /// dimensions, an unsupported format or backend, or an allocation failure.
+    /// Clear or write the texture before sampling or reading it back.
+    fn try_new_render_texture(&mut self, _params: TextureParams) -> Option<TextureId> {
+        None
     }
     fn new_texture_from_data_and_format(
         &mut self,
@@ -1383,8 +1404,21 @@ pub trait RenderingBackend {
     /// Also note that if MipmapFilter is set to None, mipmaps will not be visible, even if
     /// generated.
     fn texture_generate_mipmaps(&mut self, texture: TextureId);
-    /// Resize the texture, optionally providing tightly packed level-zero pixels.
+    /// Resize managed storage, optionally supplying tightly packed level-zero
+    /// pixels. Panics if the backend rejects the resize.
     fn texture_resize(&mut self, texture: TextureId, width: u32, height: u32, bytes: Option<&[u8]>);
+    /// Resize managed storage without publishing a new size on failure.
+    /// Supplied pixel data must still cover the requested dimensions. Backends
+    /// without fallible resizing return `false` without changing the texture.
+    fn try_texture_resize(
+        &mut self,
+        _texture: TextureId,
+        _width: u32,
+        _height: u32,
+        _bytes: Option<&[u8]>,
+    ) -> bool {
+        false
+    }
     /// Read a single-sampled 2D texture into a buffer large enough to hold its tightly packed pixels.
     ///
     /// OpenGL leaves the buffer unchanged if a readable framebuffer cannot

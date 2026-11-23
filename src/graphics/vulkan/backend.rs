@@ -1,4 +1,5 @@
 use std::cell::RefCell;
+use std::num::NonZeroU32;
 
 use super::*;
 
@@ -66,7 +67,16 @@ pub struct VulkanBackend {
 
 impl VulkanBackend {
     pub fn new(display: RawDisplayHandle, window: RawWindowHandle, size: (u32, u32)) -> Self {
-        let context = VulkanContext::new(display, window, size);
+        Self::with_texture_size_limit(display, window, size, NonZeroU32::MAX)
+    }
+
+    pub(crate) fn with_texture_size_limit(
+        display: RawDisplayHandle,
+        window: RawWindowHandle,
+        size: (u32, u32),
+        max_size: NonZeroU32,
+    ) -> Self {
+        let context = VulkanContext::with_texture_size_limit(display, window, size, max_size);
         let textures = vec![None; context.textures.len()];
         let wrap_y = vec![TextureWrap::Clamp; textures.len()];
         Self {
@@ -142,7 +152,7 @@ impl RenderingBackend for VulkanBackend {
     }
 
     fn max_texture_size(&self) -> Option<u32> {
-        Some(self.context.borrow().max_texture_size)
+        Some(self.context.borrow().texture_size_limit.max())
     }
 
     fn new_shader(

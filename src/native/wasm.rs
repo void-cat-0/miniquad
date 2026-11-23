@@ -196,7 +196,7 @@ pub unsafe fn update_cursor() {
 // "crate_version" is a misleading, but it can't be changed for legacy reasons.
 #[no_mangle]
 pub extern "C" fn crate_version() -> u32 {
-    2
+    3
 }
 
 #[no_mangle]

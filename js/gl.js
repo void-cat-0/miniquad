@@ -8,7 +8,7 @@
 
 "use strict";
 
-const version = 2;
+const version = 3;
 
 const canvas = document.querySelector("#glcanvas");
 var gl;
@@ -291,15 +291,10 @@ var GL = {
 function _glGenObject(n, buffers, createFunction, objectTable, functionName) {
     for (var i = 0; i < n; i++) {
         var buffer = gl[createFunction]();
-        var id = buffer && GL.getNewId(objectTable);
+        var id = buffer ? GL.getNewId(objectTable) : 0;
         if (buffer) {
             buffer.name = id;
             objectTable[id] = buffer;
-        } else {
-            console.error("GL_INVALID_OPERATION");
-            GL.recordError(0x0502 /* GL_INVALID_OPERATION */);
-
-            alert('GL_INVALID_OPERATION in ' + functionName + ': GLctx.' + createFunction + ' returned null - most likely GL context is lost!');
         }
         getArray(buffers + i * 4, Int32Array, 1)[0] = id;
     }
@@ -875,6 +870,13 @@ var importObject = {
         },
         glGetIntegerv: function (name_, p) {
             _webglGet(name_, p, 'EM_FUNC_SIG_PARAM_I');
+        },
+        glGetError: function () {
+            return gl.getError();
+        },
+        sapp_gl_get_error: function () {
+            // Older loaders link missing imports to stubs that return zero.
+            return (gl.isContextLost() ? 0x9242 : gl.getError()) + 1;
         },
         glUniform1f: function (location, v0) {
             GL.validateGLObjectID(GL.uniforms, location, 'glUniform1f', 'location');

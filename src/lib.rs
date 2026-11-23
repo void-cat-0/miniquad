@@ -130,16 +130,17 @@ fn native_display() -> &'static Mutex<native::NativeDisplayData> {
 pub mod window {
     use super::*;
 
-    /// The same as
-    /// ```ignore
-    /// if metal {
-    ///    Box::new(MetalContext::new())
-    /// } else {
-    ///   Box::new(GlContext::new())
-    /// };
-    /// ```
-    /// but under #[cfg] gate to avoid MetalContext on non-apple platforms
+    /// Create the selected rendering backend using the device's texture limits.
     pub fn new_rendering_backend() -> Box<dyn RenderingBackend> {
+        new_rendering_backend_with_texture_size_limit(std::num::NonZeroU32::MAX)
+    }
+
+    /// Create the selected backend with an additional per-axis limit on managed
+    /// texture dimensions. The device's own limits still apply, including when
+    /// a shared texture is resized directly through the backend.
+    pub fn new_rendering_backend_with_texture_size_limit(
+        max_size: std::num::NonZeroU32,
+    ) -> Box<dyn RenderingBackend> {
         #[cfg(all(
             feature = "vulkan",
             any(
@@ -149,29 +150,26 @@ pub mod window {
             )
         ))]
         {
-            let d = native_display().lock().unwrap();
-            if d.rendering_backend == conf::RenderingBackend::Vulkan {
-                let (display, window) = d
-                    .vulkan_window
-                    .expect("Vulkan window handles are unavailable")
-                    .handles();
-                return Box::new(VulkanBackend::new(
-                    display,
-                    window,
-                    (d.screen_width as u32, d.screen_height as u32),
+            let vulkan_window = {
+                let d = native_display().lock().unwrap();
+                (d.rendering_backend == conf::RenderingBackend::Vulkan).then(|| {
+                    let handles = d.vulkan_window.expect("Vulkan window handles are unavailable");
+                    (handles, (d.screen_width as u32, d.screen_height as u32))
+                })
+            };
+            if let Some((handles, size)) = vulkan_window {
+                // Win32 WSI may dispatch window messages synchronously.
+                let (display, window) = handles.handles();
+                return Box::new(VulkanBackend::with_texture_size_limit(
+                    display, window, size, max_size,
                 ));
             }
         }
         #[cfg(target_vendor = "apple")]
-        {
-            if window::apple_gfx_api() == conf::AppleGfxApi::Metal {
-                Box::new(MetalContext::new())
-            } else {
-                Box::new(GlContext::new())
-            }
+        if window::apple_gfx_api() == conf::AppleGfxApi::Metal {
+            return Box::new(MetalContext::with_texture_size_limit(max_size));
         }
-        #[cfg(not(target_vendor = "apple"))]
-        Box::new(GlContext::new())
+        Box::new(GlContext::with_texture_size_limit(max_size))
     }
 
     /// The current framebuffer size in pixels

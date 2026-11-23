@@ -57,10 +57,9 @@ rustup target add wasm32-unknown-unknown
 cargo build --example quad --target wasm32-unknown-unknown
 ```
 
-And then use the following .html to load .wasm. If you build from this fork,
-serve the matching `js/gl.js` from your checkout instead of the upstream CDN
-script below. WebGL 2 texture transfers rely on the host's framebuffer and
-pixel-buffer binding queries.
+Copy `js/gl.js` from this checkout next to the `.wasm` file before opening
+this HTML. Build and deploy the two files together; texture allocation uses
+the matching WebGL host to report failures.
 
 <details><summary>index.html</summary>
 
@@ -88,8 +87,7 @@ pixel-buffer binding queries.
 
 <body>
     <canvas id="glcanvas" tabindex='1'></canvas>
-    <!-- Minified and statically hosted version of https://github.com/not-fl3/miniquad/blob/master/native/sapp-wasm/js/gl.js -->
-    <script src="https://not-fl3.github.io/miniquad-samples/gl.js"></script>
+    <script src="gl.js"></script>
     <script>load("quad.wasm");</script> <!-- Your compiled wasm file -->
 </body>
 

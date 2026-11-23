@@ -1,4 +1,4 @@
-//! Desktop OpenGL 3.3+ transfer regression: `cargo run --example texture_readback`.
+//! Desktop OpenGL 3.3+ texture allocation and transfer regression: `cargo run --example texture_readback`.
 
 #[cfg(not(target_arch = "wasm32"))]
 fn main() {
@@ -23,14 +23,15 @@ fn main() {
         );
         check_transfers(&mut ctx);
         check_resolves(&mut ctx);
-        println!("OpenGL texture transfer and resolve checks passed");
+        check_size_limit();
+        println!("OpenGL texture allocation, transfer and resolve checks passed");
         Box::new(Stage)
     });
 }
 
 #[cfg(not(target_arch = "wasm32"))]
 fn check_transfers(ctx: &mut dyn miniquad::RenderingBackend) {
-    use miniquad::{gl::*, TextureFormat, TextureParams, TextureSource};
+    use miniquad::{gl::*, TextureFormat, TextureId, TextureParams, TextureSource};
     use std::panic::{catch_unwind, AssertUnwindSafe};
 
     fn integer(param: GLenum) -> GLint {
@@ -105,11 +106,39 @@ fn check_transfers(ctx: &mut dyn miniquad::RenderingBackend) {
         Some(&[0; 11])
     )))
     .is_err());
+    let device_limit = integer(GL_MAX_TEXTURE_SIZE) as u32;
+    assert_eq!(ctx.max_texture_size(), Some(device_limit));
+    for (width, height) in [(0, 2), (1, device_limit + 1), (u32::MAX, 1)] {
+        assert!(!ctx.try_texture_resize(tex, width, height, None));
+    }
+    let raw = unsafe { ctx.texture_raw_id(tex) };
+    let raw_texture = TextureId::from_raw_id(raw);
+    assert!(!ctx.try_texture_resize(raw_texture, 1, 3, None));
+    assert!(catch_unwind(AssertUnwindSafe(|| ctx.texture_params(raw_texture))).is_err());
+    assert!(catch_unwind(AssertUnwindSafe(
+        || ctx.texture_read_pixels(raw_texture, &mut bytes)
+    ))
+    .is_err());
+
+    // A preexisting GL error must be rejected before changing the texture.
+    unsafe { glBindTexture(GL_NONE, 0) };
+    assert!(!ctx.try_texture_resize(tex, 1, 3, None));
     assert_eq!(ctx.texture_size(tex), (1, 2));
-    check_state();
-    ctx.texture_resize(tex, 1, 3, Some(&[1, 2, 3, 4, 5, 6, 7, 8, 9]));
     ctx.texture_read_pixels(tex, &mut bytes);
-    assert_eq!(&bytes[..9], &[1, 2, 3, 4, 5, 6, 7, 8, 9]);
+    assert_eq!(&bytes[..6], &[1, 2, 3, 7, 8, 9]);
+    check_state();
+
+    // New allocations do not inherit an unrelated error from earlier GL work.
+    unsafe { glBindTexture(GL_NONE, 0) };
+    let fresh = ctx.new_texture_from_rgba8(1, 1, &[37; 4]);
+    check_state();
+
+    let new_pixels = [1, 2, 3, 4, 5, 6, 7, 8, 9];
+    assert!(ctx.try_texture_resize(tex, 1, 3, Some(&new_pixels)));
+    assert_eq!(ctx.texture_size(tex), (1, 3));
+    assert_eq!(unsafe { ctx.texture_raw_id(tex) }, raw);
+    ctx.texture_read_pixels(tex, &mut bytes);
+    assert_eq!(&bytes[..9], &new_pixels);
     assert_eq!(bytes[9..], [0xee; 55]);
     check_state();
 
@@ -154,7 +183,7 @@ fn check_transfers(ctx: &mut dyn miniquad::RenderingBackend) {
     assert_eq!(rgba, [0x81; 16]);
     check_state();
 
-    for texture in [tex, half_texture, depth_texture, mipmapped] {
+    for texture in [tex, fresh, half_texture, depth_texture, mipmapped] {
         ctx.delete_texture(texture);
     }
     unsafe {
@@ -242,6 +271,54 @@ fn check_resolves(ctx: &mut dyn miniquad::RenderingBackend) {
         ctx.delete_texture(texture);
     }
     assert_eq!(unsafe { glGetError() }, GL_NO_ERROR);
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+fn check_size_limit() {
+    use miniquad::{gl::*, window, TextureKind, TextureParams};
+    use std::num::NonZeroU32;
+
+    let mut ctx =
+        window::new_rendering_backend_with_texture_size_limit(NonZeroU32::new(4).unwrap());
+    assert_eq!(ctx.max_texture_size(), Some(4));
+    let params = TextureParams {
+        width: 4,
+        height: 4,
+        ..Default::default()
+    };
+    for (width, height, sample_count) in [(0, 4, 1), (4, 5, 1), (5, 4, 2)] {
+        assert!(ctx
+            .try_new_render_texture(TextureParams {
+                width,
+                height,
+                sample_count,
+                ..params
+            })
+            .is_none());
+    }
+    let cube = TextureParams {
+        kind: TextureKind::CubeMap,
+        ..params
+    };
+    assert!(ctx
+        .try_new_render_texture(TextureParams {
+            width: 5,
+            height: 5,
+            ..cube
+        })
+        .is_none());
+    // Both axes are in range, but GL rejects non-square cubemap storage.
+    assert!(ctx
+        .try_new_render_texture(TextureParams { height: 2, ..cube })
+        .is_none());
+    assert_eq!(unsafe { glGetError() }, GL_NO_ERROR);
+
+    let tex = ctx.try_new_render_texture(params).unwrap();
+    assert!(!ctx.try_texture_resize(tex, 5, 1, None));
+    assert_eq!(ctx.texture_size(tex), (4, 4));
+    ctx.texture_resize(tex, 1, 4, None);
+    assert_eq!(ctx.texture_size(tex), (1, 4));
+    ctx.delete_texture(tex);
 }
 
 #[cfg(target_arch = "wasm32")]
