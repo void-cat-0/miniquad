@@ -1205,10 +1205,10 @@ pub trait RenderingBackend {
     fn texture_generate_mipmaps(&mut self, texture: TextureId);
     /// Resize the texture, optionally providing tightly packed level-zero pixels.
     fn texture_resize(&mut self, texture: TextureId, width: u32, height: u32, bytes: Option<&[u8]>);
-    /// Read a 2D texture into a buffer large enough to hold its tightly packed pixels.
+    /// Read a single-sampled 2D texture into a buffer large enough to hold its tightly packed pixels.
     ///
-    /// OpenGL readback does not support multisampled textures, legacy Alpha
-    /// textures, depth formats on GLES/WebGL, or RGBA16F on WebGL.
+    /// OpenGL leaves the buffer unchanged if a readable framebuffer cannot
+    /// be set up, or for depth on GLES/WebGL and RGBA16F on WebGL.
     fn texture_read_pixels(&mut self, texture: TextureId, bytes: &mut [u8]);
     /// Update an in-bounds rectangle with tightly packed pixels in its format.
     fn texture_update_part(

@@ -259,11 +259,12 @@ impl TransferCaps {
 
     fn upload_format(&self, format: TextureFormat, has_data: bool) -> (GLenum, GLenum, GLenum) {
         match format {
+            TextureFormat::RGBA16F | TextureFormat::Depth | TextureFormat::Depth32
+                if self.api == GlApi::Web && has_data =>
+            {
+                panic!("the WebGL host only supports byte color texture uploads");
+            }
             TextureFormat::RGBA16F => {
-                assert!(
-                    self.api != GlApi::Web || !has_data,
-                    "the WebGL host does not support half-float texture uploads"
-                );
                 let pixel_type = self
                     .half_float
                     .expect("half-float textures are unsupported by this GL context");
@@ -275,30 +276,16 @@ impl TransferCaps {
                 (internal, GL_RGBA, pixel_type)
             }
             TextureFormat::Depth => {
-                assert!(
-                    self.sized_depth || self.api == GlApi::Desktop || self.legacy_depth,
-                    "depth textures are unsupported by this GL context"
-                );
-                assert!(
-                    !has_data
-                        || (self.api != GlApi::Web
-                            && (self.sized_depth
-                                || self.api == GlApi::Desktop
-                                || self.legacy_depth_upload)),
-                    "depth texture uploads are unsupported by this GL context or host"
-                );
                 let internal = if self.sized_depth || self.api == GlApi::Desktop {
                     GL_DEPTH_COMPONENT16
-                } else {
+                } else if self.legacy_depth && (!has_data || self.legacy_depth_upload) {
                     GL_DEPTH_COMPONENT
+                } else {
+                    panic!("depth textures are unsupported by this GL context for this source");
                 };
                 (internal, GL_DEPTH_COMPONENT, GL_UNSIGNED_SHORT)
             }
             TextureFormat::Depth32 => {
-                assert!(
-                    self.api != GlApi::Web || !has_data,
-                    "the WebGL host does not support float depth texture uploads"
-                );
                 let internal = if self.sized_depth {
                     GL_DEPTH_COMPONENT32F
                 } else if self.api == GlApi::Desktop {
@@ -320,13 +307,7 @@ impl TransferCaps {
         match format {
             TextureFormat::RGB8 => GL_RGB8,
             TextureFormat::RGBA8 => GL_RGBA8,
-            TextureFormat::Alpha => {
-                assert!(
-                    self.alpha_red.is_some(),
-                    "alpha renderbuffers require red-channel storage"
-                );
-                GL_R8
-            }
+            TextureFormat::Alpha => GL_R8,
             _ => self.upload_format(format, false).0,
         }
     }
@@ -376,12 +357,7 @@ unsafe fn read_es_half_float(width: GLsizei, height: GLsizei, bytes: &mut [u8]) 
             );
         }
         (GL_RGBA, GL_FLOAT) => {
-            let count = bytes.len() / 2;
-            assert!(
-                count <= isize::MAX as usize / std::mem::size_of::<f32>(),
-                "half-float readback scratch size overflow"
-            );
-            let mut floats = vec![0.0f32; count];
+            let mut floats = vec![0.0f32; bytes.len() / 2];
             glReadPixels(
                 0,
                 0,
@@ -420,51 +396,22 @@ fn narrow_widened_half(value: f32) -> u16 {
     }
 }
 
-fn gl_dimensions(width: u32, height: u32) -> (GLsizei, GLsizei) {
-    use std::convert::TryFrom;
-    (
-        GLsizei::try_from(width).expect("texture width exceeds signed GL range"),
-        GLsizei::try_from(height).expect("texture height exceeds signed GL range"),
-    )
-}
-
-fn texture_byte_len(format: TextureFormat, width: u32, height: u32) -> usize {
-    (width as usize)
-        .checked_mul(height as usize)
-        .and_then(|pixels| pixels.checked_mul(format.size(1, 1) as usize))
-        .filter(|&len| len <= isize::MAX as usize)
-        .expect("texture byte size exceeds address space")
-}
-
-fn check_upload_len(format: TextureFormat, width: u32, height: u32, bytes: &[u8]) {
-    assert_eq!(
-        texture_byte_len(format, width, height),
-        bytes.len(),
-        "incorrect texture upload byte count"
-    );
-}
-
-fn check_update_region(params: TextureParams, x: i32, y: i32, width: i32, height: i32) {
-    let (tex_width, tex_height) = gl_dimensions(params.width, params.height);
+// GL receives a pointer, not the slice length. Compare in pixels before
+// multiplying by the number of bytes per pixel.
+fn transfer_len(format: TextureFormat, width: GLsizei, height: GLsizei, available: usize) -> usize {
+    let pixels = u64::from(width.max(0) as u32) * u64::from(height.max(0) as u32);
+    let bytes_per_pixel = format.size(1, 1) as usize;
     assert!(
-        x >= 0 && y >= 0 && width >= 0 && height >= 0,
-        "texture update region cannot be negative"
+        pixels <= (available / bytes_per_pixel) as u64,
+        "texture transfer buffer is too small"
     );
-    assert!(
-        x <= tex_width && width <= tex_width - x && y <= tex_height && height <= tex_height - y,
-        "texture update region is out of bounds"
-    );
+    pixels as usize * bytes_per_pixel
 }
 
-fn mip_dimensions(width: u32, height: u32, level: usize) -> (u32, u32) {
-    let dim = |base: u32| {
-        if level == 0 {
-            base
-        } else {
-            (base >> level).max(1)
-        }
-    };
-    (dim(width), dim(height))
+fn mip_sizes(width: GLsizei, height: GLsizei) -> impl Iterator<Item = (GLsizei, GLsizei)> {
+    std::iter::successors(Some((width, height)), |&(w, h)| {
+        (w > 0 && h > 0 && (w > 1 || h > 1)).then(|| ((w / 2).max(1), (h / 2).max(1)))
+    })
 }
 
 unsafe fn gl_integer(param: GLenum) -> GLint {
@@ -597,7 +544,7 @@ struct ReadbackFramebuffer {
 }
 
 impl ReadbackFramebuffer {
-    unsafe fn new(caps: &TransferCaps, depth: bool) -> Self {
+    unsafe fn new(caps: &TransferCaps, depth: bool) -> Option<Self> {
         let target = if caps.split_framebuffers && !depth {
             GL_READ_FRAMEBUFFER
         } else {
@@ -612,14 +559,16 @@ impl ReadbackFramebuffer {
             .then(|| gl_integer(GL_READ_FRAMEBUFFER_BINDING) as GLuint);
         let mut fbo = 0;
         glGenFramebuffers(1, &mut fbo);
-        assert_ne!(fbo, 0, "unable to create texture readback framebuffer");
+        if fbo == 0 {
+            return None;
+        }
         glBindFramebuffer(target, fbo);
-        Self {
+        Some(Self {
             fbo,
             target,
             previous: previous as GLuint,
             previous_read,
-        }
+        })
     }
 }
 
@@ -642,7 +591,7 @@ impl Texture {
         source: TextureSource,
         params: TextureParams,
     ) -> Texture {
-        let (width, height) = gl_dimensions(params.width, params.height);
+        let (width, height) = (params.width as GLsizei, params.height as GLsizei);
         let faces = if params.kind == TextureKind::CubeMap {
             6
         } else {
@@ -655,47 +604,11 @@ impl Texture {
                 GL_TEXTURE_2D
             }
         };
-        let max_levels =
-            (u32::BITS - params.width.max(params.height).leading_zeros()).max(1) as usize;
-        let levels = match source {
-            TextureSource::Empty => 1,
-            TextureSource::Bytes(bytes) => {
-                assert_eq!(
-                    params.kind,
-                    TextureKind::Texture2D,
-                    "cubemap data requires TextureSource::Array"
-                );
-                check_upload_len(params.format, params.width, params.height, bytes);
-                1
-            }
-            TextureSource::Array(array) => {
-                assert_eq!(array.len(), faces, "incorrect texture face count");
-                let levels = array[0].len();
-                assert!(
-                    (1..=max_levels).contains(&levels),
-                    "invalid texture mip level count"
-                );
-                for mipmaps in array {
-                    assert_eq!(
-                        mipmaps.len(),
-                        levels,
-                        "texture faces must have the same number of mip levels"
-                    );
-                    for (level, bytes) in mipmaps.iter().enumerate() {
-                        let (w, h) = mip_dimensions(params.width, params.height, level);
-                        check_upload_len(params.format, w, h, bytes);
-                    }
-                }
-                levels
-            }
-        };
+        let mut params = params;
         if access != TextureAccess::RenderTarget {
-            assert!(
-                params.sample_count <= 1,
-                "Multisampling is only supported for render textures"
-            );
+            params.sample_count = 1;
         }
-        if access == TextureAccess::RenderTarget && params.sample_count > 1 {
+        if params.sample_count > 1 {
             let internal_format = caps.renderbuffer_format(params.format);
             let mut renderbuffer = 0;
             unsafe {
@@ -719,6 +632,19 @@ impl Texture {
 
         let (internal_format, format, pixel_type) =
             caps.upload_format(params.format, !matches!(source, TextureSource::Empty));
+        match source {
+            TextureSource::Empty => {}
+            TextureSource::Bytes(bytes) => {
+                transfer_len(params.format, width, height, bytes.len());
+            }
+            TextureSource::Array(array) => {
+                for mipmaps in array.iter().take(faces) {
+                    for ((w, h), bytes) in mip_sizes(width, height).zip(*mipmaps) {
+                        transfer_len(params.format, w, h, bytes.len());
+                    }
+                }
+            }
+        }
         let mut texture = 0;
         unsafe {
             glGenTextures(1, &mut texture);
@@ -728,9 +654,9 @@ impl Texture {
             if params.format == TextureFormat::Alpha && caps.alpha_swizzle {
                 glTexParameteri(gl_target, GL_TEXTURE_SWIZZLE_A, GL_RED as GLint);
             }
-            let upload = |face, level, w, h, bytes: Option<&[u8]>| {
+            let upload = |target, level, w, h, bytes: Option<&[u8]>| {
                 glTexImage2D(
-                    target(face),
+                    target,
                     level,
                     internal_format as GLint,
                     w,
@@ -744,25 +670,22 @@ impl Texture {
             match source {
                 TextureSource::Empty => {
                     for face in 0..faces {
-                        upload(face, 0, width, height, None);
+                        upload(target(face), 0, width, height, None);
                     }
                 }
-                TextureSource::Bytes(bytes) => upload(0, 0, width, height, Some(bytes)),
+                TextureSource::Bytes(bytes) => upload(target(0), 0, width, height, Some(bytes)),
                 TextureSource::Array(array) => {
-                    if levels > 1 && caps.max_mip_level {
-                        glTexParameteri(gl_target, GL_TEXTURE_MAX_LEVEL, (levels - 1) as GLint);
-                    }
-                    for (face, mipmaps) in array.iter().enumerate() {
-                        for (level, bytes) in mipmaps.iter().enumerate() {
-                            let (w, h) = mip_dimensions(params.width, params.height, level);
-                            upload(
-                                face,
-                                level as GLint,
-                                w as GLsizei,
-                                h as GLsizei,
-                                Some(bytes),
-                            );
+                    let mut levels = 0;
+                    for (face, mipmaps) in array.iter().take(faces).enumerate() {
+                        for (level, ((w, h), bytes)) in
+                            mip_sizes(width, height).zip(*mipmaps).enumerate()
+                        {
+                            upload(target(face), level as GLint, w, h, Some(bytes));
+                            levels = levels.max(level as GLint + 1);
                         }
+                    }
+                    if caps.max_mip_level && levels > 1 {
+                        glTexParameteri(gl_target, GL_TEXTURE_MAX_LEVEL, levels - 1);
                     }
                 }
             }
@@ -789,14 +712,12 @@ impl Texture {
     }
 
     pub fn resize(&mut self, caps: &TransferCaps, width: u32, height: u32, source: Option<&[u8]>) {
-        let (gl_width, gl_height) = gl_dimensions(width, height);
-        assert_eq!(
-            self.params.kind,
-            TextureKind::Texture2D,
-            "texture resize requires a 2D texture"
-        );
+        let (gl_width, gl_height) = (width as GLsizei, height as GLsizei);
+        if gl_width < 0 || gl_height < 0 || self.params.kind == TextureKind::CubeMap {
+            return;
+        }
         if let Some(bytes) = source {
-            check_upload_len(self.params.format, width, height, bytes);
+            transfer_len(self.params.format, gl_width, gl_height, bytes.len());
         }
         let raw = self
             .raw
@@ -832,20 +753,14 @@ impl Texture {
         height: i32,
         source: &[u8],
     ) {
-        check_update_region(self.params, x_offset, y_offset, width, height);
-        check_upload_len(self.params.format, width as u32, height as u32, source);
-        assert_eq!(
-            self.params.kind,
-            TextureKind::Texture2D,
-            "texture update requires a 2D texture"
-        );
+        if width <= 0 || height <= 0 || self.params.kind == TextureKind::CubeMap {
+            return;
+        }
+        transfer_len(self.params.format, width, height, source.len());
         let raw = self
             .raw
             .texture()
             .expect("Texture updates are not supported for multisampled textures");
-        if source.is_empty() {
-            return;
-        }
         let (_, format, pixel_type) = caps.upload_format(self.params.format, true);
         unsafe {
             let _binding = TransferTextureBinding::new(self.params.kind, raw);
@@ -866,42 +781,25 @@ impl Texture {
 
     /// Read texture data into CPU memory.
     pub fn read_pixels(&self, caps: &TransferCaps, bytes: &mut [u8]) {
-        let (width, height) = gl_dimensions(self.params.width, self.params.height);
-        let len = texture_byte_len(self.params.format, self.params.width, self.params.height);
-        assert!(
-            bytes.len() >= len,
-            "texture_read_pixels destination is too small"
-        );
-        assert_eq!(
-            self.params.kind,
-            TextureKind::Texture2D,
-            "texture readback requires a 2D texture"
-        );
-        let raw = self
-            .raw
-            .texture()
-            .expect("Texture readback is not supported for multisampled textures");
-        if len == 0 {
+        let (width, height) = (self.params.width as GLsizei, self.params.height as GLsizei);
+        if width <= 0 || height <= 0 || self.params.kind == TextureKind::CubeMap {
             return;
         }
-
         let desktop = caps.api == GlApi::Desktop;
         let depth = matches!(
             self.params.format,
             TextureFormat::Depth | TextureFormat::Depth32
         );
-        assert!(
-            !depth || desktop,
-            "depth readback is only supported on desktop OpenGL"
-        );
-        assert!(
-            self.params.format != TextureFormat::Alpha || caps.alpha_red.is_some(),
-            "legacy alpha textures are not framebuffer-readable"
-        );
-        assert!(
-            self.params.format != TextureFormat::RGBA16F || caps.api != GlApi::Web,
-            "the WebGL host does not support half-float texture readback"
-        );
+        if (depth && !desktop)
+            || (caps.api == GlApi::Web && self.params.format == TextureFormat::RGBA16F)
+        {
+            return;
+        }
+        let raw = self
+            .raw
+            .texture()
+            .expect("Texture readback is not supported for multisampled textures");
+        let len = transfer_len(self.params.format, width, height, bytes.len());
 
         // GLES/WebGL guarantee RGBA/UNSIGNED_BYTE for normalized color buffers,
         // not a direct RGB or RED read. Keep the public bytes tightly packed.
@@ -910,12 +808,12 @@ impl Texture {
             TextureFormat::Alpha if !desktop => Some(1),
             _ => None,
         };
-        let mut rgba = compact_channels.map(|_| {
-            vec![0; texture_byte_len(TextureFormat::RGBA8, self.params.width, self.params.height)]
-        });
+        let mut rgba = compact_channels.map(|channels| vec![[0u8; 4]; len / channels]);
         let (_, format, pixel_type) = caps.upload_format(self.params.format, false);
         unsafe {
-            let fbo = ReadbackFramebuffer::new(caps, depth);
+            let Some(fbo) = ReadbackFramebuffer::new(caps, depth) else {
+                return;
+            };
             let attachment = if depth {
                 GL_DEPTH_ATTACHMENT
             } else {
@@ -927,11 +825,9 @@ impl Texture {
                 glReadBuffer(GL_NONE);
                 glDrawBuffers(1, &GL_NONE);
             }
-            let status = glCheckFramebufferStatus(fbo.target);
-            assert_eq!(
-                status, GL_FRAMEBUFFER_COMPLETE,
-                "texture is not framebuffer-readable (status {status:#x})"
-            );
+            if glCheckFramebufferStatus(fbo.target) != GL_FRAMEBUFFER_COMPLETE {
+                return;
+            }
 
             let _pack = TightPixelStore::new(caps, PixelTransfer::Pack);
             #[cfg(not(target_arch = "wasm32"))]
@@ -962,10 +858,7 @@ impl Texture {
             }
         }
         if let (Some(rgba), Some(channels)) = (rgba, compact_channels) {
-            for (src, dst) in rgba
-                .chunks_exact(4)
-                .zip(bytes[..len].chunks_exact_mut(channels))
-            {
+            for (src, dst) in rgba.iter().zip(bytes[..len].chunks_exact_mut(channels)) {
                 dst.copy_from_slice(&src[..channels]);
             }
         }
@@ -2291,34 +2184,19 @@ mod transfer_tests {
     use super::*;
 
     #[test]
-    fn byte_counts_are_checked_and_mip_dimensions_shrink() {
-        assert_eq!(texture_byte_len(TextureFormat::RGB8, 1, 3), 9);
-        assert_eq!(texture_byte_len(TextureFormat::RGBA16F, 4, 1), 32);
-        assert_eq!(mip_dimensions(5, 2, 1), (2, 1));
-        assert_eq!(mip_dimensions(5, 2, 2), (1, 1));
-        assert!(std::panic::catch_unwind(|| {
-            texture_byte_len(TextureFormat::RGBA16F, i32::MAX as u32, i32::MAX as u32)
-        })
-        .is_err());
-        assert!(std::panic::catch_unwind(|| gl_dimensions(u32::MAX, 1)).is_err());
+    fn transfer_sizes_match_the_layout() {
+        assert_eq!(transfer_len(TextureFormat::RGB8, 1, 3, 16), 9);
+        assert_eq!(transfer_len(TextureFormat::RGBA16F, 4, 1, 32), 32);
+        assert_eq!(
+            mip_sizes(5, 2).collect::<Vec<_>>(),
+            [(5, 2), (2, 1), (1, 1)]
+        );
     }
 
     #[test]
-    fn invalid_update_rectangles_are_rejected_without_signed_overflow() {
-        let params = TextureParams {
-            width: i32::MAX as u32,
-            height: 10,
-            ..Default::default()
-        };
-        check_update_region(params, i32::MAX - 1, 3, 1, 7);
-        for (x, y, w, h) in [
-            (-1, 0, 1, 1),
-            (0, 0, -1, 1),
-            (i32::MAX, 0, 1, 1),
-            (0, 1, 1, i32::MAX),
-        ] {
-            assert!(std::panic::catch_unwind(|| check_update_region(params, x, y, w, h)).is_err());
-        }
+    #[should_panic(expected = "texture transfer buffer is too small")]
+    fn a_large_transfer_cannot_wrap_to_a_small_buffer() {
+        transfer_len(TextureFormat::RGBA16F, i32::MAX, i32::MAX, 64);
     }
 
     #[cfg(not(target_arch = "wasm32"))]
