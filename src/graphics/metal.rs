@@ -242,6 +242,7 @@ struct Texture {
     sampler: ObjcId,
     sampler_descriptor: ObjcId,
     params: TextureParams,
+    access: TextureAccess,
 }
 struct Textures(Vec<Texture>);
 
@@ -295,8 +296,7 @@ impl MetalContext {
     }
 
     pub(crate) fn with_texture_size_limit(max_size: NonZeroU32) -> Self {
-        let limit = (max_size != NonZeroU32::MAX).then(|| TextureSizeLimit::new(max_size.get()));
-        Self::new_with_texture_size_limit(limit)
+        Self::new_with_texture_size_limit(Some(TextureSizeLimit::new(max_size.get())))
     }
 
     fn new_with_texture_size_limit(texture_size_limit: Option<TextureSizeLimit>) -> Self {
@@ -524,6 +524,12 @@ impl RenderingBackend for MetalContext {
     fn texture_params(&self, texture: TextureId) -> TextureParams {
         let texture = self.textures.get(texture);
         texture.params
+    }
+    fn texture_supports_color_attachment(&self, texture: TextureId) -> bool {
+        let texture = self.textures.get(texture);
+        texture.access == TextureAccess::RenderTarget
+            && texture.params.kind == TextureKind::Texture2D
+            && !matches!(texture.params.format, TextureFormat::Depth | TextureFormat::Depth32)
     }
     unsafe fn texture_raw_id(&self, texture: TextureId) -> RawId {
         let texture = self.textures.get(texture);
@@ -814,6 +820,7 @@ impl RenderingBackend for MetalContext {
                 texture: raw_texture,
                 sampler_descriptor,
                 params,
+                access,
             });
             TextureId(TextureIdInner::Managed(self.textures.0.len() - 1))
         };

@@ -76,7 +76,10 @@ impl VulkanBackend {
         size: (u32, u32),
         max_size: NonZeroU32,
     ) -> Self {
-        let context = VulkanContext::with_texture_size_limit(display, window, size, max_size);
+        Self::from_context(VulkanContext::with_texture_size_limit(display, window, size, max_size))
+    }
+
+    pub(crate) fn from_context(context: VulkanContext) -> Self {
         let textures = vec![None; context.textures.len()];
         let wrap_y = vec![TextureWrap::Clamp; textures.len()];
         Self {
@@ -86,6 +89,16 @@ impl VulkanBackend {
             buffers: Vec::new(),
             passes: Vec::new(),
         }
+    }
+
+    fn register_texture(&mut self, index: usize, params: TextureParams) -> TextureId {
+        self.textures
+            .resize(self.textures.len().max(index + 1), None);
+        self.textures[index] = Some(params);
+        self.wrap_y
+            .resize(self.wrap_y.len().max(index + 1), TextureWrap::Clamp);
+        self.wrap_y[index] = params.wrap;
+        TextureId(TextureIdInner::Managed(index))
     }
 
     fn texture_index(&self, texture: TextureId) -> usize {
@@ -205,13 +218,40 @@ impl RenderingBackend for VulkanBackend {
             assert!(bytes.is_none(), "Multisampled textures cannot be uploaded");
             ctx.new_attachment_texture(params, samples)
         };
-        self.textures
-            .resize(self.textures.len().max(index + 1), None);
-        self.textures[index] = Some(params);
-        self.wrap_y
-            .resize(self.wrap_y.len().max(index + 1), TextureWrap::Clamp);
-        self.wrap_y[index] = params.wrap;
-        TextureId(TextureIdInner::Managed(index))
+        self.register_texture(index, params)
+    }
+
+    fn render_target_sample_count(
+        &self,
+        color: TextureFormat,
+        depth: Option<TextureFormat>,
+        requested: i32,
+    ) -> i32 {
+        self.context
+            .borrow()
+            .render_target_sample_count(color, depth, requested)
+    }
+
+    fn texture_supports_color_attachment(&self, texture: TextureId) -> bool {
+        let index = self.texture_index(texture);
+        self.context
+            .borrow()
+            .texture_has_color_attachment_usage(index)
+    }
+
+    fn try_new_rgba8_render_texture(&mut self, width: u32, height: u32) -> Option<TextureId> {
+        let (index, params) = self
+            .context
+            .get_mut()
+            .try_new_rgba8_render_texture(width, height)?;
+        Some(self.register_texture(index, params))
+    }
+
+    fn prepare_render_texture_for_sampling(&mut self, texture: TextureId) {
+        let index = self.texture_index(texture);
+        self.context
+            .get_mut()
+            .prepare_render_texture_for_sampling(index);
     }
 
     fn texture_params(&self, texture: TextureId) -> TextureParams {
@@ -359,6 +399,10 @@ impl RenderingBackend for VulkanBackend {
                 ids.iter()
                     .zip(colors)
                     .map(|(id, color)| {
+                        assert!(
+                            self.texture_supports_color_attachment(*id),
+                            "Resolve textures require Vulkan color attachment usage"
+                        );
                         let r = self.texture_params(*id);
                         let color = self.texture_params(*color);
                         assert_eq!(r.sample_count, 1);
@@ -381,8 +425,8 @@ impl RenderingBackend for VulkanBackend {
         }
         for id in colors {
             assert!(
-                !is_depth_format(vk_format(self.texture_params(*id).format)),
-                "Color attachments require color formats"
+                self.texture_supports_color_attachment(*id),
+                "Color attachments require Vulkan color attachment usage"
             );
         }
         if let Some(depth) = depth {
@@ -454,7 +498,7 @@ impl RenderingBackend for VulkanBackend {
         ctx.free_pipelines.push(pipeline.0);
         if ctx.cur_pipeline == Some(pipeline) {
             ctx.cur_pipeline = None;
-            ctx.pending.clear();
+            ctx.bound_textures.clear();
         }
     }
     fn delete_shader(&mut self, shader: ShaderId) {
@@ -479,6 +523,8 @@ impl RenderingBackend for VulkanBackend {
         module.uniform_offsets = Vec::new();
         module.images = Vec::new();
         module.float_vertex_locations = Default::default();
+        module.named_vertex_locations = None;
+        module.uniforms = UniformState::default();
         ctx.free_shaders.push(shader.0);
     }
     fn new_buffer(
@@ -489,21 +535,17 @@ impl RenderingBackend for VulkanBackend {
     ) -> BufferId {
         let (size, element, bytes) = match source {
             BufferSource::Empty { size, element_size } => (size, element_size, None),
-            BufferSource::Slice(arg) => (
-                arg.size,
-                arg.element_size,
-                Some(unsafe { std::slice::from_raw_parts(arg.ptr as *const u8, arg.size) }),
-            ),
+            BufferSource::Slice(arg) => (arg.size, arg.element_size, Some(arg.ptr.cast::<u8>())),
         };
         let index_type = if type_ == BufferType::IndexBuffer {
             Some(IndexType::from_size(element))
         } else {
             None
         };
-        let index =
-            self.context
-                .get_mut()
-                .new_buffer(type_, index_type, size, bytes.map(|b| b.as_ptr()));
+        let index = self
+            .context
+            .get_mut()
+            .new_buffer(type_, index_type, size, bytes);
         self.buffers.resize(self.buffers.len().max(index.0 + 1), 0);
         self.buffers[index.0] = size;
         index
@@ -513,15 +555,23 @@ impl RenderingBackend for VulkanBackend {
             BufferSource::Slice(arg) => arg,
             BufferSource::Empty { .. } => panic!("buffer_update requires data"),
         };
-        self.context
-            .get_mut()
-            .update_buffer(buffer.0, arg.ptr as *const u8, arg.size);
+        let ctx = self.context.get_mut();
+        let module = &ctx.buffers[buffer.0];
+        if let Some(index_type) = module.index_type {
+            let element_size = if module.widen { 1 } else { index_type.size() };
+            assert_eq!(
+                arg.element_size,
+                usize::from(element_size),
+                "Index buffer updates must use the original element size"
+            );
+        }
+        ctx.update_buffer(buffer.0, arg.ptr.cast::<u8>(), arg.size);
     }
     fn buffer_size(&mut self, buffer: BufferId) -> usize {
         self.buffers[buffer.0]
     }
     fn delete_buffer(&mut self, buffer: BufferId) {
-        self.context.get_mut().delete_buffer(buffer.0);
+        self.context.get_mut().retire_buffer(buffer.0);
     }
     fn apply_viewport(&mut self, x: i32, y: i32, w: i32, h: i32) {
         self.context.get_mut().apply_viewport(x, y, w, h);

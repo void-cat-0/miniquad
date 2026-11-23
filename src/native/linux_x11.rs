@@ -22,12 +22,14 @@ use std::collections::HashMap;
 #[derive(Debug, PartialEq, Eq, Clone)]
 pub enum X11Error {
     LibraryNotFound(module::Error),
+    OpenDisplay,
     GLXError(String),
 }
 impl std::fmt::Display for X11Error {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::LibraryNotFound(e) => write!(f, "Library not found error: {e}"),
+            Self::OpenDisplay => write!(f, "XOpenDisplay() failed"),
             Self::GLXError(msg) => write!(f, "GLX error:\n{msg}"),
         }
     }
@@ -802,7 +804,7 @@ unsafe fn vulkan_main_loop<F>(
     conf: &crate::conf::Conf,
     f: &mut Option<F>,
     screen: i32,
-)
+) -> Option<X11Display>
 where
     F: 'static + FnOnce() -> Box<dyn EventHandler>,
 {
@@ -810,30 +812,37 @@ where
         display
             .libx11
             .create_window(display.root, display.display, std::ptr::null_mut(), 0, conf);
+    let (w, h) = display
+        .libx11
+        .query_window_size(display.display, display.window);
+
+    let window = super::vulkan::VulkanWindow::Xlib {
+        display: display.display as usize,
+        window: display.window as u64,
+        screen,
+    };
+    let Some(prepared) = window.prepare(conf.platform.rendering_backend, (w as u32, h as u32))
+    else {
+        // GLX/EGL select the native visual for their own window.
+        (display.libx11.XDestroyWindow)(display.display, display.window);
+        display.window = 0;
+        return Some(display);
+    };
     display.init_drag_n_drop();
     if !conf.headless {
         display.libx11.show_window(display.display, display.window);
     }
 
-    (display.libx11.XFlush)(display.display);
-
-    let (w, h) = display
-        .libx11
-        .query_window_size(display.display, display.window);
-
+    // A failed Wayland startup may have already published temporary display data.
     let (tx, rx) = std::sync::mpsc::channel();
     let clipboard = Box::new(clipboard::X11Clipboard::new(
         display.libx11.clone(),
         display.display,
         display.window,
     ));
-    crate::set_display(NativeDisplayData {
+    crate::set_or_replace_display(NativeDisplayData {
         rendering_backend: crate::conf::RenderingBackend::Vulkan,
-        vulkan_window: Some(super::vulkan::VulkanWindow::Xlib {
-            display: display.display as usize,
-            window: display.window as u64,
-            screen,
-        }),
+        vulkan_window: Some(window),
         high_dpi: conf.high_dpi,
         dpi_scale: display.libx11.update_system_dpi(display.display),
         blocking_event_loop: conf.platform.blocking_event_loop,
@@ -844,33 +853,58 @@ where
     }
 
     let mut event_handler = (f.take().unwrap())();
+    drop(prepared);
 
+    let mut retry_frame = false;
+    // An intentionally hidden window may be driving offscreen exports.
+    let mut mapped = conf.headless;
     while !crate::native_display().try_lock().unwrap().quit_ordered {
         while let Ok(request) = rx.try_recv() {
             display.process_request(request);
         }
 
         let mut count = (display.libx11.XPending)(display.display);
-        let block_on_wait = conf.platform.blocking_event_loop && !display.update_requested;
-        if block_on_wait {
-            // if there are multiple events pending, it is still desired to process
-            // them all in one frame.
-            // However, when there are no events in the queue, +1 hack
-            // will block main thread and release the cpu until the new event.
-            count += 1;
+        let block_on_wait =
+            !mapped || (conf.platform.blocking_event_loop && !display.update_requested);
+        if mapped && retry_frame && count == 0 {
+            let mut fd = libc::pollfd {
+                fd: (*(display.display as _XPrivDisplay)).fd,
+                events: libc::POLLIN,
+                revents: 0,
+            };
+            libc::poll(&mut fd, 1, crate::event::VULKAN_FRAME_RETRY_MS as i32);
+            count = (display.libx11.XPending)(display.display);
+        } else if block_on_wait && count == 0 {
+            // XNextEvent blocks until at least one native event arrives.
+            count = 1;
         }
 
         for _ in 0..count {
             let mut xevent = _XEvent { type_0: 0 };
             (display.libx11.XNextEvent)(display.display, &mut xevent);
+            match xevent.type_0 {
+                18 if xevent.xunmap.window == display.window => mapped = false, // UnmapNotify
+                19 if xevent.xmap.window == display.window => {
+                    // MapNotify
+                    mapped = true;
+                    display.update_requested = true;
+                }
+                12 | 22 if xevent.xany.window == display.window => {
+                    // Expose / ConfigureNotify
+                    display.update_requested = true;
+                }
+                _ => (),
+            }
             display.process_event(&mut xevent, &mut *event_handler);
         }
 
-        if !conf.platform.blocking_event_loop || display.update_requested {
+        if mapped
+            && (!conf.platform.blocking_event_loop || display.update_requested)
+            && !crate::native_display().lock().unwrap().quit_ordered
+        {
             display.update_requested = false;
-            event_handler.update();
-            event_handler.draw();
-
+            retry_frame = !crate::event::draw_desktop_vulkan_frame(event_handler.as_mut());
+            display.update_requested |= retry_frame;
             (display.libx11.XFlush)(display.display);
         }
     }
@@ -879,6 +913,7 @@ where
     (display.libx11.XUnmapWindow)(display.display, display.window);
     (display.libx11.XDestroyWindow)(display.display, display.window);
     (display.libx11.XCloseDisplay)(display.display);
+    None
 }
 
 unsafe fn glx_main_loop<F>(
@@ -927,7 +962,7 @@ where
         display.display,
         display.window,
     ));
-    crate::set_display(NativeDisplayData {
+    crate::set_or_replace_display(NativeDisplayData {
         high_dpi: conf.high_dpi,
         dpi_scale: display.libx11.update_system_dpi(display.display),
         blocking_event_loop: conf.platform.blocking_event_loop,
@@ -1039,7 +1074,7 @@ where
         display.display,
         display.window,
     ));
-    crate::set_display(NativeDisplayData {
+    crate::set_or_replace_display(NativeDisplayData {
         high_dpi: conf.high_dpi,
         dpi_scale: display.libx11.update_system_dpi(display.display),
         blocking_event_loop: conf.platform.blocking_event_loop,
@@ -1109,7 +1144,7 @@ where
 
         let x11_display = (libx11.XOpenDisplay)(std::ptr::null());
         if x11_display.is_null() {
-            panic!("XOpenDisplay() failed!");
+            return Err(X11Error::OpenDisplay);
         }
 
         // screen selection process. The place to do something about
@@ -1161,9 +1196,11 @@ where
             .query_xi_extension(&mut display.libx11, display.display);
 
         #[cfg(feature = "vulkan")]
-        if conf.platform.rendering_backend == crate::conf::RenderingBackend::Vulkan {
-            vulkan_main_loop(display, conf, f, x11_screen);
-            return Ok(());
+        if conf.platform.rendering_backend != crate::conf::RenderingBackend::OpenGl {
+            let Some(gl_display) = vulkan_main_loop(display, conf, f, x11_screen) else {
+                return Ok(());
+            };
+            display = gl_display;
         }
 
         match conf.platform.linux_x11_gl {

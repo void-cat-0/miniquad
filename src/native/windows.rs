@@ -130,6 +130,7 @@ pub(crate) struct WindowsDisplay {
     event_handler: Option<Box<dyn EventHandler>>,
     modal_resizing_timer: usize,
     update_requested: bool,
+    vulkan: bool,
     ime_position: Option<(i32, i32)>,
 }
 
@@ -484,6 +485,9 @@ unsafe extern "system" fn win32_wndproc(
             }
 
             let iconified = wparam == SIZE_MINIMIZED;
+            if payload.vulkan && !iconified {
+                payload.update_requested = true;
+            }
             if iconified != payload.iconified {
                 payload.iconified = iconified;
                 if iconified {
@@ -885,14 +889,20 @@ unsafe extern "system" fn win32_wndproc(
                         .resize_event(width, height);
                 }
 
+                #[cfg(feature = "vulkan")]
+                if payload.vulkan {
+                    if !payload.iconified {
+                        payload.update_requested = false;
+                        let drawn = crate::event::draw_desktop_vulkan_frame(
+                            payload.event_handler.as_deref_mut().unwrap(),
+                        );
+                        payload.update_requested |= !drawn;
+                    }
+                    return DefWindowProcW(hwnd, umsg, wparam, lparam);
+                }
                 payload.event_handler.as_mut().unwrap().update();
                 payload.event_handler.as_mut().unwrap().draw();
-
-                if crate::native_display().lock().unwrap().rendering_backend
-                    != crate::conf::RenderingBackend::Vulkan
-                {
-                    SwapBuffers(payload.dc);
-                }
+                SwapBuffers(payload.dc);
             }
         }
         WM_EXITSIZEMOVE | WM_EXITMENULOOP => {
@@ -1356,6 +1366,7 @@ where
             event_handler: None,
             modal_resizing_timer: 0,
             update_requested: true,
+            vulkan: false,
             ime_position: None,
         };
         display.init_dpi(conf.high_dpi);
@@ -1371,8 +1382,26 @@ where
 
         display.update_dimensions(wnd);
 
-        let vulkan = conf.platform.rendering_backend == crate::conf::RenderingBackend::Vulkan;
-        let gl_ctx = if vulkan {
+        #[cfg(feature = "vulkan")]
+        let prepared = {
+            let window = super::vulkan::VulkanWindow::Win32 {
+                hwnd: wnd as usize,
+                hinstance: GetModuleHandleW(NULL as _) as usize,
+            };
+            let (width, height) = crate::window::screen_size();
+            let prepared = window.prepare(
+                conf.platform.rendering_backend,
+                (width as u32, height as u32),
+            );
+            if prepared.is_some() {
+                let mut d = crate::native_display().lock().unwrap();
+                d.rendering_backend = crate::conf::RenderingBackend::Vulkan;
+                d.vulkan_window = Some(window);
+                display.vulkan = true;
+            }
+            prepared
+        };
+        let gl_ctx = if display.vulkan {
             None
         } else {
             let mut wgl = wgl::Wgl::new(&mut display);
@@ -1384,15 +1413,6 @@ where
             super::gl::load_gl_funcs(|proc| display.get_proc_address(proc));
             Some(context)
         };
-        #[cfg(feature = "vulkan")]
-        if vulkan {
-            let mut d = crate::native_display().lock().unwrap();
-            d.rendering_backend = crate::conf::RenderingBackend::Vulkan;
-            d.vulkan_window = Some(super::vulkan::VulkanWindow::Win32 {
-                hwnd: wnd as usize,
-                hinstance: GetModuleHandleW(NULL as _) as usize,
-            });
-        }
 
         // IMPORTANT: Show window AFTER WGL context is created
         // This ensures IME initializes correctly when window gains focus
@@ -1415,6 +1435,8 @@ where
         );
 
         display.event_handler = Some(f());
+        #[cfg(feature = "vulkan")]
+        drop(prepared);
 
         #[cfg(target_arch = "x86_64")]
         SetWindowLongPtrA(wnd, GWLP_USERDATA, &mut display as *mut _ as isize);
@@ -1422,6 +1444,8 @@ where
         SetWindowLong(wnd, GWLP_USERDATA, &mut display as *mut _ as isize);
 
         let mut done = false;
+        #[cfg(feature = "vulkan")]
+        let mut retry_frame = false;
         while !(done || crate::native_display().lock().unwrap().quit_ordered) {
             while let Ok(request) = rx.try_recv() {
                 display.process_request(request);
@@ -1439,8 +1463,18 @@ where
             // A minimized Vulkan surface may not return a swapchain image.
             // Keep processing messages until restore instead of blocking the
             // window thread inside acquisition/presentation.
-            let block_on_wait = (vulkan && display.iconified)
+            let block_on_wait = (display.vulkan && display.iconified)
                 || (conf.platform.blocking_event_loop && !display.update_requested);
+            #[cfg(feature = "vulkan")]
+            if retry_frame && !block_on_wait {
+                MsgWaitForMultipleObjectsEx(
+                    0,
+                    std::ptr::null(),
+                    crate::event::VULKAN_FRAME_RETRY_MS,
+                    QS_ALLINPUT,
+                    MWMO_INPUTAVAILABLE,
+                );
+            }
             if block_on_wait {
                 GetMessageW(&mut msg as *mut _ as _, NULL as _, 0, 0);
                 dispatch_message(msg);
@@ -1461,14 +1495,21 @@ where
                     .unwrap()
                     .resize_event(width, height);
             }
-            if (!vulkan || !display.iconified)
+            if !done
+                && (!display.vulkan || !display.iconified)
                 && (!conf.platform.blocking_event_loop || display.update_requested)
             {
                 display.update_requested = false;
-                display.event_handler.as_mut().unwrap().update();
-                display.event_handler.as_mut().unwrap().draw();
-
-                if !vulkan {
+                let event_handler = display.event_handler.as_deref_mut().unwrap();
+                if display.vulkan {
+                    #[cfg(feature = "vulkan")]
+                    {
+                        retry_frame = !crate::event::draw_desktop_vulkan_frame(event_handler);
+                        display.update_requested |= retry_frame;
+                    }
+                } else {
+                    event_handler.update();
+                    event_handler.draw();
                     SwapBuffers(display.dc);
                 }
             }

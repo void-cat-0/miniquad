@@ -63,6 +63,7 @@ struct WaylandPayload {
     focused_window: *mut wl_surface,
     decoration_manager: *mut extensions::xdg_decoration::zxdg_decoration_manager_v1,
     decorations: decorations::Decorations,
+    surface_configured: bool,
 
     text_input_manager: *mut extensions::text_input::zwp_text_input_manager_v3,
     text_input: *mut extensions::text_input::zwp_text_input_v3,
@@ -93,6 +94,79 @@ fn dead_keysym_to_char(keysym: u32) -> Option<char> {
 }
 
 impl WaylandPayload {
+    /// Destroy EGL resources before disconnecting when window setup fails.
+    unsafe fn init_opengl(
+        &mut self,
+        mut egl: egl::LibEgl,
+        conf: &crate::conf::Conf,
+        (width, height): (i32, i32),
+    ) -> Result<(egl::LibEgl, egl::EGLDisplay, egl::EGLSurface), String> {
+        let (context, config, egl_display) = egl::create_egl_context(
+            &mut egl,
+            self.display.cast(),
+            conf.platform.framebuffer_alpha,
+            conf.sample_count,
+        )
+        .map_err(|error| error.to_string())?;
+        let libwayland_egl = self.egl.as_ref().unwrap();
+        self.egl_window = (libwayland_egl.wl_egl_window_create)(self.surface, width, height);
+        let surface = if self.egl_window.is_null() {
+            std::ptr::null_mut()
+        } else {
+            (egl.eglCreateWindowSurface)(
+                egl_display,
+                config,
+                self.egl_window as _,
+                std::ptr::null_mut(),
+            )
+        };
+        if surface.is_null() || (egl.eglMakeCurrent)(egl_display, surface, surface, context) == 0 {
+            let error = (egl.eglGetError)();
+            if !surface.is_null() {
+                (egl.eglDestroySurface)(egl_display, surface);
+            }
+            if !self.egl_window.is_null() {
+                (libwayland_egl.wl_egl_window_destroy)(self.egl_window);
+                self.egl_window = std::ptr::null_mut();
+            }
+            (egl.eglDestroyContext)(egl_display, context);
+            (egl.eglTerminate)(egl_display);
+            return Err(format!("EGL window context failed (0x{error:x})"));
+        }
+        if (egl.eglSwapInterval)(egl_display, conf.platform.swap_interval.unwrap_or(1)) == 0 {
+            eprintln!("eglSwapInterval failed");
+        }
+        crate::native::gl::load_gl_funcs(|proc| {
+            let name = std::ffi::CString::new(proc).unwrap();
+            (egl.eglGetProcAddress)(name.as_ptr() as _)
+        });
+        Ok((egl, egl_display, surface))
+    }
+
+    unsafe fn abort_startup(&self, error: impl std::fmt::Display) -> Option<()> {
+        eprintln!("Wayland window startup failed: {error}");
+        if let decorations::Decorations::LibDecor {
+            libdecor,
+            frame,
+            context,
+        } = &self.decorations
+        {
+            (libdecor.libdecor_frame_unref)(*frame);
+            (libdecor.libdecor_unref)(*context);
+        }
+        // Disconnect releases Wayland proxies owned by the connection.
+        (self.client.wl_display_disconnect)(self.display);
+        (self.xkb.xkb_state_unref)(self.xkb_state);
+        (self.xkb.xkb_keymap_unref)(self.keymap.xkb_keymap);
+        (self.xkb.xkb_compose_state_unref)(self.xkb_compose_state);
+        (self.xkb.xkb_compose_table_unref)(self.xkb_compose_table);
+        (self.xkb.xkb_context_unref)(self.xkb_context);
+        if self.keyboard_context.timerfd >= 0 {
+            libc::close(self.keyboard_context.timerfd);
+        }
+        None
+    }
+
     unsafe fn process_key_event(&mut self, key: core::ffi::c_uint, repeat: bool) {
         let libxkb = &mut self.xkb;
         let keymap = &self.keymap;
@@ -190,11 +264,10 @@ impl WaylandPayload {
             }
         }
     }
-    /// Poll new events, `blocking` specifies whether it should block until a new event is
-    /// available
+    /// Poll Wayland and key-repeat events for at most `timeout_ms` (`-1` blocks).
     // needs to combine both the Wayland events and the key repeat events
     // the implementation is translated from glfw
-    unsafe fn poll_new_event(&mut self, blocking: bool) {
+    unsafe fn poll_new_event(&mut self, timeout_ms: i32) -> bool {
         let mut fds = [
             libc::pollfd {
                 fd: (self.client.wl_display_get_fd)(self.display),
@@ -209,14 +282,19 @@ impl WaylandPayload {
         ];
         (self.client.wl_display_flush)(self.display);
         while (self.client.wl_display_prepare_read)(self.display) != 0 {
-            (self.client.wl_display_dispatch_pending)(self.display);
+            if (self.client.wl_display_dispatch_pending)(self.display) < 0 {
+                return false;
+            }
             (self.client.wl_display_flush)(self.display);
         }
-        if libc::poll(fds.as_mut_ptr(), 2, if blocking { i32::MAX } else { 0 }) > 0 {
+        if libc::poll(fds.as_mut_ptr(), 2, timeout_ms) > 0 {
             // if the Wayland display has events available
             if fds[0].revents & libc::POLLIN == 1 {
-                (self.client.wl_display_read_events)(self.display);
-                (self.client.wl_display_dispatch_pending)(self.display);
+                if (self.client.wl_display_read_events)(self.display) < 0
+                    || (self.client.wl_display_dispatch_pending)(self.display) < 0
+                {
+                    return false;
+                }
             } else {
                 (self.client.wl_display_cancel_read)(self.display);
             }
@@ -241,35 +319,13 @@ impl WaylandPayload {
         } else {
             (self.client.wl_display_cancel_read)(self.display);
         }
-        let errno = (self.client.wl_display_get_error)(self.display);
-        // A non-zero errno means the compositor decided that we need to die.
-        // Nothing more we can do at this point :(
-        // If we want the detailed error message, we need to run with `WAYLAND_DEBUG=client`, since
-        // the message string is not accessible to us.
-        match errno {
-            0 => (),
-            libc::EPROTO => {
-                let mut interface: *const wl_interface = std::ptr::null();
-                let mut id = 0;
-                let code = (self.client.wl_display_get_protocol_error)(
-                    self.display,
-                    &mut interface,
-                    &mut id,
-                );
-                let name = core::ffi::CStr::from_ptr((*interface).name)
-                    .to_str()
-                    .unwrap();
-                panic!(
-                    "Wayland protocol error at {}#{} with code {}",
-                    name, id, code
-                )
-            }
-            _ => {
-                panic!("Wayland display error with code {}", errno)
-            }
-        }
+        (self.client.wl_display_get_error)(self.display) == 0
     }
+
     unsafe fn init_data_device(&mut self) {
+        if self.seat.is_null() || self.data_device_manager.is_null() {
+            return;
+        }
         self.data_device = wl_request_constructor!(
             self.client,
             self.data_device_manager,
@@ -290,6 +346,9 @@ impl WaylandPayload {
         );
     }
     unsafe fn init_pointer_context(&mut self) {
+        if self.pointer_context.pointer.is_null() {
+            return;
+        }
         if !self.pointer_context.cursor_shape_manager.is_null() {
             self.pointer_context.cursor_shape_device = wl_request_constructor!(
                 self.client,
@@ -1340,11 +1399,12 @@ where
 {
     unsafe {
         let client = LibWaylandClient::try_load().ok()?;
-        let vulkan = conf.platform.rendering_backend == crate::conf::RenderingBackend::Vulkan;
-        let egl = if vulkan {
-            None
+        let request_vulkan = cfg!(feature = "vulkan")
+            && conf.platform.rendering_backend != crate::conf::RenderingBackend::OpenGl;
+        let (egl, mut egl_driver) = if request_vulkan {
+            (None, None)
         } else {
-            Some(LibWaylandEgl::try_load().ok()?)
+            (Some(LibWaylandEgl::try_load().ok()?), Some(egl::LibEgl::try_load().ok()?))
         };
         let xkb = LibXkbCommon::try_load().ok()?;
 
@@ -1417,6 +1477,7 @@ where
             focused_window: std::ptr::null_mut(),
             decoration_manager: std::ptr::null_mut(),
             decorations: decorations::Decorations::None,
+            surface_configured: false,
             text_input_manager: std::ptr::null_mut(),
             text_input: std::ptr::null_mut(),
             events: Vec::new(),
@@ -1443,129 +1504,113 @@ where
             ..NativeDisplayData::new(conf.window_width, conf.window_height, tx, clipboard)
         });
 
-        (display.client.wl_display_dispatch)(display.display);
-        (display.client.wl_display_dispatch)(display.display);
+        // Complete registry discovery, then the initial events from the bound
+        // globals (e.g. seat capabilities and output scale). Unlike dispatch,
+        // a roundtrip gets a reply even if a global has no events to send.
+        for _ in 0..2 {
+            if (display.client.wl_display_roundtrip)(display.display) < 0 {
+                return display.abort_startup("compositor disconnected during registry discovery");
+            }
+        }
 
+        display.decorations = decorations::Decorations::new(&mut display, conf);
+        display
+            .decorations
+            .configure_toplevel(&mut display.client, display.xdg_toplevel, conf);
+
+        let uses_libdecor = display.decorations.map_libdecor_frame();
+        if !uses_libdecor {
+            if conf.fullscreen {
+                display.set_fullscreen(true);
+            }
+            wl_request!(display.client, display.surface, WL_SURFACE_COMMIT);
+        }
+        // The first xdg_surface.configure (or libdecor's committed frame
+        // configuration) is our readiness signal, even for a 0x0 size hint.
+        // Once acknowledged, don't block waiting for an unrelated second batch:
+        // some compositors won't send another event until we submit a buffer.
+        while !display.surface_configured {
+            if (display.client.wl_display_dispatch)(display.display) < 0 {
+                return display.abort_startup("compositor disconnected before surface configure");
+            }
+        }
+        if uses_libdecor && conf.fullscreen {
+            display.set_fullscreen(true);
+        }
+        if (display.client.wl_display_flush)(display.display) < 0
+            && std::io::Error::last_os_error().kind() != std::io::ErrorKind::WouldBlock
+        {
+            return display.abort_startup("failed to send initial surface configure");
+        }
+
+        let (size, scale) = {
+            let d = crate::native_display().lock().unwrap();
+            ((d.screen_width, d.screen_height), d.dpi_scale as i32)
+        };
+        wl_request!(
+            display.client,
+            display.surface,
+            WL_SURFACE_SET_BUFFER_SCALE,
+            scale
+        );
+
+        #[cfg(feature = "vulkan")]
+        let prepared = if request_vulkan {
+            let window = super::vulkan::VulkanWindow::Wayland {
+                display: wdisplay as usize,
+                surface: display.surface as usize,
+            };
+            let prepared = window.prepare(
+                conf.platform.rendering_backend,
+                (size.0 as u32, size.1 as u32),
+            );
+            if prepared.is_some() {
+                let mut d = crate::native_display().lock().unwrap();
+                d.rendering_backend = crate::conf::RenderingBackend::Vulkan;
+                d.vulkan_window = Some(window);
+            }
+            prepared
+        } else {
+            None
+        };
+        #[cfg(feature = "vulkan")]
+        let vulkan = prepared.is_some();
+        #[cfg(not(feature = "vulkan"))]
+        let vulkan = false;
+        let mut opengl = if vulkan {
+            None
+        } else {
+            let driver = if let Some(egl) = egl_driver.take() {
+                egl
+            } else {
+                let result = LibWaylandEgl::try_load().and_then(|windowing| {
+                    let egl = egl::LibEgl::try_load()?;
+                    display.egl = Some(windowing);
+                    Ok(egl)
+                });
+                match result {
+                    Ok(egl) => egl,
+                    Err(error) => return display.abort_startup(error),
+                }
+            };
+            match display.init_opengl(driver, conf, size) {
+                Ok(context) => Some(context),
+                Err(error) => return display.abort_startup(error),
+            }
+        };
         display.init_data_device();
         display.init_pointer_context();
         display.init_text_input();
 
-        #[cfg(feature = "vulkan")]
-        if vulkan {
-            let mut d = crate::native_display().lock().unwrap();
-            d.rendering_backend = crate::conf::RenderingBackend::Vulkan;
-            d.vulkan_window = Some(super::vulkan::VulkanWindow::Wayland {
-                display: wdisplay as usize,
-                surface: display.surface as usize,
-            });
-            wl_request!(
-                display.client,
-                display.surface,
-                WL_SURFACE_SET_BUFFER_SCALE,
-                d.dpi_scale as i32
-            );
-        }
-        let mut opengl = if vulkan {
-            None
-        } else {
-            let mut libegl = egl::LibEgl::try_load().ok()?;
-            let (context, config, egl_display) = egl::create_egl_context(
-                &mut libegl,
-                wdisplay as *mut _,
-                conf.platform.framebuffer_alpha,
-                conf.sample_count,
-            )
-            .unwrap();
-
-            {
-                // At this point we have been told the dpi_scale
-                let d = crate::native_display().try_lock().unwrap();
-                display.egl_window = (display.egl.as_ref().unwrap().wl_egl_window_create)(
-                    display.surface as _,
-                    d.screen_width,
-                    d.screen_height,
-                );
-                wl_request!(
-                    display.client,
-                    display.surface,
-                    WL_SURFACE_SET_BUFFER_SCALE,
-                    d.dpi_scale as i32
-                );
-            }
-
-            let egl_surface = (libegl.eglCreateWindowSurface)(
-                egl_display,
-                config,
-                display.egl_window as _,
-                std::ptr::null_mut(),
-            );
-
-            if egl_surface.is_null() {
-                // == EGL_NO_SURFACE
-                panic!("surface creation failed");
-            }
-            if (libegl.eglMakeCurrent)(egl_display, egl_surface, egl_surface, context) == 0 {
-                panic!("eglMakeCurrent failed");
-            }
-
-            if (libegl.eglSwapInterval)(egl_display, conf.platform.swap_interval.unwrap_or(1)) == 0
-            {
-                eprintln!("eglSwapInterval failed");
-            }
-
-            crate::native::gl::load_gl_funcs(|proc| {
-                let name = std::ffi::CString::new(proc).unwrap();
-                (libegl.eglGetProcAddress)(name.as_ptr() as _)
-            });
-
-            Some((libegl, egl_display, egl_surface))
-        };
-
-        display.decorations = decorations::Decorations::new(&mut display, conf);
-        assert!(!display.xdg_toplevel.is_null());
-
-        display.decorations.set_title(
-            &mut display.client,
-            display.xdg_toplevel,
-            conf.window_title.as_str(),
-        );
-
-        let wm_class = std::ffi::CString::new(conf.platform.linux_wm_class).unwrap();
-        wl_request!(
-            display.client,
-            display.xdg_toplevel,
-            extensions::xdg_shell::xdg_toplevel::set_app_id,
-            wm_class.as_ptr()
-        );
-
-        if !conf.window_resizable {
-            for set_size in [
-                extensions::xdg_shell::xdg_toplevel::set_max_size,
-                extensions::xdg_shell::xdg_toplevel::set_min_size,
-            ] {
-                wl_request!(
-                    display.client,
-                    display.xdg_toplevel,
-                    set_size,
-                    conf.window_width,
-                    conf.window_height
-                );
-            }
-        }
-
-        if conf.fullscreen {
-            display.set_fullscreen(true);
-        }
-
-        wl_request!(display.client, display.surface, WL_SURFACE_COMMIT);
-        (display.client.wl_display_dispatch)(display.display);
-        (display.client.wl_display_dispatch)(display.display);
-
         let mut event_handler = (f.take().unwrap())();
+        #[cfg(feature = "vulkan")]
+        drop(prepared);
 
         // track cursor visibility and icon separately, so that we can show/hide cursor without resetting icon
         let mut cursor_icon = crate::CursorIcon::Default;
         let mut cursor_visible = true;
+        #[cfg(feature = "vulkan")]
+        let mut retry_frame = false;
 
         while !crate::native_display().try_lock().unwrap().quit_ordered {
             while let Ok(request) = rx.try_recv() {
@@ -1640,8 +1685,24 @@ where
 
             // If `blocking_event_loop` is set but an update is requested, we should still poll the
             // new events but continue without blocking
-            let blocking = conf.platform.blocking_event_loop && !display.update_requested;
-            display.poll_new_event(blocking);
+            let timeout_ms = if conf.platform.blocking_event_loop && !display.update_requested {
+                -1
+            } else {
+                0
+            };
+            #[cfg(feature = "vulkan")]
+            let timeout_ms = if retry_frame {
+                crate::event::VULKAN_FRAME_RETRY_MS as i32
+            } else {
+                timeout_ms
+            };
+            if !display.poll_new_event(timeout_ms) {
+                eprintln!(
+                    "Wayland display disconnected (error {})",
+                    (display.client.wl_display_get_error)(display.display)
+                );
+                break;
+            }
 
             for event in display.events.drain(..) {
                 match event {
@@ -1681,6 +1742,9 @@ where
                         event_handler.touch_event(phase, id, x, y, time)
                     }
                     WaylandEvent::Resize(width, height) => {
+                        if vulkan {
+                            display.update_requested = true;
+                        }
                         event_handler.resize_event(width, height)
                     }
                     WaylandEvent::WindowMinimized => event_handler.window_minimized_event(),
@@ -1725,8 +1789,16 @@ where
                 }
             }
 
-            if !conf.platform.blocking_event_loop || display.update_requested {
+            if !crate::native_display().lock().unwrap().quit_ordered
+                && (!conf.platform.blocking_event_loop || display.update_requested)
+            {
                 display.update_requested = false;
+                #[cfg(feature = "vulkan")]
+                if vulkan {
+                    retry_frame = !crate::event::draw_desktop_vulkan_frame(event_handler.as_mut());
+                    display.update_requested |= retry_frame;
+                    continue;
+                }
                 event_handler.update();
                 event_handler.draw();
                 if let Some((libegl, egl_display, egl_surface)) = &mut opengl {

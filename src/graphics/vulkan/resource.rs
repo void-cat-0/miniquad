@@ -1,5 +1,6 @@
 use std::{
-    collections::{BTreeMap, BTreeSet, HashSet},
+    collections::{BTreeMap, BTreeSet, HashMap, HashSet},
+    mem::MaybeUninit,
     ptr,
 };
 
@@ -23,8 +24,11 @@ pub struct ShaderModule {
     /// `(tight offset, std140 offset, element size, std140 stride, element count)`
     /// per uniform in `ShaderMeta` declaration order.
     pub uniform_offsets: Vec<(u32, u32, u32, u32, u32)>,
+    pub(super) uniforms: super::UniformState,
     pub images: Vec<String>,
     pub float_vertex_locations: BTreeSet<u32>,
+    /// Runtime GLSL inputs bind by source name; SPIR-V assets use pipeline order.
+    pub(super) named_vertex_locations: Option<HashMap<String, u32>>,
 }
 
 pub struct PipelineVariant {
@@ -50,6 +54,107 @@ pub struct BufferModule {
     pub current_offset: vk::DeviceSize,
     pub index_type: Option<IndexType>,
     pub widen: bool,
+    initial_data: bool,
+    stream: StreamData,
+}
+
+/// The logical contents of an updated buffer outlive the frame that wrote
+/// them. Its transient GPU copy is valid only in the epoch that staged it.
+#[derive(Default)]
+struct StreamData {
+    // BufferSource may be a typed vertex slice with uninitialized padding.
+    bytes: Vec<MaybeUninit<u8>>,
+    uploaded_epoch: Option<u64>,
+}
+
+impl StreamData {
+    fn update_prefix(&mut self, bytes: &[MaybeUninit<u8>]) {
+        if bytes.is_empty() {
+            return;
+        }
+        if bytes.len() > self.bytes.len() {
+            self.bytes.resize(bytes.len(), MaybeUninit::uninit());
+        }
+        self.bytes[..bytes.len()].copy_from_slice(bytes);
+        self.uploaded_epoch = None;
+    }
+
+    fn needs_upload(&self, epoch: u64) -> bool {
+        !self.bytes.is_empty() && self.uploaded_epoch != Some(epoch)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{
+        compatible_sample_count, transfer_destination_layout, vk, MaybeUninit, StreamData,
+    };
+
+    // Each byte asserted here came from one of the initialized test arrays.
+    fn data(stream: &StreamData) -> Vec<u8> {
+        stream
+            .bytes
+            .iter()
+            .map(|byte| unsafe { byte.assume_init() })
+            .collect()
+    }
+
+    #[test]
+    fn updated_data_is_replayed_after_switching_slots_or_restarting() {
+        let mut stream = StreamData::default();
+        assert!(!stream.needs_upload(1));
+        stream.update_prefix(&[1, 2, 3, 4].map(MaybeUninit::new));
+        assert!(stream.needs_upload(1));
+        stream.uploaded_epoch = Some(1);
+        assert!(!stream.needs_upload(1));
+        assert!(stream.needs_upload(2));
+        stream.uploaded_epoch = Some(2);
+        assert!(stream.needs_upload(3));
+        assert_eq!(data(&stream), [1, 2, 3, 4]);
+    }
+
+    #[test]
+    fn a_second_update_preserves_the_previous_suffix_and_needs_a_new_slice() {
+        let mut stream = StreamData::default();
+        stream.update_prefix(&[1, 2, 3, 4].map(MaybeUninit::new));
+        stream.uploaded_epoch = Some(1);
+        stream.update_prefix(&[]);
+        assert!(!stream.needs_upload(1));
+        stream.update_prefix(&[5, 6].map(MaybeUninit::new));
+        assert!(stream.needs_upload(1));
+        assert_eq!(data(&stream), [5, 6, 3, 4]);
+    }
+
+    #[test]
+    fn transfer_into_a_new_attachment_uses_a_defined_layout() {
+        let undefined = vk::ImageLayout::UNDEFINED;
+        let color = vk::ImageAspectFlags::COLOR;
+        let depth = vk::ImageAspectFlags::DEPTH;
+        assert_eq!(
+            transfer_destination_layout(undefined, color),
+            vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL
+        );
+        assert_eq!(
+            transfer_destination_layout(undefined, depth),
+            vk::ImageLayout::DEPTH_STENCIL_ATTACHMENT_OPTIMAL
+        );
+        let sampled = vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL;
+        assert_eq!(transfer_destination_layout(sampled, color), sampled);
+    }
+
+    #[test]
+    fn msaa_uses_the_largest_supported_count_common_to_both_attachments() {
+        let color = vk::SampleCountFlags::TYPE_1
+            | vk::SampleCountFlags::TYPE_4
+            | vk::SampleCountFlags::TYPE_8;
+        let depth = vk::SampleCountFlags::TYPE_1
+            | vk::SampleCountFlags::TYPE_2
+            | vk::SampleCountFlags::TYPE_4;
+        assert_eq!(compatible_sample_count(8, color, None), 8);
+        assert_eq!(compatible_sample_count(8, color, Some(depth)), 4);
+        assert_eq!(compatible_sample_count(2, color, Some(depth)), 1);
+        assert_eq!(compatible_sample_count(0, color, None), 1);
+    }
 }
 
 pub struct TextureModule {
@@ -65,7 +170,7 @@ pub struct TextureModule {
     pub height: u32,
     pub format: vk::Format,
     source_format: TextureFormat,
-    usage: vk::ImageUsageFlags,
+    pub(super) usage: vk::ImageUsageFlags,
     pub layout: vk::ImageLayout,
     pub mip_levels: u32,
     pub filter: FilterMode,
@@ -196,11 +301,6 @@ impl VulkanContext {
         module.wrap = wrap_x;
         module.wrap_y = wrap_y;
         module.mipmap_filter = mipmap_filter;
-        for image in self.pending.images.iter_mut().flatten() {
-            if image.sampler == old {
-                image.sampler = sampler;
-            }
-        }
         unsafe {
             self.device.destroy_sampler(old, None);
         }
@@ -212,44 +312,47 @@ impl VulkanContext {
         usage: vk::BufferUsageFlags,
         required: vk::MemoryPropertyFlags,
     ) -> (vk::Buffer, vk::DeviceMemory) {
+        self.try_create_buffer(size, usage, required)
+            .expect("Failed to allocate a Vulkan buffer")
+    }
+
+    unsafe fn try_create_buffer(
+        &mut self,
+        size: vk::DeviceSize,
+        usage: vk::BufferUsageFlags,
+        required: vk::MemoryPropertyFlags,
+    ) -> Result<(vk::Buffer, vk::DeviceMemory), vk::Result> {
         let create_info = vk::BufferCreateInfo::builder()
             .size(size)
             .usage(usage)
             .sharing_mode(vk::SharingMode::EXCLUSIVE);
 
-        let buffer = self
-            .device
-            .create_buffer(&create_info, None)
-            .expect("Failed to create the buffer");
+        let buffer = self.device.create_buffer(&create_info, None)?;
 
         let requirements = self.device.get_buffer_memory_requirements(buffer);
-        let memory_type_index = find_memory_type_index(
+        let Some(memory_type_index) = find_memory_type_index(
             self.memory_properties,
             requirements.memory_type_bits,
             required,
-        )
-        .unwrap_or_else(|| {
+        ) else {
             self.device.destroy_buffer(buffer, None);
-            panic!("No memory type satisfies the buffer requirements");
-        });
+            return Err(vk::Result::ERROR_FEATURE_NOT_PRESENT);
+        };
 
         let allocate_info = vk::MemoryAllocateInfo::builder()
             .allocation_size(requirements.size)
             .memory_type_index(memory_type_index);
-        let memory = self
-            .device
-            .allocate_memory(&allocate_info, None)
-            .unwrap_or_else(|error| {
-                self.device.destroy_buffer(buffer, None);
-                panic!("Failed to allocate buffer memory: {:?}", error);
-            });
+        let memory = self.device.allocate_memory(&allocate_info, None).map_err(|error| {
+            self.device.destroy_buffer(buffer, None);
+            error
+        })?;
         if let Err(error) = self.device.bind_buffer_memory(buffer, memory, 0) {
             self.device.destroy_buffer(buffer, None);
             self.device.free_memory(memory, None);
-            panic!("Failed to bind buffer memory: {:?}", error);
+            return Err(error);
         }
 
-        (buffer, memory)
+        Ok((buffer, memory))
     }
 
     pub(crate) fn create_mapped_buffer(
@@ -257,26 +360,32 @@ impl VulkanContext {
         size: vk::DeviceSize,
         usage: vk::BufferUsageFlags,
     ) -> (vk::Buffer, vk::DeviceMemory, *mut u8) {
+        self.try_create_mapped_buffer(size, usage).expect("Failed to map a Vulkan buffer")
+    }
+
+    pub(super) fn try_create_mapped_buffer(
+        &mut self,
+        size: vk::DeviceSize,
+        usage: vk::BufferUsageFlags,
+    ) -> Result<(vk::Buffer, vk::DeviceMemory, *mut u8), vk::Result> {
         unsafe {
-            let (buffer, memory) = self.create_buffer(
+            let (buffer, memory) = self.try_create_buffer(
                 size,
                 usage,
                 vk::MemoryPropertyFlags::HOST_VISIBLE | vk::MemoryPropertyFlags::HOST_COHERENT,
-            );
-            let mapped = self
-                .device
-                .map_memory(memory, 0, size, vk::MemoryMapFlags::empty())
-                .unwrap_or_else(|error| {
+            )?;
+            let mapped = self.device.map_memory(memory, 0, size, vk::MemoryMapFlags::empty())
+                .map_err(|error| {
                     self.device.destroy_buffer(buffer, None);
                     self.device.free_memory(memory, None);
-                    panic!("Failed to map buffer memory: {:?}", error);
-                }) as *mut u8;
-            (buffer, memory, mapped)
+                    error
+                })? as *mut u8;
+            Ok((buffer, memory, mapped))
         }
     }
 
     /// Allocate an image and bind memory of the requested properties to it.
-    pub(crate) unsafe fn create_image(
+    unsafe fn try_create_image(
         &mut self,
         width: u32,
         height: u32,
@@ -284,7 +393,7 @@ impl VulkanContext {
         usage: vk::ImageUsageFlags,
         mip_levels: u32,
         samples: vk::SampleCountFlags,
-    ) -> (vk::Image, vk::DeviceMemory) {
+    ) -> Result<(vk::Image, vk::DeviceMemory), vk::Result> {
         let create_info = vk::ImageCreateInfo::builder()
             .image_type(vk::ImageType::TYPE_2D)
             .extent(vk::Extent3D {
@@ -301,39 +410,35 @@ impl VulkanContext {
             .sharing_mode(vk::SharingMode::EXCLUSIVE)
             .initial_layout(vk::ImageLayout::UNDEFINED);
 
-        let image = self
-            .device
-            .create_image(&create_info, None)
-            .expect("Failed to create the image");
+        let image = self.device.create_image(&create_info, None)?;
 
         let requirements = self.device.get_image_memory_requirements(image);
-        let memory_type_index = find_memory_type_index(
+        let Some(memory_type_index) = find_memory_type_index(
             self.memory_properties,
             requirements.memory_type_bits,
             vk::MemoryPropertyFlags::DEVICE_LOCAL,
-        )
-        .unwrap_or_else(|| {
+        ) else {
             self.device.destroy_image(image, None);
-            panic!("No memory type satisfies the image requirements");
-        });
+            return Err(vk::Result::ERROR_FEATURE_NOT_PRESENT);
+        };
 
         let allocate_info = vk::MemoryAllocateInfo::builder()
             .allocation_size(requirements.size)
             .memory_type_index(memory_type_index);
-        let memory = self
-            .device
-            .allocate_memory(&allocate_info, None)
-            .unwrap_or_else(|error| {
+        let memory = match self.device.allocate_memory(&allocate_info, None) {
+            Ok(memory) => memory,
+            Err(error) => {
                 self.device.destroy_image(image, None);
-                panic!("Failed to allocate image memory: {:?}", error);
-            });
+                return Err(error);
+            }
+        };
         if let Err(error) = self.device.bind_image_memory(image, memory, 0) {
             self.device.destroy_image(image, None);
             self.device.free_memory(memory, None);
-            panic!("Failed to bind image memory: {:?}", error);
+            return Err(error);
         }
 
-        (image, memory)
+        Ok((image, memory))
     }
 
     // -----------------------------------------------------------------
@@ -346,9 +451,15 @@ impl VulkanContext {
         fragment_source: &str,
         meta: ShaderMeta,
     ) -> Result<ShaderId, ShaderError> {
-        let (vertex, fragment, arrays) =
+        let (vertex, fragment, layout) =
             super::shader::compile_glsl_with_layout(vertex_source, fragment_source, &meta)?;
-        self.new_shader_words(&vertex, &fragment, meta, &arrays)
+        self.new_shader_words(
+            &vertex,
+            &fragment,
+            meta,
+            &layout.uniform_arrays,
+            Some(&layout.sampler_aliases),
+        )
     }
 
     pub(super) fn new_shader_spirv(
@@ -377,7 +488,7 @@ impl VulkanContext {
             .iter()
             .map(|name| (*name).to_owned())
             .collect::<HashSet<_>>();
-        self.new_shader_words(&vertex, &fragment, meta, &arrays)
+        self.new_shader_words(&vertex, &fragment, meta, &arrays, None)
     }
 
     fn new_shader_words(
@@ -386,9 +497,11 @@ impl VulkanContext {
         fragment: &[u32],
         meta: ShaderMeta,
         arrays: &HashSet<String>,
+        glsl_aliases: Option<&HashMap<String, String>>,
     ) -> Result<ShaderId, ShaderError> {
         let (uniform_offsets, uniforms_size) = std140_layout_with_arrays(&meta.uniforms, arrays);
-        let float_vertex_locations = vertex_float_locations(vertex);
+        let (float_vertex_locations, named_vertex_locations) =
+            reflect_vertex_inputs(vertex, glsl_aliases);
 
         unsafe {
             let vertex = self
@@ -487,8 +600,10 @@ impl VulkanContext {
                 pipeline_layout,
                 uniforms_size: uniforms_size as vk::DeviceSize,
                 uniform_offsets,
+                uniforms: Default::default(),
                 images: meta.images,
                 float_vertex_locations,
+                named_vertex_locations,
             };
             let index = if let Some(index) = self.free_shaders.pop() {
                 self.shaders[index] = module;
@@ -512,10 +627,12 @@ impl VulkanContext {
         shader: ShaderId,
         params: PipelineParams,
     ) -> Pipeline {
+        let shader_module = &self.shaders[shader.0];
         let inputs = vertex_inputs(
             buffer_layout,
             attributes,
-            &self.shaders[shader.0].float_vertex_locations,
+            &shader_module.float_vertex_locations,
+            shader_module.named_vertex_locations.as_ref(),
         );
 
         let module = PipelineModule {
@@ -835,6 +952,8 @@ impl VulkanContext {
                     }
                 }),
                 widen,
+                initial_data: data.is_some(),
+                stream: StreamData::default(),
             };
             let index = if let Some(index) = self.free_buffers.pop() {
                 self.buffers[index] = module;
@@ -883,37 +1002,70 @@ impl VulkanContext {
             size <= logical_size,
             "Buffer update is larger than the buffer"
         );
-        let (buffer, offset) = if module.widen {
+        if size == 0 {
+            return;
+        }
+        if module.widen {
             let wide = widen_indices(data, size);
-            self.append_stream(wide.as_ptr(), wide.len())
+            self.update_stream_data(index, wide.as_ptr(), wide.len());
         } else {
-            self.append_stream(data, size)
-        };
-        let module = &mut self.buffers[index];
-        module.current_buffer = buffer;
-        module.current_offset = offset;
+            self.update_stream_data(index, data, size);
+        }
     }
 
-    pub(crate) fn append_stream(
-        &mut self,
-        data: *const u8,
-        size: usize,
-    ) -> (vk::Buffer, vk::DeviceSize) {
-        if size == 0 {
-            return (self.stream_arenas[self.current_frame].buffer, 0);
-        }
-        unsafe {
-            let slot = self.current_frame;
-            let alignment = 16;
-            let offset = (self.stream_arenas[slot].offset + alignment - 1) & !(alignment - 1);
-            if offset + size as vk::DeviceSize > self.stream_arenas[slot].capacity {
-                self.grow_stream_arena(slot, offset + size as vk::DeviceSize);
+    fn update_stream_data(&mut self, index: usize, data: *const u8, len: usize) {
+        let module = &mut self.buffers[index];
+        let size = module.size as usize;
+        if module.stream.bytes.is_empty() && module.initial_data && len < size {
+            // A partial first update must preserve the initial suffix. This
+            // allocation is host coherent and the GPU only ever reads it.
+            module.stream.bytes.resize(size, MaybeUninit::uninit());
+            unsafe {
+                let mapped = self
+                    .device
+                    .map_memory(module.memory, 0, module.size, vk::MemoryMapFlags::empty())
+                    .expect("Failed to map initial buffer data");
+                ptr::copy_nonoverlapping(
+                    mapped.cast::<MaybeUninit<u8>>().add(len),
+                    module.stream.bytes.as_mut_ptr().add(len),
+                    size - len,
+                );
+                self.device.unmap_memory(module.memory);
             }
-            let arena = &mut self.stream_arenas[slot];
-            ptr::copy_nonoverlapping(data, arena.mapped.add(offset as usize), size);
-            arena.offset = offset + size as vk::DeviceSize;
-            (arena.buffer, offset)
         }
+        let bytes = unsafe { std::slice::from_raw_parts(data.cast::<MaybeUninit<u8>>(), len) };
+        module.stream.update_prefix(bytes);
+    }
+
+    pub(super) fn stage_buffer_for_draw(&mut self, index: usize) {
+        // Updates may arrive in input/resize callbacks before a slot is ready.
+        // Draws stage into their own epoch, never into another slot's storage.
+        let stream = &self.buffers[index].stream;
+        if !stream.needs_upload(self.stream_epoch) {
+            return;
+        }
+        let size = stream.bytes.len();
+        let (buffer, offset, dst) = self.reserve_stream_slice(size);
+        let module = &mut self.buffers[index];
+        unsafe { ptr::copy_nonoverlapping(module.stream.bytes.as_ptr(), dst.cast(), size) };
+        module.current_buffer = buffer;
+        module.current_offset = offset;
+        module.stream.uploaded_epoch = Some(self.stream_epoch);
+    }
+
+    fn reserve_stream_slice(&mut self, size: usize) -> (vk::Buffer, vk::DeviceSize, *mut u8) {
+        let slot = self.current_frame;
+        let alignment = 16;
+        let offset = (self.stream_arenas[slot].offset + alignment - 1) & !(alignment - 1);
+        let end = offset + size as vk::DeviceSize;
+        if end > self.stream_arenas[slot].capacity {
+            self.grow_stream_arena(slot, end);
+        }
+        let arena = &mut self.stream_arenas[slot];
+        arena.offset = end;
+        (arena.buffer, offset, unsafe {
+            arena.mapped.add(offset as usize)
+        })
     }
 
     fn grow_stream_arena(&mut self, slot: usize, required: vk::DeviceSize) {
@@ -939,27 +1091,61 @@ impl VulkanContext {
         }
     }
 
+    /// Synchronously delete a buffer when using the raw Vulkan context. The
+    /// rendering trait uses the managed frame fences instead.
     pub fn delete_buffer(&mut self, index: usize) {
-        self.synchronize_resources();
-        unsafe {
-            if self.buffers[index].buffer == vk::Buffer::null() {
-                return;
-            }
-            self.device.destroy_buffer(self.buffers[index].buffer, None);
-            self.device.free_memory(self.buffers[index].memory, None);
-            self.buffers[index].buffer = vk::Buffer::null();
-            self.buffers[index].memory = vk::DeviceMemory::null();
-            self.buffers[index].current_buffer = vk::Buffer::null();
-            self.free_buffers.push(index);
-            if self.cur_index_buffer == Some(index) {
-                self.cur_index_buffer = None;
-            }
-            for slot in &mut self.cur_vertex_buffers {
-                if *slot == Some(index) {
-                    *slot = None;
-                }
+        if let Some((buffer, memory)) = self.remove_buffer(index) {
+            self.synchronize_resources();
+            unsafe {
+                self.device.destroy_buffer(buffer, None);
+                self.device.free_memory(memory, None);
             }
         }
+    }
+
+    pub(super) fn retire_buffer(&mut self, index: usize) {
+        let Some((buffer, memory)) = self.remove_buffer(index) else {
+            return;
+        };
+        // A draw has already captured the raw VkBuffer, so its logical ID can
+        // be reused now. After commit use the slot handed to the worker, not
+        // the next (possibly already signaled) slot the CPU will record into.
+        let slot = if self.frame_active {
+            Some(self.current_frame)
+        } else {
+            self.last_submitted_slot
+        };
+        if let Some(slot) = slot {
+            self.retired_buffers[slot].push((buffer, memory));
+        } else {
+            unsafe {
+                self.device.destroy_buffer(buffer, None);
+                self.device.free_memory(memory, None);
+            }
+        }
+    }
+
+    fn remove_buffer(&mut self, index: usize) -> Option<(vk::Buffer, vk::DeviceMemory)> {
+        let module = &mut self.buffers[index];
+        if module.buffer == vk::Buffer::null() {
+            return None;
+        }
+        // Only the base allocation belongs to the buffer. Its most recent
+        // draw may instead point into the frame's stream arena.
+        let buffer = std::mem::take(&mut module.buffer);
+        let memory = std::mem::take(&mut module.memory);
+        module.current_buffer = vk::Buffer::null();
+        module.stream = StreamData::default();
+        self.free_buffers.push(index);
+        if self.cur_index_buffer == Some(index) {
+            self.cur_index_buffer = None;
+        }
+        for slot in &mut self.cur_vertex_buffers {
+            if *slot == Some(index) {
+                *slot = None;
+            }
+        }
+        Some((buffer, memory))
     }
 
     // -----------------------------------------------------------------
@@ -973,16 +1159,119 @@ impl VulkanContext {
         access: TextureAccess,
     ) -> usize {
         Self::validate_texture_extent(self.texture_size_limit, params);
-        self.new_texture_with_wrap_y(bytes, params, access, params.wrap)
+        self.allocate_texture(bytes, params, access, params.wrap)
     }
 
-    fn new_texture_with_wrap_y(
+    /// Allocate optional render storage without recording an initial transition.
+    /// The first clear transitions the image out of UNDEFINED in the frame.
+    pub(super) fn try_new_rgba8_render_texture(
+        &mut self,
+        width: u32,
+        height: u32,
+    ) -> Option<(usize, TextureParams)> {
+        if !self.texture_size_limit.contains(width, height) {
+            return None;
+        }
+        let params = TextureParams {
+            kind: TextureKind::Texture2D,
+            format: TextureFormat::RGBA8,
+            wrap: TextureWrap::Clamp,
+            min_filter: FilterMode::Linear,
+            mag_filter: FilterMode::Linear,
+            mipmap_filter: MipmapFilterMode::None,
+            width,
+            height,
+            allocate_mipmaps: false,
+            sample_count: 1,
+        };
+        let format = vk_texture_format(params.format, TextureAccess::RenderTarget);
+        let usage = vk::ImageUsageFlags::SAMPLED
+            | vk::ImageUsageFlags::COLOR_ATTACHMENT
+            | vk::ImageUsageFlags::TRANSFER_DST
+            | vk::ImageUsageFlags::TRANSFER_SRC;
+        // Optimal RGBA8 is required to support this combination of sampling,
+        // linear filtering, color attachment, and transfers at one sample.
+        unsafe {
+            let limits = self
+                .instance
+                .get_physical_device_properties(self.physical_device)
+                .limits;
+            if width > limits.max_framebuffer_width || height > limits.max_framebuffer_height {
+                return None;
+            }
+            let samples = vk::SampleCountFlags::TYPE_1;
+            let (image, memory) = self
+                .try_create_image(width, height, format, usage, 1, samples)
+                .ok()?;
+            let mut allocation = ResourceAllocation::new(&self.device, image, memory);
+            let view = self
+                .try_create_image_view(image, format, false, 1, None)
+                .ok()?;
+            allocation.views.push(view);
+            let sampler = try_create_sampler_with_params(
+                &self.device,
+                params.min_filter,
+                params.mag_filter,
+                params.wrap,
+                params.wrap,
+                params.mipmap_filter,
+            )
+            .ok()?;
+            allocation.sampler = sampler;
+
+            let index = self.insert_texture(TextureModule {
+                image,
+                view,
+                sample_view: None,
+                sampler,
+                memory,
+                width,
+                height,
+                format,
+                source_format: params.format,
+                usage,
+                layout: vk::ImageLayout::UNDEFINED,
+                mip_levels: 1,
+                filter: params.min_filter,
+                mag_filter: params.mag_filter,
+                wrap: params.wrap,
+                wrap_y: params.wrap,
+                mipmap_filter: params.mipmap_filter,
+                access: TextureAccess::RenderTarget,
+            });
+            allocation.commit();
+            Some((index, params))
+        }
+    }
+
+    pub(super) fn initialize_dummy_texture(&mut self) -> Result<(), vk::Result> {
+        self.dummy_texture = self.try_allocate_texture(
+            Some(&[0, 0, 0, 255]),
+            TextureParams { width: 1, height: 1, ..Default::default() },
+            TextureAccess::Static,
+            TextureWrap::Clamp,
+        )?;
+        Ok(())
+    }
+
+    fn allocate_texture(
         &mut self,
         bytes: Option<&[u8]>,
         params: TextureParams,
         access: TextureAccess,
         wrap_y: TextureWrap,
     ) -> usize {
+        self.try_allocate_texture(bytes, params, access, wrap_y)
+            .expect("Failed to allocate and initialize a Vulkan texture")
+    }
+
+    fn try_allocate_texture(
+        &mut self,
+        bytes: Option<&[u8]>,
+        params: TextureParams,
+        access: TextureAccess,
+        wrap_y: TextureWrap,
+    ) -> Result<usize, vk::Result> {
         let bytes = bytes.map(|bytes| {
             let len = params
                 .format
@@ -993,7 +1282,6 @@ impl VulkanContext {
             let format = vk_texture_format(params.format, access);
             let depth =
                 params.format == TextureFormat::Depth || params.format == TextureFormat::Depth32;
-            let opaque = params.format == TextureFormat::RGB8;
 
             let mip_levels = mip_level_count(
                 params.width,
@@ -1022,45 +1310,49 @@ impl VulkanContext {
                 usage
             };
 
-            let (image, memory) = self.create_image(
+            let (image, memory) = self.try_create_image(
                 params.width,
                 params.height,
                 format,
                 usage,
                 mip_levels,
                 vk::SampleCountFlags::TYPE_1,
-            );
+            )?;
             let mut allocation = ResourceAllocation::new(&self.device, image, memory);
             let attachment_levels = if access == TextureAccess::RenderTarget {
                 1
             } else {
                 mip_levels
             };
-            let view = self.create_image_view(
+            // Attachment views must use an identity component mapping. The
+            // sample view of RGB and Alpha textures may need a different one.
+            let separate_sample_view = params.format == TextureFormat::RGB8
+                || (params.format == TextureFormat::Alpha && access == TextureAccess::RenderTarget)
+                || mip_levels != attachment_levels;
+            let view = self.try_create_image_view(
                 image,
                 format,
                 depth,
                 attachment_levels,
-                params.format,
-                false,
-            );
+                (!separate_sample_view).then_some(params.format),
+            )?;
             allocation.views.push(view);
-            let sample_view = if opaque || mip_levels != attachment_levels {
+            let sample_view = if separate_sample_view {
                 let view =
-                    self.create_image_view(image, format, depth, mip_levels, params.format, opaque);
+                    self.try_create_image_view(image, format, depth, mip_levels, Some(params.format))?;
                 allocation.views.push(view);
                 Some(view)
             } else {
                 None
             };
-            let sampler = create_sampler_with_params(
+            let sampler = try_create_sampler_with_params(
                 &self.device,
                 params.min_filter,
                 params.mag_filter,
                 params.wrap,
                 wrap_y,
                 params.mipmap_filter,
-            );
+            )?;
             allocation.sampler = sampler;
 
             let module = TextureModule {
@@ -1086,9 +1378,9 @@ impl VulkanContext {
             let index = self.insert_texture(module);
             allocation.commit();
 
-            match bytes {
-                Some(bytes) => {
-                    self.upload_texture(
+            let initialized = (|| {
+                if let Some(bytes) = bytes {
+                    self.try_upload_texture(
                         index,
                         TextureUpdateRegion {
                             x: 0,
@@ -1097,67 +1389,47 @@ impl VulkanContext {
                             height: params.height as i32,
                             bytes,
                         },
-                    );
-                    if access == TextureAccess::RenderTarget && !depth {
-                        let from = self.textures[index].layout;
-                        self.transition_texture(
-                            index,
-                            from,
-                            vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL,
-                        );
-                    }
+                    )?;
                 }
-                None if depth => self.transition_texture(
-                    index,
-                    vk::ImageLayout::UNDEFINED,
-                    vk::ImageLayout::DEPTH_STENCIL_ATTACHMENT_OPTIMAL,
-                ),
-                None => self.transition_texture(
-                    index,
-                    vk::ImageLayout::UNDEFINED,
-                    if access == TextureAccess::RenderTarget {
-                        vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL
-                    } else {
-                        vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL
-                    },
-                ),
+                let layout = if depth {
+                    vk::ImageLayout::DEPTH_STENCIL_ATTACHMENT_OPTIMAL
+                } else if access == TextureAccess::RenderTarget {
+                    vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL
+                } else {
+                    vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL
+                };
+                self.transition_texture(index, layout)
+            })();
+            if let Err(error) = initialized {
+                self.destroy_texture(index);
+                self.textures[index] = empty_texture_module();
+                self.free_textures.push(index);
+                return Err(error);
             }
-
-            index
+            Ok(index)
         }
     }
 
-    pub(crate) unsafe fn create_image_view(
+    unsafe fn try_create_image_view(
         &self,
         image: vk::Image,
         format: vk::Format,
         depth: bool,
         mip_levels: u32,
-        texture_format: TextureFormat,
-        opaque: bool,
-    ) -> vk::ImageView {
-        let components = if opaque {
-            vk::ComponentMapping {
-                r: vk::ComponentSwizzle::R,
-                g: vk::ComponentSwizzle::G,
-                b: vk::ComponentSwizzle::B,
+        sampled_format: Option<TextureFormat>,
+    ) -> Result<vk::ImageView, vk::Result> {
+        let components = match sampled_format {
+            Some(TextureFormat::RGB8) => vk::ComponentMapping {
                 a: vk::ComponentSwizzle::ONE,
-            }
-        } else {
-            match texture_format {
-                TextureFormat::Alpha => vk::ComponentMapping {
-                    r: vk::ComponentSwizzle::ZERO,
-                    g: vk::ComponentSwizzle::ZERO,
-                    b: vk::ComponentSwizzle::ZERO,
-                    a: vk::ComponentSwizzle::R,
-                },
-                _ => vk::ComponentMapping {
-                    r: vk::ComponentSwizzle::R,
-                    g: vk::ComponentSwizzle::G,
-                    b: vk::ComponentSwizzle::B,
-                    a: vk::ComponentSwizzle::A,
-                },
-            }
+                ..Default::default()
+            },
+            Some(TextureFormat::Alpha) => vk::ComponentMapping {
+                r: vk::ComponentSwizzle::ZERO,
+                g: vk::ComponentSwizzle::ZERO,
+                b: vk::ComponentSwizzle::ZERO,
+                a: vk::ComponentSwizzle::R,
+            },
+            _ => vk::ComponentMapping::default(),
         };
         let create_view_info = vk::ImageViewCreateInfo {
             image,
@@ -1177,9 +1449,7 @@ impl VulkanContext {
             },
             ..Default::default()
         };
-        self.device
-            .create_image_view(&create_view_info, None)
-            .expect("Failed to create the image view")
+        self.device.create_image_view(&create_view_info, None)
     }
 
     pub fn set_texture_filter(&mut self, index: usize, filter: FilterMode) {
@@ -1229,21 +1499,13 @@ impl VulkanContext {
         self.synchronize_resources();
         let fresh = if params.sample_count > 1 {
             assert!(bytes.is_none(), "Multisampled textures cannot be uploaded");
-            self.create_attachment_texture(
+            self.allocate_attachment_texture(
                 params,
                 vk::SampleCountFlags::from_raw(params.sample_count as u32),
             )
         } else {
-            self.new_texture_with_wrap_y(bytes, params, self.textures[index].access, wrap_y)
+            self.allocate_texture(bytes, params, self.textures[index].access, wrap_y)
         };
-        let previous = &self.textures[index];
-        let replacement = &self.textures[fresh];
-        for image in self.pending.images.iter_mut().flatten() {
-            if image.image_view == previous.view || Some(image.image_view) == previous.sample_view {
-                image.image_view = replacement.sample_view.unwrap_or(replacement.view);
-                image.sampler = replacement.sampler;
-            }
-        }
         self.destroy_texture(index);
         let module = std::mem::replace(&mut self.textures[fresh], empty_texture_module());
         self.textures[index] = module;
@@ -1339,13 +1601,9 @@ impl VulkanContext {
             return;
         }
         self.synchronize_resources();
-        self.pending.sampled.retain(|texture| *texture != index);
-        let module = &self.textures[index];
-        for image in &mut self.pending.images {
-            if image.as_ref().is_some_and(|image| {
-                image.image_view == module.view || Some(image.image_view) == module.sample_view
-            }) {
-                *image = None;
+        for bound in &mut self.bound_textures {
+            if *bound == Some(index) {
+                *bound = None;
             }
         }
         self.destroy_texture(index);
@@ -1627,7 +1885,7 @@ impl VulkanContext {
                 )
                 .expect("Failed to submit the readback command buffer");
             self.device
-                .wait_for_fences(&[self.readback_fence], true, std::u64::MAX)
+                .wait_for_fences(&[self.readback_fence], true, u64::MAX)
                 .expect("Failed to wait for the readback fence");
             self.release_frame_resources();
 
@@ -1642,21 +1900,32 @@ impl VulkanContext {
         }
     }
 
-    fn transition_texture(&mut self, index: usize, from: vk::ImageLayout, to: vk::ImageLayout) {
+    fn transition_texture(&mut self, index: usize, to: vk::ImageLayout) -> Result<(), vk::Result> {
+        let texture = &self.textures[index];
+        let from = texture.layout;
         if from == to {
-            return;
+            return Ok(());
         }
-        let image = self.textures[index].image;
-        let aspect_mask = if is_depth_format(self.textures[index].format) {
+        let image = texture.image;
+        let aspect = if is_depth_format(texture.format) {
             vk::ImageAspectFlags::DEPTH
         } else {
             vk::ImageAspectFlags::COLOR
         };
-        self.record_submit(|ctx, cmd| ctx.barrier(cmd, image, aspect_mask, from, to));
+        self.try_record_submit(|ctx, cmd| ctx.barrier(cmd, image, aspect, from, to))?;
         self.textures[index].layout = to;
+        Ok(())
     }
 
     fn upload_texture(&mut self, index: usize, region: TextureUpdateRegion<'_>) {
+        self.try_upload_texture(index, region).expect("Failed to upload Vulkan texture");
+    }
+
+    fn try_upload_texture(
+        &mut self,
+        index: usize,
+        region: TextureUpdateRegion<'_>,
+    ) -> Result<(), vk::Result> {
         let TextureUpdateRegion {
             x,
             y,
@@ -1686,7 +1955,7 @@ impl VulkanContext {
             bytes.len(),
             &[region],
             std::iter::once(bytes),
-        );
+        )
     }
 
     fn upload_rgba8_regions(&mut self, index: usize, regions: &[TextureUpdateRegion<'_>]) {
@@ -1730,7 +1999,7 @@ impl VulkanContext {
                 size as usize,
                 &copies,
                 regions.iter().map(|r| r.bytes),
-            );
+            ).expect("Failed to upload Vulkan texture regions");
         }
     }
 
@@ -1743,7 +2012,6 @@ impl VulkanContext {
         if !self.frame_active
             || !self.recording
             || self.frame_submitted
-            || self.pass_open
             || self.offscreen
             || texture.access != TextureAccess::Static
             || texture.mip_levels != 1
@@ -1784,8 +2052,9 @@ impl VulkanContext {
         staging: vk::Buffer,
         copies: Vec<vk::BufferImageCopy>,
     ) {
+        self.suspend_pass();
         let image = self.textures[index].image;
-        let command = self.command_buffers[self.acquired_image.unwrap()];
+        let command = self.frame_command_buffer();
         let aspect = vk::ImageAspectFlags::COLOR;
         let shader_read = vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL;
         let transfer_dst = vk::ImageLayout::TRANSFER_DST_OPTIMAL;
@@ -1822,38 +2091,27 @@ impl VulkanContext {
         size: usize,
         copies: &[vk::BufferImageCopy],
         sources: impl ExactSizeIterator<Item = &'a [u8]>,
-    ) {
-        debug_assert_eq!(copies.len(), sources.len());
-        let image = self.textures[index].image;
-        let from_layout = self.textures[index].layout;
+    ) -> Result<(), vk::Result> {
+        let texture = &self.textures[index];
+        let image = texture.image;
+        let from_layout = texture.layout;
         let final_layout = if aspect == vk::ImageAspectFlags::DEPTH {
             vk::ImageLayout::DEPTH_STENCIL_ATTACHMENT_OPTIMAL
         } else {
             vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL
         };
         unsafe {
-            let (staging, memory) = self.create_buffer(
+            let (staging, memory, mapped) = self.try_create_mapped_buffer(
                 size as vk::DeviceSize,
                 vk::BufferUsageFlags::TRANSFER_SRC,
-                vk::MemoryPropertyFlags::HOST_VISIBLE | vk::MemoryPropertyFlags::HOST_COHERENT,
-            );
+            )?;
             let allocation = ResourceAllocation::buffer(&self.device, staging, memory);
-            let mapped = self
-                .device
-                .map_memory(
-                    memory,
-                    0,
-                    size as vk::DeviceSize,
-                    vk::MemoryMapFlags::empty(),
-                )
-                .expect("Failed to map the staging buffer")
-                .cast::<u8>();
             for (copy, bytes) in copies.iter().zip(sources) {
                 let offset = copy.buffer_offset as usize;
                 ptr::copy_nonoverlapping(bytes.as_ptr(), mapped.add(offset), bytes.len());
             }
             self.device.unmap_memory(memory);
-            self.record_submit(|ctx, cmd| {
+            self.try_record_submit(|ctx, cmd| {
                 ctx.barrier(
                     cmd,
                     image,
@@ -1875,10 +2133,11 @@ impl VulkanContext {
                     vk::ImageLayout::TRANSFER_DST_OPTIMAL,
                     final_layout,
                 );
-            });
+            })?;
             drop(allocation);
         }
         self.textures[index].layout = final_layout;
+        Ok(())
     }
 
     /// Record an image layout transition into `cmd`.
@@ -1952,12 +2211,11 @@ impl VulkanContext {
     }
 
     pub fn delete_render_pass(&mut self, index: usize) {
-        self.synchronize_resources();
+        // Dynamic rendering records attachment handles, not this pass ID.
+        // End the matching pass so it cannot be reopened with a recycled ID.
+        self.end_render_pass_if_target(Some(RenderPass(index)));
         if self.passes[index].take().is_some() {
             self.free_passes.push(index);
-        }
-        if self.cur_target == Some(index) {
-            self.cur_target = None;
         }
     }
 
@@ -1974,20 +2232,39 @@ impl VulkanContext {
         samples: vk::SampleCountFlags,
     ) -> usize {
         Self::validate_texture_extent(self.texture_size_limit, params);
-        self.create_attachment_texture(params, samples)
+        self.allocate_attachment_texture(params, samples)
     }
 
-    pub(super) fn new_swapchain_depth_texture(&mut self, params: TextureParams) -> usize {
-        // The default pass follows the window size, not the application's texture cap.
-        Self::validate_texture_extent(self.device_texture_size_limit, params);
-        self.create_attachment_texture(params, vk::SampleCountFlags::TYPE_1)
+    pub(super) fn try_new_swapchain_depth_texture(&mut self) -> Result<usize, vk::Result> {
+        // Window depth follows the swapchain extent, not the managed texture
+        // cap. It only needs attachment usage, not sampling or transfer.
+        let vk::Extent2D { width, height } = self.swapchain_extent;
+        let params = TextureParams {
+            width,
+            height,
+            format: TextureFormat::Depth,
+            ..Default::default()
+        };
+        if !self.device_texture_size_limit.contains(width, height) {
+            return Err(vk::Result::ERROR_FORMAT_NOT_SUPPORTED);
+        }
+        self.try_allocate_attachment_texture(params, vk::SampleCountFlags::TYPE_1)
     }
 
-    fn create_attachment_texture(
+    fn allocate_attachment_texture(
         &mut self,
         params: TextureParams,
         samples: vk::SampleCountFlags,
     ) -> usize {
+        self.try_allocate_attachment_texture(params, samples)
+            .expect("Failed to allocate a Vulkan render attachment")
+    }
+
+    fn try_allocate_attachment_texture(
+        &mut self,
+        params: TextureParams,
+        samples: vk::SampleCountFlags,
+    ) -> Result<usize, vk::Result> {
         unsafe {
             let format = vk_texture_format(params.format, TextureAccess::RenderTarget);
             let depth = is_depth_format(format);
@@ -1997,9 +2274,9 @@ impl VulkanContext {
                 vk::ImageUsageFlags::COLOR_ATTACHMENT
             };
             let (image, memory) =
-                self.create_image(params.width, params.height, format, usage, 1, samples);
+                self.try_create_image(params.width, params.height, format, usage, 1, samples)?;
             let mut allocation = ResourceAllocation::new(&self.device, image, memory);
-            let view = self.create_image_view(image, format, depth, 1, params.format, false);
+            let view = self.try_create_image_view(image, format, depth, 1, None)?;
             allocation.views.push(view);
 
             let module = TextureModule {
@@ -2024,16 +2301,8 @@ impl VulkanContext {
             };
             let index = self.insert_texture(module);
             allocation.commit();
-            self.transition_texture(
-                index,
-                vk::ImageLayout::UNDEFINED,
-                if depth {
-                    vk::ImageLayout::DEPTH_STENCIL_ATTACHMENT_OPTIMAL
-                } else {
-                    vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL
-                },
-            );
-            index
+            // The producing pass performs the first layout transition.
+            Ok(index)
         }
     }
 
@@ -2043,12 +2312,13 @@ impl VulkanContext {
             TextureKind::Texture2D,
             "Vulkan currently supports 2D textures"
         );
-        if !limit.contains(params.width, params.height) {
-            panic!(
-                "Vulkan texture dimensions {}x{} must be in 1..={}",
-                params.width, params.height, limit.max()
-            );
-        }
+        assert!(
+            limit.contains(params.width, params.height),
+            "texture dimensions {}x{} are outside the Vulkan texture size limit of {}",
+            params.width,
+            params.height,
+            limit.max(),
+        );
     }
 
     pub(crate) fn texture_sample_count(
@@ -2059,8 +2329,27 @@ impl VulkanContext {
         if samples <= 1 {
             return vk::SampleCountFlags::TYPE_1;
         }
+        vk_sample_count_flags(samples, self.attachment_sample_counts(format))
+    }
+
+    pub(super) fn render_target_sample_count(
+        &self,
+        color: TextureFormat,
+        depth: Option<TextureFormat>,
+        requested: i32,
+    ) -> i32 {
+        if requested <= 1 {
+            return 1;
+        }
+        let color_counts = self.attachment_sample_counts(color);
+        let depth_counts = depth.map(|format| self.attachment_sample_counts(format));
+        compatible_sample_count(requested, color_counts, depth_counts)
+    }
+
+    fn attachment_sample_counts(&self, format: TextureFormat) -> vk::SampleCountFlags {
         let format = vk_texture_format(format, TextureAccess::RenderTarget);
-        let usage = if is_depth_format(format) {
+        let depth = is_depth_format(format);
+        let usage = if depth {
             vk::ImageUsageFlags::DEPTH_STENCIL_ATTACHMENT
         } else {
             vk::ImageUsageFlags::COLOR_ATTACHMENT
@@ -2076,36 +2365,55 @@ impl VulkanContext {
             )
         }
         .expect("Texture format does not support render attachments");
-        let limits = unsafe {
-            self.instance
-                .get_physical_device_properties(self.physical_device)
-        }
-        .limits;
-        vk_sample_count_flags(
-            samples,
-            properties.sample_counts
-                & limits.framebuffer_color_sample_counts
-                & limits.framebuffer_depth_sample_counts,
-        )
+        let framebuffer_counts = if depth {
+            unsafe {
+                self.instance
+                    .get_physical_device_properties(self.physical_device)
+                    .limits
+                    .framebuffer_depth_sample_counts
+            }
+        } else {
+            self.color_sample_counts
+        };
+        properties.sample_counts & framebuffer_counts
+    }
+
+    pub(super) fn texture_has_color_attachment_usage(&self, index: usize) -> bool {
+        self.textures.get(index).is_some_and(|texture| {
+            texture
+                .usage
+                .contains(vk::ImageUsageFlags::COLOR_ATTACHMENT)
+        })
     }
 
     /// Copy `src` into `dst`, scaling when the sizes differ.
+    /// The source texture must already contain data.
     pub fn copy_texture(&mut self, src: usize, dst: usize) {
         if src == dst {
             return;
         }
-        let (src_image, src_layout, src_size) = {
-            let module = &self.textures[src];
-            (module.image, module.layout, (module.width, module.height))
-        };
-        let (dst_image, dst_layout, dst_size) = {
-            let module = &self.textures[dst];
-            (module.image, module.layout, (module.width, module.height))
-        };
-        let depth = is_depth_format(self.textures[src].format);
-        if depth || is_depth_format(self.textures[dst].format) {
+        let source = &self.textures[src];
+        let destination = &self.textures[dst];
+        assert!(
+            source.usage.contains(vk::ImageUsageFlags::TRANSFER_SRC),
+            "Source texture does not support transfer reads"
+        );
+        assert!(
+            destination
+                .usage
+                .contains(vk::ImageUsageFlags::TRANSFER_DST),
+            "Destination texture does not support transfer writes"
+        );
+        let src_layout = source.layout;
+        assert_ne!(
+            src_layout,
+            vk::ImageLayout::UNDEFINED,
+            "Cannot copy from an uninitialized texture"
+        );
+        let depth = is_depth_format(source.format);
+        if depth || is_depth_format(destination.format) {
             assert_eq!(
-                self.textures[src].format, self.textures[dst].format,
+                source.format, destination.format,
                 "Depth copies require matching texture formats"
             );
         }
@@ -2114,6 +2422,12 @@ impl VulkanContext {
         } else {
             vk::ImageAspectFlags::COLOR
         };
+        let src_image = source.image;
+        let src_size = (source.width, source.height);
+        let dst_image = destination.image;
+        let dst_size = (destination.width, destination.height);
+        let dst_layout = destination.layout;
+        let dst_final_layout = transfer_destination_layout(dst_layout, aspect_mask);
         let subresource = vk::ImageSubresourceLayers {
             aspect_mask,
             mip_level: 0,
@@ -2182,15 +2496,32 @@ impl VulkanContext {
                 dst_image,
                 aspect_mask,
                 vk::ImageLayout::TRANSFER_DST_OPTIMAL,
-                dst_layout,
+                dst_final_layout,
             );
         });
+        self.textures[dst].layout = dst_final_layout;
     }
 }
 
 // ---------------------------------------------------------------------
 // Shaders and layouts
 // ---------------------------------------------------------------------
+
+/// Keep a transfer destination's layout when it already has one. The lazily
+/// allocated render textures start UNDEFINED, which is only an old layout:
+/// preserve their newly written contents in the appropriate attachment layout.
+pub(super) fn transfer_destination_layout(
+    layout: vk::ImageLayout,
+    aspect: vk::ImageAspectFlags,
+) -> vk::ImageLayout {
+    if layout != vk::ImageLayout::UNDEFINED {
+        layout
+    } else if aspect.contains(vk::ImageAspectFlags::COLOR) {
+        vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL
+    } else {
+        vk::ImageLayout::DEPTH_STENCIL_ATTACHMENT_OPTIMAL
+    }
+}
 
 pub(super) fn image_barrier(
     image: vk::Image,
@@ -2401,6 +2732,15 @@ pub fn vk_sampler_wrap(wrap: TextureWrap) -> vk::SamplerAddressMode {
     }
 }
 
+fn compatible_sample_count(
+    requested: i32,
+    color: vk::SampleCountFlags,
+    depth: Option<vk::SampleCountFlags>,
+) -> i32 {
+    let shared = depth.map_or(color, |depth| color & depth);
+    vk_sample_count_flags(requested.max(1) as u32, shared).as_raw() as i32
+}
+
 /// Largest colour-attachment sample count the device supports that does not
 /// exceed `samples`. Falls back to `TYPE_1` when nothing above 1 is available,
 /// which is the contract `RenderPass::samples` documents.
@@ -2597,6 +2937,25 @@ fn create_sampler_with_params(
     wrap_y: TextureWrap,
     mipmap_filter: MipmapFilterMode,
 ) -> vk::Sampler {
+    try_create_sampler_with_params(
+        device,
+        min_filter,
+        mag_filter,
+        wrap_x,
+        wrap_y,
+        mipmap_filter,
+    )
+    .expect("Failed to create the sampler")
+}
+
+fn try_create_sampler_with_params(
+    device: &Device,
+    min_filter: FilterMode,
+    mag_filter: FilterMode,
+    wrap_x: TextureWrap,
+    wrap_y: TextureWrap,
+    mipmap_filter: MipmapFilterMode,
+) -> Result<vk::Sampler, vk::Result> {
     unsafe {
         let (mipmap_mode, max_lod) = match mipmap_filter {
             MipmapFilterMode::None => (vk::SamplerMipmapMode::NEAREST, 0.0),
@@ -2621,9 +2980,7 @@ fn create_sampler_with_params(
             unnormalized_coordinates: 0,
             ..Default::default()
         };
-        device
-            .create_sampler(&create_info, None)
-            .expect("Failed to create the sampler")
+        device.create_sampler(&create_info, None)
     }
 }
 
@@ -2649,7 +3006,21 @@ pub fn mip_level_count(width: u32, height: u32, mipmap_filter: MipmapFilterMode)
 /// Reflect the float inputs from the compiled shader, including every matrix
 /// column. Legacy GLSL receives unnormalized integer vertex attributes as
 /// floats, while native Vulkan shaders can explicitly request integer inputs.
-fn vertex_float_locations(words: &[u32]) -> BTreeSet<u32> {
+fn reflect_vertex_inputs(
+    words: &[u32],
+    glsl_aliases: Option<&HashMap<String, String>>,
+) -> (BTreeSet<u32>, Option<HashMap<String, u32>>) {
+    fn literal_string(words: &[u32]) -> Option<String> {
+        let mut bytes = Vec::new();
+        for byte in words.iter().flat_map(|word| word.to_le_bytes()) {
+            if byte == 0 {
+                return String::from_utf8(bytes).ok();
+            }
+            bytes.push(byte);
+        }
+        None
+    }
+
     #[derive(Clone, Copy)]
     enum InputType {
         Float,
@@ -2672,6 +3043,7 @@ fn vertex_float_locations(words: &[u32]) -> BTreeSet<u32> {
     let mut types = BTreeMap::new();
     let mut variables = BTreeMap::new();
     let mut locations = BTreeMap::new();
+    let mut names = HashMap::new();
     let mut cursor = 5;
     while let Some(&header) = words.get(cursor) {
         let count = (header >> 16) as usize;
@@ -2682,6 +3054,12 @@ fn vertex_float_locations(words: &[u32]) -> BTreeSet<u32> {
             break;
         }
         match (header & 0xffff, instruction) {
+            // OpName. Only source GLSL needs names; ignore them in assets.
+            (5, [_, id, encoded @ ..]) if glsl_aliases.is_some() => {
+                if let Some(name) = literal_string(encoded) {
+                    names.insert(*id, name);
+                }
+            }
             (22, [_, id, _]) => {
                 types.insert(*id, InputType::Float);
             }
@@ -2708,12 +3086,27 @@ fn vertex_float_locations(words: &[u32]) -> BTreeSet<u32> {
     }
 
     let mut floats = BTreeSet::new();
+    let mut named = glsl_aliases.map(|_| HashMap::new());
+    let source_names: HashMap<&str, &str> = glsl_aliases
+        .into_iter()
+        .flatten()
+        .map(|(name, alias)| (alias.as_str(), name.as_str()))
+        .collect();
     for (id, type_id) in variables {
-        if let (Some(&location), Some(width)) = (locations.get(&id), float_width(type_id, &types)) {
+        let Some(&location) = locations.get(&id) else {
+            continue; // built-in, not a user-provided vertex attribute
+        };
+        if let Some(width) = float_width(type_id, &types) {
             floats.extend(location..location + width);
         }
+        if let (Some(named), Some(name)) = (&mut named, names.remove(&id)) {
+            let name = source_names
+                .get(name.as_str())
+                .map_or(name, |name| (*name).to_owned());
+            named.insert(name, location);
+        }
     }
-    floats
+    (floats, named)
 }
 
 fn vertex_format_for_input(format: VertexFormat, float_input: bool) -> vk::Format {
@@ -2751,6 +3144,7 @@ fn vertex_inputs(
     buffer_layout: &[BufferLayout],
     attributes: &[VertexAttribute],
     float_locations: &BTreeSet<u32>,
+    named_locations: Option<&HashMap<String, u32>>,
 ) -> Vec<VertexInput> {
     #[derive(Clone, Copy, Default)]
     struct BufferCacheData {
@@ -2776,9 +3170,10 @@ fn vertex_inputs(
     }
 
     let mut inputs = Vec::with_capacity(attributes.len());
-    let mut location = 0u32;
+    let mut ordinal = 0u32;
 
     for VertexAttribute {
+        name,
         format,
         buffer_index,
         ..
@@ -2799,19 +3194,156 @@ fn vertex_inputs(
             VertexStep::PerInstance => vk::VertexInputRate::INSTANCE,
         };
 
-        for _ in 0..count {
-            inputs.push(VertexInput {
-                location,
-                binding: *buffer_index as u32,
-                format: vertex_format_for_input(format, float_locations.contains(&location)),
-                offset: entry.offset,
-                stride: entry.stride,
-                input_rate,
-            });
-            location += 1;
+        let location = match named_locations {
+            Some(locations) => locations.get(*name).copied(),
+            None => Some(ordinal),
+        };
+        for column in 0..count {
+            if let Some(location) = location.map(|location| location + column) {
+                inputs.push(VertexInput {
+                    location,
+                    binding: *buffer_index as u32,
+                    format: vertex_format_for_input(format, float_locations.contains(&location)),
+                    offset: entry.offset,
+                    stride: entry.stride,
+                    input_rate,
+                });
+            }
+            // An attribute omitted by the shader still occupies bytes in
+            // the user's vertex/instance buffer layout.
             entry.offset += format.size_bytes() as u32;
         }
+        ordinal += count;
     }
 
     inputs
+}
+
+#[cfg(test)]
+mod vertex_input_tests {
+    use super::*;
+
+    const FRAGMENT: &str = "#version 100
+        precision mediump float;
+        varying vec4 v_color;
+        void main() { gl_FragColor = v_color; }";
+
+    fn compile(
+        vertex: &str,
+        fragment: &str,
+        images: &[&str],
+    ) -> (Vec<u32>, super::super::shader::GlslLayout) {
+        let meta = ShaderMeta {
+            images: images.iter().map(|image| (*image).to_owned()).collect(),
+            uniforms: UniformBlockLayout { uniforms: vec![] },
+        };
+        let (vertex, _, layout) =
+            super::super::shader::compile_glsl_with_layout(vertex, fragment, &meta).unwrap();
+        (vertex, layout)
+    }
+
+    #[test]
+    fn glsl_attribute_order_does_not_change_vertex_memory_layout() {
+        let (words, layout) = compile(
+            "#version 100
+            attribute vec4 color0;
+            attribute vec3 position;
+            varying vec4 v_color;
+            void main() { gl_Position = vec4(position, 1.0); v_color = color0; }",
+            FRAGMENT,
+            &[],
+        );
+        let (floats, named) = reflect_vertex_inputs(&words, Some(&layout.sampler_aliases));
+        let named = named.unwrap();
+        assert_eq!(named.len(), 2);
+        let attributes = [
+            VertexAttribute::new("position", VertexFormat::Float3),
+            VertexAttribute::new("texcoord", VertexFormat::Float2),
+            VertexAttribute::new("color0", VertexFormat::Byte4),
+        ];
+        let inputs = vertex_inputs(
+            &[BufferLayout::default()],
+            &attributes,
+            &floats,
+            Some(&named),
+        );
+        assert_eq!(inputs.len(), 2);
+        assert_eq!(inputs[0].location, named["position"]);
+        assert_eq!(inputs[1].location, named["color0"]);
+        assert_eq!(inputs[1].format, vk::Format::R8G8B8A8_USCALED);
+        assert_eq!(inputs[1].offset, 20);
+        assert_eq!(inputs[1].stride, 24);
+
+        let (_, unreflected) = reflect_vertex_inputs(&words, None);
+        assert!(unreflected.is_none());
+        let ordinal = vertex_inputs(&[BufferLayout::default()], &attributes, &floats, None);
+        assert_eq!(
+            ordinal.iter().map(|i| i.location).collect::<Vec<_>>(),
+            [0, 1, 2]
+        );
+    }
+
+    #[test]
+    fn glsl_reflection_uses_explicit_locations_and_matrix_columns() {
+        let (words, layout) = compile(
+            "#version 330
+            layout(location = 6) in mat4 transform;
+            layout(location = 3) in vec3 position;
+            layout(location = 0) in uvec4 color0;
+            out vec4 v_color;
+            void main() { gl_Position = transform * vec4(position, 1.0); v_color = vec4(color0); }",
+            FRAGMENT,
+            &[],
+        );
+        let (floats, named) = reflect_vertex_inputs(&words, Some(&layout.sampler_aliases));
+        let named = named.unwrap();
+        assert_eq!(named["transform"], 6);
+        assert_eq!(named["position"], 3);
+        assert_eq!(named["color0"], 0);
+        assert_eq!(floats.iter().copied().collect::<Vec<_>>(), [3, 6, 7, 8, 9]);
+        let attributes = [
+            VertexAttribute::new("position", VertexFormat::Float3),
+            VertexAttribute::new("unused", VertexFormat::Float2),
+            VertexAttribute::new("color0", VertexFormat::Byte4),
+            VertexAttribute::with_buffer("transform", VertexFormat::Mat4, 1),
+        ];
+        let layouts = [
+            BufferLayout::default(),
+            BufferLayout {
+                step_func: VertexStep::PerInstance,
+                ..Default::default()
+            },
+        ];
+        let inputs = vertex_inputs(&layouts, &attributes, &floats, Some(&named));
+        assert_eq!(inputs[1].format, vk::Format::R8G8B8A8_UINT);
+        assert_eq!(inputs[1].offset, 20);
+        for (column, input) in inputs[2..].iter().enumerate() {
+            assert_eq!(input.location, 6 + column as u32);
+            assert_eq!(input.offset, 16 * column as u32);
+            assert_eq!(input.stride, 64);
+            assert_eq!(input.binding, 1);
+            assert_eq!(input.input_rate, vk::VertexInputRate::INSTANCE);
+        }
+        assert_eq!(inputs.len(), 6);
+    }
+
+    #[test]
+    fn glsl_reflection_restores_legacy_names_rewritten_by_translator() {
+        let (words, layout) = compile(
+            "#version 100
+            attribute vec4 texture;
+            varying vec4 v_color;
+            void main() { gl_Position = texture; v_color = vec4(1.0); }",
+            "#version 100
+            precision mediump float;
+            varying vec4 v_color;
+            uniform sampler2D texture;
+            void main() { gl_FragColor = v_color * texture2D(texture, vec2(0.5)); }",
+            &["texture"],
+        );
+        let (_, named) = reflect_vertex_inputs(&words, Some(&layout.sampler_aliases));
+        let named = named.unwrap();
+        assert_eq!(named.len(), 1);
+        assert_eq!(named["texture"], 0);
+    }
 }

@@ -1,9 +1,9 @@
-use super::resource::{image_barrier, vk_index_type};
+use super::resource::{image_barrier, transfer_destination_layout, vk_index_type};
 use super::{VulkanContext, DEPTH_FORMAT, MAX_FRAMES_IN_FLIGHT};
 use crate::graphics::*;
 use ash::vk;
 use ash::vk::Handle;
-use std::{convert::TryFrom, ptr};
+use std::{convert::TryFrom, mem::MaybeUninit, ptr};
 
 impl VulkanContext {
     pub(crate) fn grab_screen(&mut self, dst: usize) {
@@ -12,31 +12,28 @@ impl VulkanContext {
             return;
         }
         let image_index = self.acquired_image.unwrap();
-        #[cfg(target_os = "android")]
-        {
-            let dst_blit = unsafe {
-                self.instance.get_physical_device_format_properties(
-                    self.physical_device,
-                    self.textures[dst].format,
-                )
-            }
-            .optimal_tiling_features
-            .contains(vk::FormatFeatureFlags::BLIT_DST);
-            assert!(
-                self.android_swapchain_can_capture && dst_blit,
-                "This Android swapchain does not support screen capture to that texture format"
-            );
-            if self.swapchain_image_layouts[image_index] == vk::ImageLayout::UNDEFINED {
-                // The acquired image has not had any window rendering yet.
-                // It has no defined pixels to copy or valid layout to restore.
-                return;
-            }
-        }
-        self.close_pass();
-        let src_image = self.swapchain_images[image_index];
         let src_layout = self.swapchain_image_layouts[image_index];
+        if src_layout == vk::ImageLayout::UNDEFINED {
+            // Before the first window pass there is nothing defined to capture.
+            return;
+        }
         let module = &self.textures[dst];
+        let dst_blit = unsafe {
+            self.instance
+                .get_physical_device_format_properties(self.physical_device, module.format)
+        }
+        .optimal_tiling_features
+        .contains(vk::FormatFeatureFlags::BLIT_DST);
+        assert!(
+            self.swapchain_can_capture
+                && dst_blit
+                && module.usage.contains(vk::ImageUsageFlags::TRANSFER_DST),
+            "This Vulkan swapchain or destination texture does not support screen capture"
+        );
+        let src_image = self.swapchain_images[image_index];
         let (dst_image, dst_layout) = (module.image, module.layout);
+        let aspect = vk::ImageAspectFlags::COLOR;
+        let dst_final = transfer_destination_layout(dst_layout, aspect);
         let (w, h) = (module.width as i32, module.height as i32);
         let subresource = vk::ImageSubresourceLayers {
             aspect_mask: vk::ImageAspectFlags::COLOR,
@@ -64,7 +61,6 @@ impl VulkanContext {
             dst_offsets: [vk::Offset3D::default(), vk::Offset3D { x: w, y: h, z: 1 }],
         };
         self.record_submit(|ctx, cmd| {
-            let aspect = vk::ImageAspectFlags::COLOR;
             ctx.barrier(
                 cmd,
                 src_image,
@@ -102,12 +98,21 @@ impl VulkanContext {
                 dst_image,
                 aspect,
                 vk::ImageLayout::TRANSFER_DST_OPTIMAL,
-                dst_layout,
+                dst_final,
             );
         });
+        self.textures[dst].layout = dst_final;
     }
 
     pub(crate) fn record_submit<F>(&mut self, f: F)
+    where
+        F: FnOnce(&VulkanContext, vk::CommandBuffer),
+    {
+        self.try_record_submit(f)
+            .expect("Failed to submit a Vulkan transfer");
+    }
+
+    pub(super) fn try_record_submit<F>(&mut self, f: F) -> Result<(), vk::Result>
     where
         F: FnOnce(&VulkanContext, vk::CommandBuffer),
     {
@@ -118,40 +123,29 @@ impl VulkanContext {
                 .command_buffer_count(1)
                 .command_pool(self.command_pool)
                 .level(vk::CommandBufferLevel::PRIMARY);
-            let command_buffer = self
-                .device
-                .allocate_command_buffers(&allocate_info)
-                .expect("Failed to allocate a command buffer")[0];
-
-            let begin_info = vk::CommandBufferBeginInfo::builder()
-                .flags(vk::CommandBufferUsageFlags::ONE_TIME_SUBMIT);
-            self.device
-                .begin_command_buffer(command_buffer, &begin_info)
-                .expect("Failed to begin the command buffer");
-
-            f(self, command_buffer);
-
-            self.device
-                .end_command_buffer(command_buffer)
-                .expect("Failed to end the command buffer");
-
+            let command_buffer = self.device.allocate_command_buffers(&allocate_info)?[0];
             let command_buffers = [command_buffer];
-            let submit_info = vk::SubmitInfo::builder().command_buffers(&command_buffers);
-            self.device
-                .queue_submit(
+            let result = (|| {
+                let begin_info = vk::CommandBufferBeginInfo::builder()
+                    .flags(vk::CommandBufferUsageFlags::ONE_TIME_SUBMIT);
+                self.device
+                    .begin_command_buffer(command_buffer, &begin_info)?;
+                f(self, command_buffer);
+                self.device.end_command_buffer(command_buffer)?;
+                let submit_info = vk::SubmitInfo::builder().command_buffers(&command_buffers);
+                self.device.queue_submit(
                     self.graphics_queue,
                     &[submit_info.build()],
                     vk::Fence::null(),
-                )
-                .expect("Failed to submit the command buffer");
+                )?;
+                self.device.queue_wait_idle(self.graphics_queue)
+            })();
             self.device
-                .queue_wait_idle(self.graphics_queue)
-                .expect("Failed to wait for the command buffer");
-
-            self.device
-                .free_command_buffers(self.command_pool, &[command_buffer]);
+                .free_command_buffers(self.command_pool, &command_buffers);
+            result?;
         }
         self.release_frame_resources();
+        Ok(())
     }
 
     /// Submit pending draws before a synchronous transfer reads their output.
@@ -160,10 +154,9 @@ impl VulkanContext {
             return false;
         }
         self.drain_submissions();
-        let image_index = self.acquired_image.unwrap();
-        self.close_pass();
+        self.suspend_pass();
         self.flush_draw_commands();
-        let command_buffer = self.command_buffers[image_index];
+        let command_buffer = self.frame_command_buffer();
         unsafe {
             self.device
                 .end_command_buffer(command_buffer)
@@ -187,21 +180,24 @@ impl VulkanContext {
         true
     }
 
-    /// Release the per-frame pools and start recording again, after the GPU has
-    /// finished the submission `flush_recording` made.
+    /// Reclaim buffers after a synchronous graphics operation. Restart the
+    /// current command buffer if `flush_recording` submitted that segment.
     pub(crate) fn release_frame_resources(&mut self) {
+        // Synchronous callers drain the worker, flush recorded draws, and
+        // wait for this queue or their own later submission on it.
+        self.release_all_retired_buffers();
         if !self.frame_submitted || !self.frame_active {
             return;
         }
-        let image_index = self.acquired_image.unwrap();
         self.reset_frame_storage();
-        self.restart_command_buffer(self.command_buffers[image_index]);
+        self.restart_command_buffer(self.frame_command_buffer());
         self.frame_submitted = false;
     }
 
     // The caller waits for this slot's GPU work before reusing its storage.
     fn reset_frame_storage(&mut self) {
         self.free_allocated_sets();
+        self.release_retired_buffers(self.current_frame);
         let uniform = &mut self.uniform_arenas[self.current_frame];
         let stream = &mut self.stream_arenas[self.current_frame];
         for (buffer, memory) in uniform.retired.drain(..).chain(stream.retired.drain(..)) {
@@ -212,9 +208,16 @@ impl VulkanContext {
         }
         uniform.offset = 0;
         stream.offset = 0;
+        self.stream_epoch = self.stream_epoch.wrapping_add(1);
         if let Some(arena) = &mut self.texture_upload_arenas[self.current_frame] {
             arena.offset = 0;
         }
+    }
+
+    /// Primary command buffer for the current frame slot, not the swapchain
+    /// image. Only append commands while this frame is actively recording.
+    pub fn frame_command_buffer(&self) -> vk::CommandBuffer {
+        self.command_buffers[self.current_frame]
     }
 
     fn restart_command_buffer(&self, command_buffer: vk::CommandBuffer) {
@@ -233,107 +236,136 @@ impl VulkanContext {
         }
     }
 
+    /// The desktop host can prepare before calling draw, giving it a chance
+    /// to service events while a window has no drawable image.
+    #[cfg(not(target_os = "android"))]
+    pub(crate) fn prepare_desktop_frame(&mut self) -> bool {
+        self.offscreen || self.frame_active || self.begin_frame()
+    }
+
+    #[cfg(target_os = "android")]
     fn begin_frame(&mut self) -> bool {
         // The Android host pre-acquires before invoking application code.
-        // Other callbacks must not record to a detached window or try to
-        // acquire again partway through a draw callback.
-        if cfg!(target_os = "android") {
+        false
+    }
+
+    #[cfg(not(target_os = "android"))]
+    fn begin_frame(&mut self) -> bool {
+        if self.offscreen || self.window_size.0 == 0 || self.window_size.1 == 0 {
             return false;
         }
         #[cfg(feature = "tracy")]
         let _span =
             crate::tracy::span_with_callstack(crate::tracy::span_location!("Vulkan::begin_frame"));
-        let mut prepared = if let Some(worker) = &mut self.submission {
-            let (image, recreate) = worker
-                .wait_prepared()
-                .expect("Failed to submit or acquire the next frame");
-            self.presentation_needs_recreate |= recreate;
-            image
+        if let Some(worker) = &mut self.submission {
+            let state = worker
+                .poll()
+                .expect("Failed to submit or present the frame");
+            self.update_presentation(state);
+        }
+        let recreate = self.surface_lost
+            || self.presentation_needs_recreate
+            || self.swapchain == vk::SwapchainKHR::null();
+        let slot = self.current_frame;
+        if self
+            .submission
+            .as_ref()
+            .is_some_and(|worker| !worker.frame_ready(slot, recreate))
+        {
+            return false;
+        }
+        let fences = if recreate {
+            &self.in_flight[..]
         } else {
-            None
+            &self.in_flight[slot..=slot]
         };
-        unsafe {
-            let fence = self.in_flight[self.current_frame];
-            let wait_start = std::time::Instant::now();
-            {
-                #[cfg(feature = "tracy")]
-                let _span = crate::tracy::span_with_callstack(crate::tracy::span_location!(
-                    "Vulkan::wait_frame_fence (wall time)"
-                ));
-                self.device
-                    .wait_for_fences(&[fence], true, u64::MAX)
-                    .expect("Failed to wait for the frame fence");
+        let wait_start = std::time::Instant::now();
+        let ready = fences.iter().all(|&fence| unsafe {
+            self.device
+                .get_fence_status(fence)
+                .expect("Failed to poll the frame fence")
+        });
+        self.frame_wait_ns = self
+            .frame_wait_ns
+            .saturating_add(wait_start.elapsed().as_nanos() as u64);
+        if !ready {
+            return false;
+        }
+        if recreate {
+            let result = if self.surface_lost {
+                self.recreate_desktop_surface()
+            } else {
+                self.recreate_swapchain()
+            };
+            if let Err(error) = result {
+                self.desktop_frame_not_ready(error);
+                return false;
             }
-            self.frame_wait_ns = self
-                .frame_wait_ns
-                .saturating_add(wait_start.elapsed().as_nanos() as u64);
-            self.reset_frame_storage();
-
-            // A prepared image was acquired by the worker before it started
-            // presenting. Recording into it accesses neither the queue nor
-            // the swapchain. If acquisition did not find a free image, reclaim
-            // host ownership before acquiring here; a GPU fence alone does
-            // not synchronize this thread with the worker's present call.
-            if prepared.is_none() || self.presentation_needs_recreate {
-                self.drain_submissions();
-                if self.presentation_needs_recreate {
-                    if let Some(image) = prepared.take() {
-                        self.wait_acquired_semaphore(image.semaphore);
-                    }
-                    self.recreate_swapchain()
-                        .expect("Failed to recreate the swapchain");
-                }
+            if self.swapchain == vk::SwapchainKHR::null() {
+                return false;
             }
+        }
 
-            let (image_index, slot, semaphore, suboptimal) = loop {
-                if let Some(image) = prepared.take() {
-                    break (
-                        image.image_index,
-                        image.slot,
-                        image.semaphore,
-                        image.suboptimal,
-                    );
-                }
-                let slot = self.acquire_slot;
-                let semaphore = self.image_available[slot];
-                #[cfg(feature = "tracy")]
-                let _span = crate::tracy::span_with_callstack(crate::tracy::span_location!(
-                    "Vulkan::acquire_next_image (wall time)"
-                ));
-                match self.swapchain_loader.acquire_next_image(
+        let prepared = self
+            .submission
+            .as_mut()
+            .and_then(|worker| worker.take_prepared());
+        let (index, slot, semaphore, suboptimal) = if let Some(image) = prepared {
+            (
+                image.image_index,
+                image.slot,
+                image.semaphore,
+                image.suboptimal,
+            )
+        } else {
+            // No worker request owns this swapchain. Do not wait indefinitely:
+            // the native window thread may need to process resize/restore first.
+            let slot = self.acquire_slot;
+            let semaphore = self.image_available[slot];
+            #[cfg(feature = "tracy")]
+            let _span = crate::tracy::span_with_callstack(crate::tracy::span_location!(
+                "Vulkan::acquire_next_image (wall time)"
+            ));
+            match unsafe {
+                self.swapchain_loader.acquire_next_image(
                     self.swapchain,
-                    u64::MAX,
+                    1_000_000,
                     semaphore,
                     vk::Fence::null(),
-                ) {
-                    Ok((image_index, suboptimal)) => {
-                        break (image_index, slot, semaphore, suboptimal);
-                    }
-                    // The swapchain no longer matches the surface; rebuild it
-                    // and try again with the new one.
-                    Err(vk::Result::ERROR_OUT_OF_DATE_KHR) => {
-                        self.recreate_swapchain()
-                            .expect("Failed to recreate the swapchain");
-                    }
-                    // With the worker drained above, `VK_NOT_READY`/`VK_TIMEOUT`
-                    // are not expected: the acquisition blocks until the
-                    // presentation engine returns an image. Anything else means
-                    // the swapchain/device is in a state this backend cannot
-                    // recover from, so fail fast instead of spinning.
-                    Err(error) => panic!("Failed to acquire a swapchain image: {:?}", error),
+                )
+            } {
+                Ok((index, suboptimal)) => (index, slot, semaphore, suboptimal),
+                Err(error) => {
+                    self.desktop_frame_not_ready(error);
+                    return false;
                 }
-            };
-
-            self.start_acquired_frame(image_index, slot, semaphore, suboptimal);
-        }
+            }
+        };
+        self.acquire_slot = (slot + 1) % self.image_available.len();
+        self.reset_frame_storage();
+        self.start_acquired_frame(index, semaphore, suboptimal);
         true
+    }
+
+    #[cfg(not(target_os = "android"))]
+    fn desktop_frame_not_ready(&mut self, error: vk::Result) {
+        match error {
+            vk::Result::NOT_READY | vk::Result::TIMEOUT => (),
+            vk::Result::ERROR_OUT_OF_DATE_KHR | vk::Result::SUBOPTIMAL_KHR => {
+                self.presentation_needs_recreate = true;
+            }
+            vk::Result::ERROR_SURFACE_LOST_KHR => self.surface_lost = true,
+            // Another surface owner may not have released the native window
+            // yet during rebind. Keep retrying the surface, not the old chain.
+            vk::Result::ERROR_NATIVE_WINDOW_IN_USE_KHR if self.surface_lost => (),
+            other => panic!("Failed to prepare the Vulkan window frame: {:?}", other),
+        }
     }
 
     fn start_acquired_frame(
         &mut self,
         image_index: u32,
-        slot: usize,
-        semaphore: vk::Semaphore,
+        acquire_semaphore: vk::Semaphore,
         suboptimal: bool,
     ) {
         // Reset only once an image was acquired and a submission will use
@@ -345,13 +377,12 @@ impl VulkanContext {
         }
         let image_index = image_index as usize;
         self.swapchain_suboptimal = suboptimal;
-        self.frame_wait = semaphore;
-        self.acquire_slot = (slot + 1) % self.image_available.len();
+        self.frame_wait = acquire_semaphore;
         self.acquired_image = Some(image_index);
         // The presentation engine owned the image until now, so whatever it
         // holds is undefined.
         self.swapchain_image_layouts[image_index] = vk::ImageLayout::UNDEFINED;
-        self.restart_command_buffer(self.command_buffers[image_index]);
+        self.restart_command_buffer(self.frame_command_buffer());
 
         self.frame_wait_pending = true;
         self.recording = true;
@@ -362,7 +393,8 @@ impl VulkanContext {
         self.cur_index_buffer = None;
         self.cur_vertex_buffers.clear();
         self.cur_target = None;
-        self.pending.clear();
+        self.pass_suspended = false;
+        self.bound_textures.clear();
     }
 
     /// Prepare the window frame before entering application callbacks. A
@@ -372,7 +404,7 @@ impl VulkanContext {
         if self.offscreen {
             return Ok(true);
         }
-        if self.android_surface_lost {
+        if self.surface_lost {
             return Err(vk::Result::ERROR_SURFACE_LOST_KHR);
         }
         if self.surface == vk::SurfaceKHR::null()
@@ -384,15 +416,24 @@ impl VulkanContext {
         if self.frame_active {
             return Ok(true);
         }
-        // The command buffers are indexed by image, not by frame slot. The
-        // acquired index can be returned before its semaphore is signalled,
-        // so ensure no old submission can still be using its command buffer.
-        for &fence in &self.in_flight {
+        // The primary, acquire semaphore, and transient storage belong to the
+        // frame slot. The other slot may still execute while we record this one.
+        let slot = self.current_frame;
+        let recreate =
+            self.presentation_needs_recreate || self.swapchain == vk::SwapchainKHR::null();
+        let fences = if recreate {
+            // Both slots must retire before replacing the swapchain. Poll first
+            // so lifecycle messages can be handled while GPU work is pending.
+            &self.in_flight[..]
+        } else {
+            &self.in_flight[slot..=slot]
+        };
+        for &fence in fences {
             if !unsafe { self.device.get_fence_status(fence)? } {
                 return Ok(false);
             }
         }
-        if self.presentation_needs_recreate || self.swapchain == vk::SwapchainKHR::null() {
+        if recreate {
             match self.recreate_swapchain() {
                 Ok(()) => (),
                 Err(error) => return self.android_frame_not_ready(error),
@@ -402,24 +443,19 @@ impl VulkanContext {
             }
         }
 
-        let slot = self.acquire_slot;
+        let acquire_semaphore = self.image_available[slot];
         let image = unsafe {
             self.swapchain_loader.acquire_next_image(
                 self.swapchain,
                 0, // Do not block Android's surface lifecycle messages.
-                self.image_available[slot],
+                acquire_semaphore,
                 vk::Fence::null(),
             )
         };
         match image {
             Ok((image_index, suboptimal)) => {
                 self.reset_frame_storage();
-                self.start_acquired_frame(
-                    image_index,
-                    slot,
-                    self.image_available[slot],
-                    suboptimal,
-                );
+                self.start_acquired_frame(image_index, acquire_semaphore, suboptimal);
                 Ok(true)
             }
             Err(error) => self.android_frame_not_ready(error),
@@ -428,7 +464,7 @@ impl VulkanContext {
 
     #[cfg(target_os = "android")]
     pub(crate) fn android_window_needs_attention(&self) -> bool {
-        !self.offscreen && (self.android_surface_lost || self.presentation_needs_recreate)
+        !self.offscreen && (self.surface_lost || self.presentation_needs_recreate)
     }
 
     #[cfg(target_os = "android")]
@@ -440,7 +476,7 @@ impl VulkanContext {
             }
             vk::Result::NOT_READY | vk::Result::TIMEOUT => Ok(false),
             vk::Result::ERROR_SURFACE_LOST_KHR => {
-                self.android_surface_lost = true;
+                self.surface_lost = true;
                 Err(error)
             }
             _ => Err(error),
@@ -473,12 +509,14 @@ impl VulkanContext {
                     )
                     .expect("Failed to retire the Android window frame");
             }
+            self.last_submitted_slot = Some(self.current_frame);
         }
         self.frame_wait = vk::Semaphore::null();
         self.frame_wait_pending = false;
         self.acquired_image = None;
         self.recording = false;
         self.pass_open = false;
+        self.pass_suspended = false;
         self.frame_active = false;
         self.frame_submitted = false;
         self.cmd_dirty = false;
@@ -486,7 +524,7 @@ impl VulkanContext {
         self.cur_pipeline = None;
         self.cur_index_buffer = None;
         self.cur_vertex_buffers.clear();
-        self.pending.clear();
+        self.bound_textures.clear();
     }
 
     /// Switch this context to offscreen video export.
@@ -509,12 +547,10 @@ impl VulkanContext {
         if self.frame_wait_pending {
             self.wait_acquired_semaphore(self.frame_wait);
         }
-        let prepared = self.submission.as_mut().and_then(|worker| {
-            worker
-                .wait_prepared()
-                .expect("Failed to drain image acquisition")
-                .0
-        });
+        let prepared = self
+            .submission
+            .as_mut()
+            .and_then(super::submission::SubmissionWorker::take_prepared);
         if let Some(image) = prepared {
             self.wait_acquired_semaphore(image.semaphore);
         }
@@ -542,6 +578,7 @@ impl VulkanContext {
             }
         }
         self.command_buffers = command_buffers;
+        self.release_all_retired_buffers();
         // An incomplete normal frame can leave a per-frame fence reset without
         // a matching submission.  The device is idle here, so replace the ring
         // with fresh signaled fences before the offscreen ring starts using
@@ -560,6 +597,7 @@ impl VulkanContext {
         self.frame_active = false;
         self.recording = false;
         self.pass_open = false;
+        self.pass_suspended = false;
         self.cmd_dirty = false;
         self.frame_submitted = false;
     }
@@ -599,7 +637,8 @@ impl VulkanContext {
         self.cur_index_buffer = None;
         self.cur_vertex_buffers.clear();
         self.cur_target = None;
-        self.pending.clear();
+        self.pass_suspended = false;
+        self.bound_textures.clear();
         slot
     }
 
@@ -630,8 +669,8 @@ impl VulkanContext {
         );
         // Transfer commands cannot be recorded inside a dynamic rendering
         // instance.
-        self.close_pass();
-        let command_buffer = self.command_buffers[self.acquired_image.unwrap()];
+        self.suspend_pass();
+        let command_buffer = self.frame_command_buffer();
         self.flush_draw_commands();
         unsafe {
             let nv12 = vk::Image::from_raw(nv12_image_raw);
@@ -858,8 +897,8 @@ impl VulkanContext {
             width > 0 && height > 0 && width % 2 == 0 && height % 2 == 0,
             "NV12 dimensions must be positive and even"
         );
-        self.close_pass();
-        let command_buffer = self.command_buffers[self.acquired_image.unwrap()];
+        self.suspend_pass();
+        let command_buffer = self.frame_command_buffer();
         self.flush_draw_commands();
         unsafe {
             let staging = vk::Buffer::from_raw(staging_buffer_raw);
@@ -976,7 +1015,7 @@ impl VulkanContext {
             return;
         }
         self.drain_submissions();
-        self.close_pass();
+        self.end_render_pass();
         self.flush_draw_commands();
         let slot = self.acquired_image.take().unwrap();
         let command_buffer = self.command_buffers[slot];
@@ -990,6 +1029,7 @@ impl VulkanContext {
                 .queue_submit(self.graphics_queue, &[submit.build()], self.in_flight[slot])
                 .expect("Failed to submit the offscreen frame");
         }
+        self.last_submitted_slot = Some(slot);
         self.current_frame = (slot + 1) % MAX_FRAMES_IN_FLIGHT;
         self.recording = false;
         self.frame_active = false;
@@ -1010,6 +1050,7 @@ impl VulkanContext {
                 .wait_for_fences(&fences, true, u64::MAX)
                 .expect("Failed to wait for offscreen frames");
         }
+        self.release_all_retired_buffers();
     }
 
     pub fn begin_pass(&mut self, pass: Option<RenderPass>, action: PassAction) {
@@ -1022,17 +1063,18 @@ impl VulkanContext {
         if !self.frame_active && !self.begin_frame() {
             return;
         }
-        let target = pass.map(|pass| pass.0);
-        // Reuse an open target when no clear is requested. end_render_pass
-        // still closes the instance so resolves finish at the public boundary.
-        if self.pass_open && self.cur_target == target && matches!(action, PassAction::Nothing) {
+        if self.render_pass_is_open(pass) && matches!(action, PassAction::Nothing) {
             return;
         }
-        if self.pass_open {
-            self.close_pass();
-        }
-        self.transition_sampled_textures();
+        self.close_pass();
+        self.cur_target = pass.map(|pass| pass.0);
+        let area = self.open_pass(action);
+        self.viewport = area;
+        self.scissor = area;
+        self.bound_textures.clear();
+    }
 
+    fn open_pass(&mut self, action: PassAction) -> vk::Rect2D {
         let (
             color_views,
             resolve_views,
@@ -1042,7 +1084,7 @@ impl VulkanContext {
             height,
             color_formats,
             depth_format,
-        ) = match pass {
+        ) = match self.cur_target {
             None => {
                 self.transition_swapchain_image();
                 self.transition_pass_texture(
@@ -1061,8 +1103,8 @@ impl VulkanContext {
                 )
             }
             Some(pass) => {
-                self.transition_attachments(pass.0);
-                let module = self.passes[pass.0]
+                self.transition_attachments(pass);
+                let module = self.passes[pass]
                     .as_ref()
                     .expect("the render pass has been deleted");
                 let target = module
@@ -1110,7 +1152,6 @@ impl VulkanContext {
         } else {
             Some(depth_format)
         };
-        self.cur_target = target;
 
         let mut clear = vk::ClearValue {
             color: vk::ClearColorValue {
@@ -1223,23 +1264,34 @@ impl VulkanContext {
             unsafe {
                 self.dynamic_rendering.begin(
                     &self.device,
-                    self.command_buffers[self.acquired_image.unwrap()],
+                    self.frame_command_buffer(),
                     &rendering_info,
                 );
             }
         }
 
         self.pass_open = true;
-        self.viewport = area;
-        self.scissor = area;
+        self.pass_suspended = false;
         self.cmd_dirty = true;
-        self.pending.clear();
+        area
+    }
+
+    /// Whether the window supports transfer-source blits from its swapchain.
+    /// The destination texture also needs transfer-destination and blit support.
+    pub fn can_capture_window(&self) -> bool {
+        !self.offscreen && self.swapchain_can_capture
+    }
+
+    /// Whether this target still owns the pass, including while its Vulkan
+    /// rendering instance is suspended by a transfer.
+    pub fn render_pass_is_open(&self, pass: Option<RenderPass>) -> bool {
+        (self.pass_open || self.pass_suspended) && self.cur_target == pass.map(|pass| pass.0)
     }
 
     /// Release the given target even if a transfer already closed its rendering
     /// instance. Leave a different target alone.
     pub fn end_render_pass_if_target(&mut self, pass: Option<RenderPass>) {
-        if self.cur_target == pass.map(|pass| pass.0) {
+        if self.render_pass_is_open(pass) {
             self.end_render_pass();
         }
     }
@@ -1247,7 +1299,15 @@ impl VulkanContext {
     /// Finish attachment writes and MSAA resolves, matching miniquad 0.4.
     pub fn end_render_pass(&mut self) {
         self.close_pass();
+        self.pass_suspended = false;
         self.cur_target = None;
+    }
+
+    pub(super) fn suspend_pass(&mut self) {
+        if self.pass_open {
+            self.close_pass();
+            self.pass_suspended = true;
+        }
     }
 
     fn close_pass(&mut self) {
@@ -1263,10 +1323,8 @@ impl VulkanContext {
             self.recorder.end();
         } else {
             unsafe {
-                self.dynamic_rendering.end(
-                    &self.device,
-                    self.command_buffers[self.acquired_image.unwrap()],
-                );
+                self.dynamic_rendering
+                    .end(&self.device, self.frame_command_buffer());
             }
         }
         self.pass_open = false;
@@ -1284,10 +1342,11 @@ impl VulkanContext {
                     self.cur_samples,
                 );
             }
+            let command_buffer = self.frame_command_buffer();
             self.recorder.execute(
                 &self.device,
                 &self.dynamic_rendering,
-                self.command_buffers[self.acquired_image.unwrap()],
+                command_buffer,
                 self.current_frame,
             );
         }
@@ -1327,7 +1386,7 @@ impl VulkanContext {
         // Only the first pass of a frame may come from `UNDEFINED`; later passes
         // load what the earlier ones wrote, so their contents have to survive.
         let old_layout = self.swapchain_image_layouts[index];
-        let command_buffer = self.command_buffers[index];
+        let command_buffer = self.frame_command_buffer();
         let (src, dst, barrier) = image_barrier(
             image,
             vk::ImageAspectFlags::COLOR,
@@ -1345,11 +1404,8 @@ impl VulkanContext {
         self.swapchain_image_layouts[index] = vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL;
     }
 
-    /// Move a render target's colour and resolve images into attachment layout.
-    ///
-    /// The other half of `transition_sampled_textures`: a target may have been
-    /// sampled (or written) by an earlier pass, and `vkCmdBeginRendering` does
-    /// not transition on the application's behalf.
+    /// Move a render target's colour, resolve and depth images into attachment
+    /// layouts; an earlier pass might have sampled or written them.
     fn transition_attachments(&mut self, pass: usize) {
         let module = self.passes[pass]
             .take()
@@ -1380,7 +1436,7 @@ impl VulkanContext {
         }
         let viewport = self.viewport;
         let scissor = self.scissor;
-        let pending = std::mem::take(&mut self.pending);
+        let bindings = std::mem::take(&mut self.bound_textures);
         self.begin_pass(
             self.cur_target.map(RenderPass),
             PassAction::Clear {
@@ -1391,13 +1447,14 @@ impl VulkanContext {
         );
         self.viewport = viewport;
         self.scissor = scissor;
-        self.pending = pending;
+        if self.frame_active {
+            self.bound_textures = bindings;
+        }
     }
 
     pub fn apply_pipeline(&mut self, pipeline: &Pipeline) {
         self.cur_pipeline = Some(*pipeline);
         self.cur_params = self.pipelines[pipeline.0].params;
-        self.pending.uniform_offset = None;
     }
 
     pub fn set_cull_face(&mut self, cull_face: CullFace) {
@@ -1444,9 +1501,9 @@ impl VulkanContext {
         &mut self,
         vertex_buffers: &[BufferId],
         index_buffer: BufferId,
-        textures: impl Iterator<Item = usize> + Clone,
+        textures: impl Iterator<Item = usize>,
     ) {
-        if cfg!(target_os = "android") && !self.frame_active {
+        if !self.frame_active {
             return;
         }
         let pipeline = self
@@ -1460,44 +1517,38 @@ impl VulkanContext {
             .extend(vertex_buffers.iter().map(|buffer| Some(buffer.0)));
         self.cur_index_buffer = Some(index_buffer.0);
 
-        let sampled = textures.take(images);
-        let texture_modules = &self.textures;
-        self.pending
-            .sampled
-            .extend(sampled.clone().filter(|&index| {
-                texture_modules[index].layout != vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL
-            }));
-        let needs_transition = !self.pending.sampled.is_empty();
-        if needs_transition && self.pass_open {
-            let target = self.cur_target;
-            let viewport = self.viewport;
-            let scissor = self.scissor;
-            self.close_pass();
-            self.begin_pass(target.map(RenderPass), PassAction::Nothing);
-            self.viewport = viewport;
-            self.scissor = scissor;
-        }
+        self.bound_textures.clear();
+        self.bound_textures.extend(textures.take(images).map(Some));
+    }
 
-        self.pending.images.clear();
-        self.pending.images.resize(images, None);
-        for (slot, texture) in sampled.enumerate() {
-            let module = &self.textures[texture];
-            self.pending.images[slot] = Some(vk::DescriptorImageInfo {
-                sampler: module.sampler,
-                image_view: module.sample_view.unwrap_or(module.view),
-                image_layout: vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL,
-            });
+    fn prepare_bound_textures(&mut self, images: usize) {
+        for slot in 0..images.min(self.bound_textures.len()) {
+            if let Some(index) = self.bound_textures[slot] {
+                let layout = vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL;
+                if self.textures[index].layout != layout {
+                    self.suspend_pass();
+                    self.transition_pass_texture(index, layout);
+                }
+            }
         }
     }
 
-    /// Move the textures the pass just sampled into `SHADER_READ_ONLY_OPTIMAL`.
-    ///
-    /// Recorded after `cmdEndRendering` because Vulkan rejects image barriers
-    /// inside a dynamic rendering instance.
-    fn transition_sampled_textures(&mut self) {
-        for index in std::mem::take(&mut self.pending.sampled) {
-            self.transition_pass_texture(index, vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL);
+    pub(super) fn prepare_render_texture_for_sampling(&mut self, index: usize) {
+        if !self.frame_active || !self.recording || self.frame_submitted {
+            return;
         }
+        assert!(
+            !self.pass_open && !self.pass_suspended,
+            "Finish the render pass before preparing its texture for sampling"
+        );
+        let texture = &self.textures[index];
+        if texture.layout != vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL
+            || !texture.usage.contains(vk::ImageUsageFlags::SAMPLED)
+        {
+            return;
+        }
+        self.transition_pass_texture(index, vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL);
+        self.cmd_dirty = true;
     }
 
     fn transition_pass_texture(&mut self, index: usize, to: vk::ImageLayout) {
@@ -1520,7 +1571,7 @@ impl VulkanContext {
             vk::ImageAspectFlags::COLOR
         };
         let (src, dst, barrier) = image_barrier(module.image, aspect, module.layout, to);
-        let command = self.command_buffers[self.acquired_image.unwrap()];
+        let command = self.frame_command_buffer();
         self.pass_image_barrier(command, src, dst, barrier);
         self.textures[index].layout = to;
     }
@@ -1528,7 +1579,7 @@ impl VulkanContext {
     /// # Safety
     /// `uniform_ptr` must address `size` readable bytes in the bound shader's uniform layout.
     pub unsafe fn apply_uniforms_from_bytes(&mut self, uniform_ptr: *const u8, size: usize) {
-        if cfg!(target_os = "android") && !self.frame_active {
+        if !self.frame_active {
             return;
         }
         let pipeline = self
@@ -1540,49 +1591,60 @@ impl VulkanContext {
             return;
         }
 
-        let offset = match self.pending.uniform_offset {
-            Some(offset) => offset,
-            None => {
-                let offset = self.allocate_uniforms(buffer_size);
-                unsafe {
-                    ptr::write_bytes(
-                        self.uniform_arenas[self.current_frame]
-                            .mapped
-                            .add(offset as usize),
-                        0,
-                        buffer_size as usize,
-                    );
-                }
-                self.pending.uniform_offset = Some(offset);
-                offset
-            }
-        };
-
-        unsafe {
-            let mapped = self.uniform_arenas[self.current_frame]
-                .mapped
-                .add(offset as usize);
-            for (tight, std140, element, stride, count) in &self.shaders[shader].uniform_offsets {
-                assert!(
-                    *tight as usize + *count as usize * *element as usize <= size,
-                    "Uniforms struct does not match shader uniforms layout"
+        let module = &mut self.shaders[shader];
+        let uniforms = &mut module.uniforms;
+        uniforms
+            .bytes
+            .resize(buffer_size as usize, MaybeUninit::new(0));
+        uniforms.offset = None;
+        // Copy fields rather than the whole input so packed and std140 layouts
+        // may differ and the unused std140 padding stays zeroed.
+        for &(tight, std140, element, stride, count) in &module.uniform_offsets {
+            assert!(
+                tight as usize + count as usize * element as usize <= size,
+                "Uniforms struct does not match shader uniforms layout"
+            );
+            for index in 0..count {
+                ptr::copy_nonoverlapping(
+                    uniform_ptr.add((tight + index * element) as usize).cast(),
+                    uniforms
+                        .bytes
+                        .as_mut_ptr()
+                        .add((std140 + index * stride) as usize),
+                    element as usize,
                 );
-                for index in 0..*count {
-                    ptr::copy_nonoverlapping(
-                        uniform_ptr.add((*tight + index * *element) as usize),
-                        mapped.add((*std140 + index * *stride) as usize),
-                        *element as usize,
-                    );
-                }
             }
         }
     }
 
-    /// Reserve a slice of the frame's uniform arena for one draw call.
-    ///
-    /// The arena is a bump allocator: slices are aligned to what the device
-    /// requires of a dynamic uniform offset and are all released when the frame
-    /// ends.
+    fn stage_uniforms_for_draw(&mut self, shader: usize) -> Option<vk::DeviceSize> {
+        let bytes = self.shaders[shader].uniforms_size;
+        if bytes == 0 {
+            return None;
+        }
+        if let Some((epoch, offset)) = self.shaders[shader].uniforms.offset {
+            if epoch == self.stream_epoch {
+                return Some(offset);
+            }
+        }
+        let offset = self.allocate_uniforms(bytes);
+        let uniforms = &mut self.shaders[shader].uniforms;
+        unsafe {
+            let dst = self.uniform_arenas[self.current_frame]
+                .mapped
+                .add(offset as usize);
+            if uniforms.bytes.is_empty() {
+                ptr::write_bytes(dst, 0, bytes as usize);
+            } else {
+                ptr::copy_nonoverlapping(uniforms.bytes.as_ptr(), dst.cast(), bytes as usize);
+            }
+        }
+        uniforms.offset = Some((self.stream_epoch, offset));
+        Some(offset)
+    }
+
+    /// Reserve an aligned, immutable slice until the current command segment
+    /// has been submitted and its GPU work has completed.
     fn allocate_uniforms(&mut self, size: vk::DeviceSize) -> vk::DeviceSize {
         let slot = self.current_frame;
         let alignment = self.uniform_arenas[slot].alignment;
@@ -1618,20 +1680,26 @@ impl VulkanContext {
     }
 
     pub fn draw(&mut self, base_element: i32, num_elements: i32, num_instances: i32) {
-        if (cfg!(target_os = "android") && !self.frame_active)
-            || num_elements == 0
-            || num_instances == 0
-        {
+        if !self.frame_active || num_elements == 0 || num_instances == 0 {
             return;
         }
         assert!(base_element >= 0 && num_elements >= 0 && num_instances >= 0);
-        assert!(self.pass_open, "Drawing outside a render pass");
+        assert!(
+            self.pass_open || self.pass_suspended,
+            "Drawing outside a render pass"
+        );
         if self.viewport.extent.width == 0 || self.viewport.extent.height == 0 {
             return;
         }
         let pipeline = self.cur_pipeline.expect("Drawing without a bound pipeline");
         let index_buffer = self.cur_index_buffer.expect("Unset index buffer");
         let shader_index = self.pipelines[pipeline.0].shader;
+        self.prepare_bound_textures(self.shaders[shader_index].images.len());
+        if self.pass_suspended {
+            // The transfer closed only the Vulkan instance. Reload the stored
+            // attachments without resetting bindings, viewport or scissor.
+            self.open_pass(PassAction::Nothing);
+        }
         let screen = self.cur_target.is_none();
         let mut params = self.cur_params;
         if !screen {
@@ -1643,36 +1711,15 @@ impl VulkanContext {
             };
         }
         let vk_pipeline = self.pipeline_for_current_target(pipeline, params);
+        let uniform_offset = self.stage_uniforms_for_draw(shader_index);
         let uniforms_size = self.shaders[shader_index].uniforms_size;
-        let uniform_offset = if uniforms_size == 0 {
-            None
-        } else {
-            let offset = match self.pending.uniform_offset {
-                Some(offset) => offset,
-                None => {
-                    let offset = self.allocate_uniforms(uniforms_size);
-                    unsafe {
-                        ptr::write_bytes(
-                            self.uniform_arenas[self.current_frame]
-                                .mapped
-                                .add(offset as usize),
-                            0,
-                            uniforms_size as usize,
-                        );
-                    }
-                    offset
-                }
-            };
-            Some(offset)
-        };
 
+        self.stage_buffer_for_draw(index_buffer);
+        for slot in 0..self.cur_vertex_buffers.len() {
+            let buffer = self.cur_vertex_buffers[slot].expect("Unbound vertex buffer");
+            self.stage_buffer_for_draw(buffer);
+        }
         let shader = &self.shaders[shader_index];
-        let dummy = &self.textures[self.dummy_texture];
-        let dummy_info = vk::DescriptorImageInfo {
-            sampler: dummy.sampler,
-            image_view: dummy.sample_view.unwrap_or(dummy.view),
-            image_layout: vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL,
-        };
         let index = &self.buffers[index_buffer];
         assert!(
             index.current_buffer != vk::Buffer::null(),
@@ -1734,7 +1781,15 @@ impl VulkanContext {
             uniform_offset: uniform_offset
                 .map(|offset| u32::try_from(offset).expect("Uniform offset exceeds u32")),
             images: (0..shader.images.len())
-                .map(|slot| self.pending.images[slot].unwrap_or(dummy_info))
+                .map(|slot| {
+                    let index = self.bound_textures.get(slot).copied().flatten();
+                    let texture = &self.textures[index.unwrap_or(self.dummy_texture)];
+                    vk::DescriptorImageInfo {
+                        sampler: texture.sampler,
+                        image_view: texture.sample_view.unwrap_or(texture.view),
+                        image_layout: vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL,
+                    }
+                })
                 .collect(),
             // The screen flips Y; texture targets retain OpenGL row order.
             viewport: vk::Viewport {
@@ -1765,14 +1820,9 @@ impl VulkanContext {
         } else {
             let set = self.allocate_descriptor_set(draw.descriptor_layout);
             draw.update_descriptors(&self.device, set);
-            draw.record(
-                &self.device,
-                self.command_buffers[self.acquired_image.unwrap()],
-                set,
-            );
+            draw.record(&self.device, self.frame_command_buffer(), set);
         }
         self.cmd_dirty = true;
-        self.pending.uniform_offset = None;
     }
 
     pub fn commit_frame(&mut self) {}
@@ -1784,18 +1834,24 @@ impl VulkanContext {
         if !self.frame_active {
             return;
         }
-        self.close_pass();
+        self.end_render_pass();
         self.flush_draw_commands();
+        let command_buffer = self.frame_command_buffer();
         let image_index = self.acquired_image.take().unwrap();
-        let command_buffer = self.command_buffers[image_index];
         let swapchain_image = self.swapchain_images[image_index];
         let swapchain_layout = self.swapchain_image_layouts[image_index];
 
         unsafe {
             // Hand the rendered image over to the presentation engine.
             let present_barrier = vk::ImageMemoryBarrier::builder()
-                .src_access_mask(vk::AccessFlags::COLOR_ATTACHMENT_WRITE)
-                .dst_access_mask(vk::AccessFlags::MEMORY_READ)
+                .src_access_mask(
+                    if swapchain_layout == vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL {
+                        vk::AccessFlags::COLOR_ATTACHMENT_WRITE
+                    } else {
+                        vk::AccessFlags::empty()
+                    },
+                )
+                .dst_access_mask(vk::AccessFlags::empty())
                 .old_layout(swapchain_layout)
                 .new_layout(vk::ImageLayout::PRESENT_SRC_KHR)
                 .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
@@ -1832,7 +1888,7 @@ impl VulkanContext {
             fence: self.in_flight[self.current_frame],
             swapchain: self.swapchain,
             image_index: image_index as u32,
-            // begin_frame waited on this slot's fence, which also retires any
+            // begin_frame checked this slot's fence, which also retires any
             // older submission that used the next round-robin semaphore.
             next_acquire: self
                 .submission
@@ -1853,9 +1909,7 @@ impl VulkanContext {
                 self.graphics_queue,
                 |_| {},
             ) {
-                Ok(recreate) => self.presentation_needs_recreate |= recreate,
-                #[cfg(target_os = "android")]
-                Err(vk::Result::ERROR_SURFACE_LOST_KHR) => self.android_surface_lost = true,
+                Ok(state) => self.update_presentation(state),
                 Err(error) => panic!("Failed to submit or present the frame: {:?}", error),
             }
         }
@@ -1867,6 +1921,7 @@ impl VulkanContext {
         self.swapchain_suboptimal = false;
         self.swapchain_image_layouts[image_index] = vk::ImageLayout::PRESENT_SRC_KHR;
         self.frame_wait_pending = false;
+        self.last_submitted_slot = Some(self.current_frame);
         self.current_frame = (self.current_frame + 1) % MAX_FRAMES_IN_FLIGHT;
         self.recording = false;
         self.frame_active = false;

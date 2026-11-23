@@ -1,4 +1,5 @@
 use std::ffi::CStr;
+use std::mem::MaybeUninit;
 use std::num::NonZeroU32;
 use std::os::raw::c_char;
 
@@ -35,26 +36,13 @@ pub const IMAGE_BINDING_BASE: u32 = 1;
 /// two bytes per pixel `TextureFormat::Depth` reports.
 pub const DEPTH_FORMAT: vk::Format = vk::Format::D16_UNORM;
 
-/// Descriptor writes collected between `apply_bindings`/`apply_uniforms` and
-/// `draw`, flushed into a descriptor set allocated for that draw call.
-#[derive(Clone, Default)]
-pub(crate) struct PendingDescriptors {
-    pub images: Vec<Option<vk::DescriptorImageInfo>>,
-    /// Textures this pass samples. Vulkan forbids image barriers inside a
-    /// dynamic rendering instance, so their layout transition is recorded once
-    /// the pass has ended.
-    pub sampled: Vec<usize>,
-    /// Slice of the frame's uniform arena holding the values written since the
-    /// last draw call.
-    pub uniform_offset: Option<vk::DeviceSize>,
-}
-
-impl PendingDescriptors {
-    pub fn clear(&mut self) {
-        self.images.clear();
-        self.sampled.clear();
-        self.uniform_offset = None;
-    }
+/// Uniforms belong to a shader program, not to a draw or render pass. Keep a
+/// CPU copy so a later command segment can upload the same values again.
+#[derive(Default)]
+pub(super) struct UniformState {
+    // The caller can supply typed storage containing uninitialized padding.
+    bytes: Vec<MaybeUninit<u8>>,
+    offset: Option<(u64, vk::DeviceSize)>,
 }
 
 /// Size a uniform arena starts with, in bytes.
@@ -64,8 +52,8 @@ const UNIFORM_ARENA_SIZE: vk::DeviceSize = 1 << 16;
 ///
 /// A frame's uniforms cannot all live in one buffer: the frame is recorded in
 /// full before it is submitted, so the last write would be the only one the GPU
-/// ever sees. Every draw call copies its block into its own slice instead and
-/// names it with a dynamic offset when its descriptor set is bound.
+/// ever sees. Each version of a shader's uniforms gets its own immutable slice
+/// and draws name it with a dynamic offset when the descriptor set is bound.
 pub struct UniformArena {
     pub buffer: vk::Buffer,
     pub memory: vk::DeviceMemory,
@@ -83,9 +71,8 @@ pub struct UniformArena {
 /// Per-frame host visible arena the stream buffers are written into.
 ///
 /// A frame's command buffer is recorded in full before it is submitted, so a
-/// buffer that is updated twice in one frame cannot keep a single copy: every
-/// update gets its own slice and every draw binds the slice that was current
-/// when it was recorded.
+/// buffer that is updated twice in one frame cannot keep a single GPU copy.
+/// Draws bind an immutable snapshot of the most recent logical contents.
 pub struct StreamArena {
     pub buffer: vk::Buffer,
     pub memory: vk::DeviceMemory,
@@ -144,8 +131,8 @@ pub struct VulkanContext {
     pub surface: vk::SurfaceKHR,
     pub physical_device: vk::PhysicalDevice,
     pub memory_properties: vk::PhysicalDeviceMemoryProperties,
-    /// Effective limit for managed textures at creation. This field is
-    /// informational; changing it does not affect allocation or resize.
+    /// Initial limit for managed texture dimensions. Changing this informational
+    /// field does not affect allocation or resize validation.
     pub max_texture_size: u32,
     texture_size_limit: TextureSizeLimit,
     device_texture_size_limit: TextureSizeLimit,
@@ -162,6 +149,7 @@ pub struct VulkanContext {
     pub video_queue: vk::Queue,
 
     pub command_pool: vk::CommandPool,
+    /// Indexed by frame slot, independently of the acquired swapchain image.
     pub command_buffers: Vec<vk::CommandBuffer>,
     pub(crate) recorder: recording::CommandRecorder,
     pub(crate) dynamic_rendering: DynamicRenderingMode,
@@ -169,19 +157,24 @@ pub struct VulkanContext {
     /// and `drain_submissions`. Synchronous resource operations drain first.
     submission: Option<submission::SubmissionWorker>,
     presentation_needs_recreate: bool,
-    #[cfg(target_os = "android")]
-    android_surface_lost: bool,
-    #[cfg(target_os = "android")]
-    android_swapchain_can_capture: bool,
+    surface_lost: bool,
+    #[cfg(not(target_os = "android"))]
+    desktop_window: (RawDisplayHandle, RawWindowHandle),
+    swapchain_can_capture: bool,
 
-    /// `image_available` is handed out round-robin because
-    /// `acquire_next_image` has to name the wait semaphore before the image index
-    /// is known; `render_finished` is indexed by the acquired image so a semaphore
-    /// is never reused while the swapchain may still be presenting with it.
+    /// Android owns one acquire semaphore per frame slot. The slot's fence
+    /// also covers consumption of that semaphore. Desktop hands them out
+    /// round-robin (its worker can preacquire). In either case, render-finished
+    /// semaphores belong to swapchain images, not frame slots: a graphics fence
+    /// does not tell us when the presentation engine has consumed its wait.
     pub image_available: Vec<vk::Semaphore>,
     pub render_finished: Vec<vk::Semaphore>,
     pub retired_semaphores: Vec<vk::Semaphore>,
     pub in_flight: Vec<vk::Fence>,
+    /// Slot of the latest frame handed to the graphics queue (or its worker).
+    last_submitted_slot: Option<usize>,
+    /// Managed buffer allocations kept alive until the corresponding slot retires.
+    retired_buffers: [Vec<(vk::Buffer, vk::DeviceMemory)>; MAX_FRAMES_IN_FLIGHT],
     /// Cumulative time spent waiting on the per-frame fence in `begin_frame`
     /// (the non-offscreen path).  Diagnostics only.
     pub frame_wait_ns: u64,
@@ -232,6 +225,9 @@ pub struct VulkanContext {
     pub uniform_arenas: Vec<UniformArena>,
     /// One stream arena per frame slot for vertex and index buffer updates.
     pub stream_arenas: Vec<StreamArena>,
+    /// Identifies the current transient arena contents. A synchronous command
+    /// segment restart invalidates slices just like a frame change does.
+    stream_epoch: u64,
     /// Allocated on the first deferred texture upload to each frame slot.
     texture_upload_arenas: [Option<TextureUploadArena>; MAX_FRAMES_IN_FLIGHT],
 
@@ -244,6 +240,8 @@ pub struct VulkanContext {
     pub acquired_image: Option<usize>,
     pub recording: bool,
     pub pass_open: bool,
+    /// A transfer ended dynamic rendering, but the caller still owns this pass.
+    pass_suspended: bool,
     pub frame_active: bool,
     /// Whether commands have been recorded into the frame command buffer since
     /// it was last submitted by `flush_recording`.
@@ -277,7 +275,9 @@ pub struct VulkanContext {
     pub cur_vertex_buffers: Vec<Option<usize>>,
     pub viewport: vk::Rect2D,
     pub scissor: vk::Rect2D,
-    pub(crate) pending: PendingDescriptors,
+    /// Keep managed IDs until draw so resource changes cannot affect already
+    /// recorded descriptors or leave stale views in future draws.
+    bound_textures: Vec<Option<usize>>,
 }
 
 unsafe extern "system" fn debug_callback(
@@ -314,6 +314,47 @@ unsafe extern "system" fn debug_callback(
     vk::FALSE
 }
 
+/// Resources owned by the window until logical device creation succeeds.
+/// Vulkan's ash handles don't destroy their objects on drop.
+struct SurfaceSetup<'a> {
+    instance: &'a Instance,
+    surface_loader: &'a Surface,
+    surface: vk::SurfaceKHR,
+    debug_utils_loader: &'a DebugUtils,
+    debug_messenger: Option<vk::DebugUtilsMessengerEXT>,
+}
+
+impl Drop for SurfaceSetup<'_> {
+    fn drop(&mut self) {
+        unsafe {
+            self.surface_loader.destroy_surface(self.surface, None);
+            if let Some(messenger) = self.debug_messenger {
+                self.debug_utils_loader.destroy_debug_utils_messenger(messenger, None);
+            }
+            self.instance.destroy_instance(None);
+        }
+    }
+}
+
+#[derive(Debug)]
+pub(crate) struct VulkanInitError(&'static str, vk::Result);
+
+impl std::fmt::Display for VulkanInitError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}: {:?}", self.0, self.1)
+    }
+}
+
+trait AtStartup<T> {
+    fn at(self, operation: &'static str) -> Result<T, VulkanInitError>;
+}
+
+impl<T> AtStartup<T> for Result<T, vk::Result> {
+    fn at(self, operation: &'static str) -> Result<T, VulkanInitError> {
+        self.map_err(|error| VulkanInitError(operation, error))
+    }
+}
+
 impl VulkanContext {
     pub fn new(
         display: RawDisplayHandle,
@@ -329,8 +370,20 @@ impl VulkanContext {
         window_size: (u32, u32),
         max_size: NonZeroU32,
     ) -> Self {
+        Self::try_with_texture_size_limit(display, window, window_size, max_size)
+            .unwrap_or_else(|error| panic!("Vulkan startup failed: {}", error))
+    }
+
+    pub(crate) fn try_with_texture_size_limit(
+        display: RawDisplayHandle,
+        window: RawWindowHandle,
+        window_size: (u32, u32),
+        max_size: NonZeroU32,
+    ) -> Result<Self, VulkanInitError> {
         unsafe {
-            let entry = Entry::load().expect("Failed to load the Vulkan loader");
+            let entry = Entry::load().map_err(|_| {
+                VulkanInitError("load Vulkan loader", vk::Result::ERROR_INITIALIZATION_FAILED)
+            })?;
             let app_name = CStr::from_bytes_with_nul_unchecked(b"miniquad\0");
 
             // Validation needs the Khronos layer to be installed, so it is opt-in
@@ -349,7 +402,7 @@ impl VulkanContext {
             };
 
             let mut extension_names = ash_window::enumerate_required_extensions(display)
-                .unwrap()
+                .at("enumerate window extensions")?
                 .to_vec();
             if validation {
                 extension_names.push(DebugUtils::name().as_ptr());
@@ -358,13 +411,15 @@ impl VulkanContext {
             // The loader and physical device both limit the effective API.
             let instance_api = entry
                 .try_enumerate_instance_version()
-                .expect("Failed to query the Vulkan loader version")
+                .at("query Vulkan loader version")?
                 .unwrap_or(vk::API_VERSION_1_0)
                 .min(vk::API_VERSION_1_3);
-            assert!(
-                instance_api >= vk::API_VERSION_1_2,
-                "Vulkan needs a 1.2+ loader"
-            );
+            if instance_api < vk::API_VERSION_1_2 {
+                return Err(VulkanInitError(
+                    "Vulkan needs a 1.2+ loader",
+                    vk::Result::ERROR_INCOMPATIBLE_DRIVER,
+                ));
+            }
             let app_info = vk::ApplicationInfo::builder()
                 .application_name(app_name)
                 .application_version(0)
@@ -376,9 +431,7 @@ impl VulkanContext {
                 .enabled_layer_names(&layer_names)
                 .enabled_extension_names(&extension_names);
 
-            let instance: Instance = entry
-                .create_instance(&create_info, None)
-                .expect("Failed to create the Vulkan instance");
+            let instance = entry.create_instance(&create_info, None).at("create Vulkan instance")?;
 
             let debug_info = vk::DebugUtilsMessengerCreateInfoEXT::builder()
                 .message_severity(
@@ -394,24 +447,24 @@ impl VulkanContext {
                 .pfn_user_callback(Some(debug_callback));
 
             let debug_utils_loader = DebugUtils::new(&entry, &instance);
-            let debug_messenger = if validation {
-                Some(
-                    debug_utils_loader
-                        .create_debug_utils_messenger(&debug_info, None)
-                        .expect("Failed to create the debug messenger"),
-                )
-            } else {
-                None
-            };
-
-            let surface = ash_window::create_surface(&entry, &instance, display, window, None)
-                .expect("Failed to create a Vulkan surface for the window");
-
             let surface_loader = Surface::new(&entry, &instance);
-
-            let physical_devices = instance
-                .enumerate_physical_devices()
-                .expect("Failed to enumerate Vulkan physical devices");
+            let mut setup = SurfaceSetup {
+                instance: &instance,
+                surface_loader: &surface_loader,
+                surface: vk::SurfaceKHR::null(),
+                debug_utils_loader: &debug_utils_loader,
+                debug_messenger: None,
+            };
+            if validation {
+                setup.debug_messenger = Some(debug_utils_loader
+                    .create_debug_utils_messenger(&debug_info, None)
+                    .at("create Vulkan validation messenger")?);
+            }
+            setup.surface = ash_window::create_surface(&entry, &instance, display, window, None)
+                .at("create Vulkan window surface")?;
+            let surface = setup.surface;
+            let physical_devices = instance.enumerate_physical_devices()
+                .at("enumerate Vulkan devices")?;
 
             let has_extension = |extensions: &[vk::ExtensionProperties], name: &CStr| {
                 extensions
@@ -457,7 +510,10 @@ impl VulkanContext {
                     })?;
                     Some((device, properties, extensions, family, use_khr))
                 })
-                .expect("No Vulkan 1.2+ device with dynamic rendering, swapchain and window presentation support");
+                .ok_or(VulkanInitError(
+                    "no Vulkan 1.2+ device with dynamic rendering and window presentation",
+                    vk::Result::ERROR_FEATURE_NOT_PRESENT,
+                ))?;
             // Vulkan video export is not part of the Android window path.
             let video_queue_supported = !cfg!(target_os = "android")
                 && has_extension(&available_extensions, cstr(b"VK_KHR_video_queue\0"))
@@ -516,9 +572,11 @@ impl VulkanContext {
                 device_create_info.push_next(&mut dynamic_rendering_13)
             };
 
-            let device: Device = instance
-                .create_device(physical_device, &device_create_info, None)
-                .expect("Failed to create the Vulkan logical device");
+            let device = instance.create_device(physical_device, &device_create_info, None)
+                .at("create Vulkan logical device")?;
+            let debug_messenger = setup.debug_messenger;
+            // The context takes ownership of the successfully created window objects.
+            std::mem::forget(setup);
 
             let dynamic_rendering = if use_khr_dynamic_rendering {
                 DynamicRenderingMode::Khr(KhrDynamicRendering::new(&instance, &device))
@@ -531,54 +589,15 @@ impl VulkanContext {
                 .unwrap_or(vk::Queue::null());
             let memory_properties = instance.get_physical_device_memory_properties(physical_device);
             // Texture operations also use signed Vulkan offsets.
+            let max_image_dimension = properties.limits.max_image_dimension2_d;
             let device_texture_size_limit =
-                TextureSizeLimit::new(properties.limits.max_image_dimension2_d.min(i32::MAX as u32));
+                TextureSizeLimit::new(max_image_dimension.min(i32::MAX as u32));
             let texture_size_limit =
                 TextureSizeLimit::new(device_texture_size_limit.max().min(max_size.get()));
             let uniform_alignment = properties.limits.min_uniform_buffer_offset_alignment;
             let color_sample_counts = properties.limits.framebuffer_color_sample_counts;
             let swapchain_loader = Swapchain::new(&instance, &device);
 
-            let command_pool = device
-                .create_command_pool(
-                    &vk::CommandPoolCreateInfo::builder()
-                        .flags(vk::CommandPoolCreateFlags::RESET_COMMAND_BUFFER)
-                        .queue_family_index(queue_family_index),
-                    None,
-                )
-                .expect("Failed to create the command pool");
-
-            let descriptor_pools: Vec<vk::DescriptorPool> = (0..MAX_FRAMES_IN_FLIGHT)
-                .map(|_| create_descriptor_pool(&device))
-                .collect();
-
-            // Synchronisation objects are created before `device` is moved into
-            // the context below. The semaphores are re-created together with the
-            // swap chain, which decides how many are needed.
-            let in_flight: Vec<vk::Fence> = (0..MAX_FRAMES_IN_FLIGHT)
-                .map(|_| create_fence(&device))
-                .collect();
-
-            let readback_cmd = device
-                .allocate_command_buffers(
-                    &vk::CommandBufferAllocateInfo::builder()
-                        .command_buffer_count(1)
-                        .command_pool(command_pool)
-                        .level(vk::CommandBufferLevel::PRIMARY),
-                )
-                .expect("Failed to allocate the readback command buffer")[0];
-            let readback_fence = device
-                .create_fence(&vk::FenceCreateInfo::default(), None)
-                .expect("Failed to create the readback fence");
-
-            let recorder = recording::CommandRecorder::new(&device, queue_family_index);
-            // The Android render thread must be able to stop using the window
-            // before the surfaceDestroyed callback returns.
-            #[cfg(not(target_os = "android"))]
-            let submission =
-                submission::SubmissionWorker::new(&device, &swapchain_loader, graphics_queue);
-            #[cfg(target_os = "android")]
-            let submission = None;
             let mut context = VulkanContext {
                 entry,
                 instance,
@@ -602,21 +621,23 @@ impl VulkanContext {
                 video_queue_family,
                 video_queue,
 
-                command_pool,
+                command_pool: vk::CommandPool::null(),
                 command_buffers: Vec::new(),
-                recorder,
+                recorder: Default::default(),
                 dynamic_rendering,
-                submission,
+                submission: None,
                 presentation_needs_recreate: false,
-                #[cfg(target_os = "android")]
-                android_surface_lost: false,
-                #[cfg(target_os = "android")]
-                android_swapchain_can_capture: false,
+                surface_lost: false,
+                #[cfg(not(target_os = "android"))]
+                desktop_window: (display, window),
+                swapchain_can_capture: false,
 
                 image_available: Vec::new(),
                 render_finished: Vec::new(),
                 retired_semaphores: Vec::new(),
-                in_flight,
+                in_flight: Vec::new(),
+                last_submitted_slot: None,
+                retired_buffers: std::array::from_fn(|_| Vec::new()),
                 frame_wait_ns: 0,
 
                 window_size,
@@ -631,8 +652,8 @@ impl VulkanContext {
                 readback_memory: vk::DeviceMemory::null(),
                 readback_mapped: std::ptr::null_mut(),
                 readback_capacity: 0,
-                readback_cmd,
-                readback_fence,
+                readback_cmd: vk::CommandBuffer::null(),
+                readback_fence: vk::Fence::null(),
                 default_depth: Texture::empty(),
                 dummy_texture: 0,
 
@@ -642,14 +663,15 @@ impl VulkanContext {
                 free_pipelines: Vec::new(),
                 buffers: Vec::new(),
                 free_buffers: Vec::new(),
-                textures: Vec::new(),
+                textures: vec![empty_texture_module()],
                 free_textures: Vec::new(),
                 passes: Vec::new(),
                 free_passes: Vec::new(),
 
-                descriptor_pools,
+                descriptor_pools: Vec::new(),
                 uniform_arenas: Vec::new(),
                 stream_arenas: Vec::new(),
+                stream_epoch: 0,
                 texture_upload_arenas: std::array::from_fn(|_| None),
 
                 current_frame: 0,
@@ -659,6 +681,7 @@ impl VulkanContext {
                 acquired_image: None,
                 recording: false,
                 pass_open: false,
+                pass_suspended: false,
                 frame_active: false,
                 cmd_dirty: false,
                 frame_submitted: false,
@@ -674,38 +697,83 @@ impl VulkanContext {
                 cur_vertex_buffers: Vec::new(),
                 viewport: vk::Rect2D::default(),
                 scissor: vk::Rect2D::default(),
-                pending: PendingDescriptors::default(),
+                bound_textures: Vec::new(),
             };
-            context.textures.push(empty_texture_module());
-            context.dummy_texture = context.new_texture(
-                Some(&[0, 0, 0, 255]),
-                TextureParams {
-                    width: 1,
-                    height: 1,
-                    format: TextureFormat::RGBA8,
-                    ..Default::default()
-                },
-                TextureAccess::Static,
-            );
-            context.create_uniform_arenas();
-            context.create_stream_arenas();
-            // Android last reports its native window size asynchronously. Let
-            // the render loop create the initial swapchain when it can draw.
-            #[cfg(not(target_os = "android"))]
-            context
-                .create_swapchain(window_size)
-                .expect("Failed to create the swapchain");
-            context
+            if let Err(error) = context.initialize_window() {
+                context.cleanup();
+                return Err(error);
+            }
+            Ok(context)
         }
     }
 
-    fn create_stream_arenas(&mut self) {
+    fn initialize_window(&mut self) -> Result<(), VulkanInitError> {
+        unsafe {
+            let command_pool = vk::CommandPoolCreateInfo::builder()
+                .flags(vk::CommandPoolCreateFlags::RESET_COMMAND_BUFFER)
+                .queue_family_index(self.queue_family_index);
+            self.command_pool = self
+                .device
+                .create_command_pool(&command_pool, None)
+                .at("create Vulkan command pool")?;
+            for _ in 0..MAX_FRAMES_IN_FLIGHT {
+                self.descriptor_pools
+                    .push(create_descriptor_pool(&self.device).at("create Vulkan descriptor pool")?);
+                self.in_flight
+                    .push(try_create_fence(&self.device).at("create Vulkan frame fence")?);
+            }
+            let readback_cmd = vk::CommandBufferAllocateInfo::builder()
+                .command_buffer_count(1)
+                .command_pool(self.command_pool)
+                .level(vk::CommandBufferLevel::PRIMARY);
+            self.readback_cmd = self
+                .device
+                .allocate_command_buffers(&readback_cmd)
+                .at("allocate Vulkan transfer command buffer")?[0];
+            self.readback_fence = self
+                .device
+                .create_fence(&vk::FenceCreateInfo::default(), None)
+                .at("create Vulkan transfer fence")?;
+        }
+        match self.create_swapchain(self.window_size) {
+            Ok(()) => (),
+            Err(vk::Result::ERROR_OUT_OF_DATE_KHR | vk::Result::NOT_READY | vk::Result::TIMEOUT) => {
+                self.presentation_needs_recreate = true;
+            }
+            Err(vk::Result::ERROR_SURFACE_LOST_KHR) => self.surface_lost = true,
+            Err(error) => return Err(VulkanInitError("create Vulkan window swapchain", error)),
+        }
+        self.create_uniform_arenas()
+            .at("create Vulkan uniform arenas")?;
+        self.create_stream_arenas()
+            .at("create Vulkan stream arenas")?;
+        self.initialize_dummy_texture()
+            .at("initialize Vulkan fallback image")?;
+        self.recorder = recording::CommandRecorder::new(&self.device, self.queue_family_index)
+            .at("create Vulkan recording pools")?;
+        // Win32 WSI can synchronously send messages to the HWND owner. Keep
+        // submission on that thread there, and on the render thread on Android.
+        if !cfg!(any(windows, target_os = "android")) {
+            self.submission = submission::SubmissionWorker::new(
+                &self.device, &self.swapchain_loader, self.graphics_queue,
+            );
+        }
+        Ok(())
+    }
+
+    pub(crate) fn set_texture_size_limit(&mut self, max_size: NonZeroU32) {
+        self.texture_size_limit =
+            TextureSizeLimit::new(self.device_texture_size_limit.max().min(max_size.get()));
+        self.max_texture_size = self.texture_size_limit.max();
+    }
+
+    fn create_stream_arenas(&mut self) -> Result<(), vk::Result> {
         const STREAM_ARENA_SIZE: vk::DeviceSize = 1 << 22;
         for _ in 0..MAX_FRAMES_IN_FLIGHT {
-            let (buffer, memory, mapped) = self.create_mapped_buffer(
+            let (buffer, memory, mapped) = self.try_create_mapped_buffer(
                 STREAM_ARENA_SIZE,
                 vk::BufferUsageFlags::VERTEX_BUFFER | vk::BufferUsageFlags::INDEX_BUFFER,
-            );
+            )?;
             self.stream_arenas.push(StreamArena {
                 buffer,
                 memory,
@@ -715,13 +783,16 @@ impl VulkanContext {
                 retired: Vec::new(),
             });
         }
+        Ok(())
     }
 
     /// Create the uniform arena of every frame slot.
-    fn create_uniform_arenas(&mut self) {
+    fn create_uniform_arenas(&mut self) -> Result<(), vk::Result> {
         for _ in 0..MAX_FRAMES_IN_FLIGHT {
-            let (buffer, memory, mapped) =
-                self.create_mapped_buffer(UNIFORM_ARENA_SIZE, vk::BufferUsageFlags::UNIFORM_BUFFER);
+            let (buffer, memory, mapped) = self.try_create_mapped_buffer(
+                UNIFORM_ARENA_SIZE,
+                vk::BufferUsageFlags::UNIFORM_BUFFER,
+            )?;
             self.uniform_arenas.push(UniformArena {
                 buffer,
                 memory,
@@ -732,6 +803,7 @@ impl VulkanContext {
                 retired: Vec::new(),
             });
         }
+        Ok(())
     }
 
     pub fn features(&self) -> Features {
@@ -743,12 +815,7 @@ impl VulkanContext {
 
     pub fn cleanup(&mut self) {
         self.drain_submissions();
-        let prepared = self.submission.as_mut().and_then(|worker| {
-            worker
-                .wait_prepared()
-                .expect("Failed to drain image acquisition")
-                .0
-        });
+        let prepared = self.submission.as_mut().and_then(submission::SubmissionWorker::take_prepared);
         if let Some(image) = prepared {
             self.wait_acquired_semaphore(image.semaphore);
         }
@@ -759,12 +826,14 @@ impl VulkanContext {
         // Join before destroying any handle the worker's device references.
         self.submission.take();
         unsafe {
-            self.device.device_wait_idle().unwrap();
+            let _ = self.device.device_wait_idle();
             self.frame_active = false;
             self.recording = false;
             self.pass_open = false;
+            self.pass_suspended = false;
             self.frame_submitted = false;
             self.recorder.destroy(&self.device);
+            self.release_all_retired_buffers();
 
             self.passes.clear();
             for shader in self.shaders.drain(..) {
@@ -851,20 +920,37 @@ impl VulkanContext {
         }
     }
 
+    fn release_retired_buffers(&mut self, slot: usize) {
+        for (buffer, memory) in self.retired_buffers[slot].drain(..) {
+            unsafe {
+                self.device.destroy_buffer(buffer, None);
+                self.device.free_memory(memory, None);
+            }
+        }
+        if self.last_submitted_slot == Some(slot) {
+            // Its completed fence also covers every earlier graphics submit.
+            self.last_submitted_slot = None;
+        }
+    }
+
+    // For callers that have already waited or discarded outstanding work.
+    fn release_all_retired_buffers(&mut self) {
+        for slot in 0..MAX_FRAMES_IN_FLIGHT {
+            self.release_retired_buffers(slot);
+        }
+    }
+
     /// Retire window work before replacing swapchain resources. Draining the
     /// submission worker only transfers host ownership; it is not a GPU wait.
     fn wait_for_swapchain_idle(&mut self) -> Result<(), vk::Result> {
         self.drain_submissions();
-        let prepared = self.submission.as_mut().and_then(|worker| {
-            worker
-                .wait_prepared()
-                .expect("Failed to drain image acquisition")
-                .0
-        });
+        let prepared = self.submission.as_mut().and_then(submission::SubmissionWorker::take_prepared);
         if let Some(image) = prepared {
             self.wait_acquired_semaphore(image.semaphore);
         }
-        unsafe { self.device.device_wait_idle() }
+        unsafe { self.device.device_wait_idle()? };
+        self.release_all_retired_buffers();
+        Ok(())
     }
 
     /// Free objects owned by the old swapchain after its work has drained.
@@ -889,10 +975,7 @@ impl VulkanContext {
         self.swapchain_image_layouts.clear();
         self.swapchain_extent = vk::Extent2D::default();
         self.acquire_slot = 0;
-        #[cfg(target_os = "android")]
-        {
-            self.android_swapchain_can_capture = false;
-        }
+        self.swapchain_can_capture = false;
     }
 
     fn release_swapchain_semaphores(&mut self) {
@@ -924,9 +1007,11 @@ impl VulkanContext {
             self.wait_for_swapchain_idle()?;
         }
         self.window_size = window_size;
-        self.presentation_needs_recreate = false;
+        // Keep retrying until all attachments are ready; transient failures
+        // may occur before or after retiring the old swapchain.
+        self.presentation_needs_recreate = true;
         self.swapchain_suboptimal = false;
-        if cfg!(target_os = "android") && (window_size.0 == 0 || window_size.1 == 0) {
+        if window_size.0 == 0 || window_size.1 == 0 {
             self.destroy_swapchain();
             return Ok(());
         }
@@ -935,32 +1020,10 @@ impl VulkanContext {
             let capabilities = self
                 .surface_loader
                 .get_physical_device_surface_capabilities(self.physical_device, self.surface)?;
-            let extent = if capabilities.current_extent.width == u32::MAX {
-                // A window with a variable extent may temporarily report a
-                // zero maximum while it has no drawable buffers.
-                if capabilities.max_image_extent.width == 0
-                    || capabilities.max_image_extent.height == 0
-                {
-                    vk::Extent2D::default()
-                } else {
-                    vk::Extent2D {
-                        width: window_size.0.clamp(
-                            capabilities.min_image_extent.width,
-                            capabilities.max_image_extent.width,
-                        ),
-                        height: window_size.1.clamp(
-                            capabilities.min_image_extent.height,
-                            capabilities.max_image_extent.height,
-                        ),
-                    }
-                }
-            } else {
-                capabilities.current_extent
-            };
-            if cfg!(target_os = "android") && (extent.width == 0 || extent.height == 0) {
+            let Some(extent) = drawable_extent(&capabilities, window_size) else {
                 self.destroy_swapchain();
                 return Ok(());
-            }
+            };
 
             let formats = self
                 .surface_loader
@@ -1009,36 +1072,32 @@ impl VulkanContext {
             }
 
             let mut usage = vk::ImageUsageFlags::COLOR_ATTACHMENT;
-            let mut composite_alpha = vk::CompositeAlphaFlagsKHR::OPAQUE;
-            if cfg!(target_os = "android") {
-                if !capabilities.supported_usage_flags.contains(usage) {
-                    return Err(vk::Result::ERROR_FORMAT_NOT_SUPPORTED);
-                }
-                if capabilities
-                    .supported_usage_flags
-                    .contains(vk::ImageUsageFlags::TRANSFER_SRC)
-                    && self
-                        .instance
-                        .get_physical_device_format_properties(self.physical_device, format.format)
-                        .optimal_tiling_features
-                        .contains(vk::FormatFeatureFlags::BLIT_SRC)
-                {
-                    usage |= vk::ImageUsageFlags::TRANSFER_SRC;
-                }
-                // Android can advertise INHERIT as its only supported option.
-                composite_alpha = [
-                    vk::CompositeAlphaFlagsKHR::OPAQUE,
-                    vk::CompositeAlphaFlagsKHR::INHERIT,
-                    vk::CompositeAlphaFlagsKHR::PRE_MULTIPLIED,
-                    vk::CompositeAlphaFlagsKHR::POST_MULTIPLIED,
-                ]
-                .iter()
-                .copied()
-                .find(|alpha| capabilities.supported_composite_alpha.contains(*alpha))
-                .ok_or(vk::Result::ERROR_INITIALIZATION_FAILED)?;
-            } else {
-                usage |= vk::ImageUsageFlags::TRANSFER_SRC | vk::ImageUsageFlags::TRANSFER_DST;
+            if !capabilities.supported_usage_flags.contains(usage) {
+                return Err(vk::Result::ERROR_FORMAT_NOT_SUPPORTED);
             }
+            // Capture is optional; it must not prevent the window from opening.
+            if capabilities
+                .supported_usage_flags
+                .contains(vk::ImageUsageFlags::TRANSFER_SRC)
+                && self
+                    .instance
+                    .get_physical_device_format_properties(self.physical_device, format.format)
+                    .optimal_tiling_features
+                    .contains(vk::FormatFeatureFlags::BLIT_SRC)
+            {
+                usage |= vk::ImageUsageFlags::TRANSFER_SRC;
+            }
+            // Not every surface supports opaque compositing (e.g. Android).
+            let composite_alpha = [
+                vk::CompositeAlphaFlagsKHR::OPAQUE,
+                vk::CompositeAlphaFlagsKHR::INHERIT,
+                vk::CompositeAlphaFlagsKHR::PRE_MULTIPLIED,
+                vk::CompositeAlphaFlagsKHR::POST_MULTIPLIED,
+            ]
+            .iter()
+            .copied()
+            .find(|alpha| capabilities.supported_composite_alpha.contains(*alpha))
+            .ok_or(vk::Result::ERROR_INITIALIZATION_FAILED)?;
 
             self.release_swapchain_attachments();
             let old_swapchain = std::mem::replace(&mut self.swapchain, vk::SwapchainKHR::null());
@@ -1069,11 +1128,8 @@ impl VulkanContext {
                 self.destroy_swapchain();
                 return Err(error);
             }
-            #[cfg(target_os = "android")]
-            {
-                self.android_swapchain_can_capture =
-                    usage.contains(vk::ImageUsageFlags::TRANSFER_SRC);
-            }
+            self.swapchain_can_capture = usage.contains(vk::ImageUsageFlags::TRANSFER_SRC);
+            self.presentation_needs_recreate = false;
         }
         Ok(())
     }
@@ -1082,11 +1138,18 @@ impl VulkanContext {
         self.swapchain_images = self.swapchain_loader.get_swapchain_images(self.swapchain)?;
         self.swapchain_image_layouts =
             vec![vk::ImageLayout::UNDEFINED; self.swapchain_images.len()];
-        for &image in &self.swapchain_images {
+        let acquire_slots = if cfg!(target_os = "android") {
+            MAX_FRAMES_IN_FLIGHT
+        } else {
+            self.swapchain_images.len().max(MAX_FRAMES_IN_FLIGHT)
+        };
+        for _ in 0..acquire_slots {
             self.image_available.push(
                 self.device
                     .create_semaphore(&vk::SemaphoreCreateInfo::default(), None)?,
             );
+        }
+        for &image in &self.swapchain_images {
             self.render_finished.push(
                 self.device
                     .create_semaphore(&vk::SemaphoreCreateInfo::default(), None)?,
@@ -1106,22 +1169,14 @@ impl VulkanContext {
                 .push(self.device.create_image_view(&info, None)?);
         }
         let buffers = vk::CommandBufferAllocateInfo::builder()
-            .command_buffer_count(self.swapchain_images.len() as u32)
+            .command_buffer_count(MAX_FRAMES_IN_FLIGHT as u32)
             .command_pool(self.command_pool)
             .level(vk::CommandBufferLevel::PRIMARY);
         self.command_buffers = self.device.allocate_command_buffers(&buffers)?;
 
-        // The window depth image is never sampled or transferred. Do not
-        // require optional sampled-depth format support just to open a window.
         let vk::Extent2D { width, height } = self.swapchain_extent;
-        let params = TextureParams {
-            width,
-            height,
-            format: TextureFormat::Depth,
-            ..Default::default()
-        };
         self.default_depth = Texture {
-            texture: self.new_swapchain_depth_texture(params) as GLuint,
+            texture: self.try_new_swapchain_depth_texture()? as GLuint,
             width,
             height,
             format: TextureFormat::Depth,
@@ -1147,7 +1202,7 @@ impl VulkanContext {
         self.window_size = (0, 0);
         self.presentation_needs_recreate = false;
         self.swapchain_suboptimal = false;
-        self.android_surface_lost = false;
+        self.surface_lost = false;
     }
 
     /// Rebind a retained Android native window without replacing the device.
@@ -1163,20 +1218,7 @@ impl VulkanContext {
         let surface = unsafe {
             ash_window::create_surface(&self.entry, &self.instance, display, window, None)?
         };
-        let supports_present = unsafe {
-            self.surface_loader.get_physical_device_surface_support(
-                self.physical_device,
-                self.queue_family_index,
-                surface,
-            )
-        };
-        if !matches!(supports_present, Ok(true)) {
-            unsafe { self.surface_loader.destroy_surface(surface, None) };
-            return Err(supports_present
-                .err()
-                .unwrap_or(vk::Result::ERROR_INITIALIZATION_FAILED));
-        }
-        self.surface = surface;
+        self.attach_surface(surface)?;
         self.window_size = size;
         if !self.offscreen {
             match self.create_swapchain(size) {
@@ -1188,6 +1230,41 @@ impl VulkanContext {
             }
         }
         Ok(())
+    }
+
+    fn attach_surface(&mut self, surface: vk::SurfaceKHR) -> Result<(), vk::Result> {
+        unsafe {
+            let present = self.surface_loader.get_physical_device_surface_support(
+                self.physical_device,
+                self.queue_family_index,
+                surface,
+            );
+            if !matches!(present, Ok(true)) {
+                self.surface_loader.destroy_surface(surface, None);
+                return Err(present.err().unwrap_or(vk::Result::ERROR_INITIALIZATION_FAILED));
+            }
+        }
+        self.surface = surface;
+        Ok(())
+    }
+
+    /// Recover a lost desktop VkSurface without discarding application resources.
+    /// The native window itself is still owned by the same host event loop.
+    #[cfg(not(target_os = "android"))]
+    fn recreate_desktop_surface(&mut self) -> Result<(), vk::Result> {
+        if self.surface != vk::SurfaceKHR::null() {
+            self.wait_for_swapchain_idle()?;
+            self.destroy_swapchain();
+            unsafe { self.surface_loader.destroy_surface(self.surface, None) };
+            self.surface = vk::SurfaceKHR::null();
+        }
+        let (display, window) = self.desktop_window;
+        let surface = unsafe {
+            ash_window::create_surface(&self.entry, &self.instance, display, window, None)?
+        };
+        self.attach_surface(surface)?;
+        self.surface_lost = false;
+        self.recreate_swapchain()
     }
 
     pub fn texture_image_raw(&self, index: usize) -> u64 {
@@ -1454,10 +1531,87 @@ impl VulkanContext {
     /// caller's responsibility.
     pub(crate) fn drain_submissions(&mut self) {
         if let Some(worker) = &mut self.submission {
-            self.presentation_needs_recreate |= worker
-                .drain()
-                .expect("Failed to submit or present the frame");
+            let state = worker.drain().expect("Failed to submit or present the frame");
+            self.update_presentation(state);
         }
+    }
+
+    fn update_presentation(&mut self, state: submission::Presentation) {
+        use submission::Presentation;
+        match state {
+            Presentation::Ready => (),
+            Presentation::Recreate => self.presentation_needs_recreate = true,
+            Presentation::SurfaceLost => self.surface_lost = true,
+        }
+    }
+}
+
+/// Resolve a variable surface extent without turning a minimized window into a
+/// 1×1 swapchain. A fixed extent is authoritative unless the host is suspended.
+fn drawable_extent(
+    capabilities: &vk::SurfaceCapabilitiesKHR,
+    size: (u32, u32),
+) -> Option<vk::Extent2D> {
+    if size.0 == 0 || size.1 == 0 {
+        return None;
+    }
+    let extent = if capabilities.current_extent.width != u32::MAX {
+        capabilities.current_extent
+    } else {
+        let min = capabilities.min_image_extent;
+        let max = capabilities.max_image_extent;
+        if max.width == 0 || max.height == 0 {
+            return None;
+        }
+        vk::Extent2D {
+            width: size.0.clamp(min.width, max.width),
+            height: size.1.clamp(min.height, max.height),
+        }
+    };
+    (extent.width != 0 && extent.height != 0).then_some(extent)
+}
+
+#[cfg(test)]
+mod swapchain_tests {
+    use super::{drawable_extent, vk};
+
+    #[test]
+    fn no_swapchain_for_zero_extent() {
+        let capabilities = vk::SurfaceCapabilitiesKHR {
+            current_extent: vk::Extent2D {
+                width: 320,
+                height: 0,
+            },
+            ..Default::default()
+        };
+        assert!(drawable_extent(&capabilities, (0, 480)).is_none());
+        assert!(drawable_extent(&capabilities, (320, 480)).is_none());
+
+        let variable = vk::SurfaceCapabilitiesKHR {
+            current_extent: vk::Extent2D {
+                width: u32::MAX,
+                height: u32::MAX,
+            },
+            min_image_extent: vk::Extent2D {
+                width: 1,
+                height: 1,
+            },
+            max_image_extent: vk::Extent2D {
+                width: 0,
+                height: 0,
+            },
+            ..Default::default()
+        };
+        assert!(drawable_extent(&variable, (320, 480)).is_none());
+        let restored = vk::SurfaceCapabilitiesKHR {
+            max_image_extent: vk::Extent2D {
+                width: 1024,
+                height: 1024,
+            },
+            ..variable
+        };
+        let extent = drawable_extent(&restored, (320, 1280)).unwrap();
+        assert_eq!((extent.width, extent.height), (320, 1024));
     }
 }
 
@@ -1475,17 +1629,19 @@ pub(super) fn env_enabled(name: &str) -> bool {
 }
 
 pub(crate) fn create_fence(device: &Device) -> vk::Fence {
+    try_create_fence(device).expect("Failed to create a Vulkan frame fence")
+}
+
+fn try_create_fence(device: &Device) -> Result<vk::Fence, vk::Result> {
     unsafe {
-        device
-            .create_fence(
-                &vk::FenceCreateInfo::builder().flags(vk::FenceCreateFlags::SIGNALED),
-                None,
-            )
-            .unwrap()
+        device.create_fence(
+            &vk::FenceCreateInfo::builder().flags(vk::FenceCreateFlags::SIGNALED),
+            None,
+        )
     }
 }
 
-pub(crate) fn create_descriptor_pool(device: &Device) -> vk::DescriptorPool {
+fn create_descriptor_pool(device: &Device) -> Result<vk::DescriptorPool, vk::Result> {
     // A set is allocated per draw call and the pool is reset once per frame, so
     // the budget has to cover the busiest frame a scene can produce.
     const MAX_SETS_PER_FRAME: u32 = 1 << 16;
@@ -1504,7 +1660,7 @@ pub(crate) fn create_descriptor_pool(device: &Device) -> vk::DescriptorPool {
             .max_sets(MAX_SETS_PER_FRAME)
             .pool_sizes(&sizes)
             .flags(vk::DescriptorPoolCreateFlags::FREE_DESCRIPTOR_SET);
-        device.create_descriptor_pool(&info, None).unwrap()
+        device.create_descriptor_pool(&info, None)
     }
 }
 

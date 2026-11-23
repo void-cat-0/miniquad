@@ -17,7 +17,24 @@ Miniquad aims to provide a graphics abstraction that works the same way on any p
 * macOS, OpenGL 3, Metal;
 * iOS, GLES 2, GLES 3, Metal;
 * WASM, WebGL 1 - tested on iOS Safari, Firefox, Chrome;
-* Android, GLES 2, GLES 3.
+* Android, GLES 2, GLES 3, experimental Vulkan.
+
+### Optional Vulkan backend
+
+Build with `--features vulkan` and set `Conf.platform.rendering_backend` to
+`RenderingBackend::Vulkan` to require Vulkan or `RenderingBackend::VulkanPreferred`
+to try Vulkan on the actual window and use OpenGL/GLES if startup fails. Vulkan
+requires a 1.3 device with dynamic rendering, or Vulkan 1.2 with
+`VK_KHR_dynamic_rendering`. Android also needs a compatible system loader
+(normally Android 13 or newer) and driver. Vulkan builds require a C++ compiler
+for glslang.
+
+Vulkan supports offscreen MSAA with resolve attachments, but the default window
+framebuffer stays single-sampled and ignores `Platform.swap_interval`. Stencil
+attachments, cube maps and explicit mip uploads are not supported. Vulkan
+supports optional allocation through `try_new_rgba8_render_texture`, but does
+not implement the generic `try_new_render_texture` or `try_texture_resize`.
+Window capture is optional and depends on surface/format capabilities.
 
 ## Examples
 
@@ -180,7 +197,7 @@ cargo run --example quad --target x86_64-pc-windows-gnu
 
 * Ultimate type safety. Library should be entirely safe in Rust's definition of safe - no UB or memory unsafety. But correct GPU state is not type guaranteed. Feel free to provide safety abstraction in the user code then!
 
-* High-end API, like Vulkan/DirectX 12. Take a look on [gfx-rs](https://github.com/gfx-rs/gfx) or [vulkano](https://github.com/vulkano-rs/vulkano) instead!
+* Exposing the full feature set of Vulkan or DirectX 12. The Vulkan backend implements Miniquad's rendering interface, not a general Vulkan abstraction.
 
 # Platinum sponsors
 

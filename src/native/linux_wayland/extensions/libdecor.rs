@@ -30,14 +30,9 @@ pub struct libdecor_state {
 
 #[repr(C)]
 #[derive(Debug, Copy, Clone)]
-pub struct libdecor_error {
-    _unused: [u8; 0],
-}
-
-#[repr(C)]
-#[derive(Debug, Copy, Clone)]
 pub struct libdecor_interface {
-    pub error: unsafe extern "C" fn(*mut libdecor, *mut libdecor_error, *const c_char),
+    pub error: unsafe extern "C" fn(*mut libdecor, c_int, *const c_char),
+    pub reserved: [Option<unsafe extern "C" fn()>; 10],
 }
 
 #[repr(C)]
@@ -47,6 +42,10 @@ pub struct libdecor_frame_interface {
         unsafe extern "C" fn(*mut libdecor_frame, *mut libdecor_configuration, *mut c_void),
     pub close: unsafe extern "C" fn(*mut libdecor_frame, *mut c_void),
     pub commit: unsafe extern "C" fn(*mut libdecor_frame, *mut c_void),
+    pub dismiss_popup:
+        Option<unsafe extern "C" fn(*mut libdecor_frame, *const c_char, *mut c_void)>,
+    // Newer libdecor uses the first reserved pointer for an optional bounds callback.
+    pub reserved: [Option<unsafe extern "C" fn()>; 10],
 }
 
 use core::ffi::{c_char, c_int, c_void};
@@ -60,14 +59,18 @@ declare_module! {
     ...
     ...
     pub fn libdecor_new(*mut wl_display, *mut libdecor_interface) -> *mut libdecor,
+    pub fn libdecor_unref(*mut libdecor),
     pub fn libdecor_decorate(
         *mut libdecor,
         *mut wl_surface,
         *mut libdecor_frame_interface,
         *mut c_void
     ) -> *mut libdecor_frame,
+    pub fn libdecor_frame_unref(*mut libdecor_frame),
     pub fn libdecor_frame_set_app_id(*mut libdecor_frame, *const c_char),
     pub fn libdecor_frame_set_title(*mut libdecor_frame, *const c_char),
+    pub fn libdecor_frame_set_min_content_size(*mut libdecor_frame, c_int, c_int),
+    pub fn libdecor_frame_set_max_content_size(*mut libdecor_frame, c_int, c_int),
     pub fn libdecor_frame_set_capabilities(*mut libdecor_frame, c_int),
     pub fn libdecor_frame_unset_capabilities(*mut libdecor_frame, c_int),
     pub fn libdecor_frame_map(*mut libdecor_frame),

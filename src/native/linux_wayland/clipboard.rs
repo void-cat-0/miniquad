@@ -49,6 +49,9 @@ impl ClipboardContext {
         self.content.clear();
         self.content.push_str(data);
         let display: &mut WaylandPayload = &mut *self.display;
+        if display.data_device.is_null() {
+            return;
+        }
         // Wayland requires that only the window with focus can set the clipboard
         if let Some(serial) = display.keyboard_context.enter_serial {
             let data_source = self.new_data_source();

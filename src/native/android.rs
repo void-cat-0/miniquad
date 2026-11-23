@@ -9,7 +9,7 @@ use crate::{
 use std::{cell::RefCell, ptr::NonNull, sync::mpsc, thread, time::Duration};
 
 #[cfg(feature = "vulkan")]
-use {crate::graphics::vulkan::VulkanContext, ash::vk};
+use {crate::graphics::vulkan::VulkanContext, ash::vk, std::time::Instant};
 
 pub use crate::native::gl::{self, *};
 
@@ -156,6 +156,19 @@ pub unsafe fn console_error(msg: *const ::core::ffi::c_char) {
     );
 }
 
+#[cfg(feature = "vulkan")]
+pub(crate) fn warn_vulkan_fallback(error: &impl std::fmt::Display) {
+    let message = std::ffi::CString::new(format!("Vulkan startup failed ({error}); using GLES"))
+        .expect("Vulkan startup diagnostics contain no NUL bytes");
+    unsafe {
+        ndk_sys::__android_log_write(
+            ndk_sys::android_LogPriority_ANDROID_LOG_WARN as _,
+            b"SAPP\0".as_ptr() as _,
+            message.as_ptr(),
+        );
+    }
+}
+
 // fn log_info(message: &str) {
 //     use std::ffi::CString;
 
@@ -237,12 +250,63 @@ impl Drop for EglState {
     }
 }
 
+#[cfg(feature = "vulkan")]
+#[derive(Default)]
+struct SurfaceRetry {
+    deadline: Option<Instant>,
+    delay: Duration,
+}
+
+#[cfg(feature = "vulkan")]
+impl SurfaceRetry {
+    fn wait(&self, now: Instant) -> Duration {
+        self.deadline.map_or(Duration::ZERO, |deadline| {
+            deadline.saturating_duration_since(now)
+        })
+    }
+
+    fn postpone(&mut self, now: Instant) {
+        const INITIAL_DELAY: Duration = Duration::from_millis(16);
+        const MAX_DELAY: Duration = Duration::from_millis(250);
+        self.delay = (self.delay * 2).clamp(INITIAL_DELAY, MAX_DELAY);
+        self.deadline = Some(now + self.delay);
+    }
+}
+
+#[cfg(all(test, feature = "vulkan"))]
+mod tests {
+    use super::{Duration, Instant, SurfaceRetry};
+
+    #[test]
+    fn surface_retry_has_a_deadline_and_caps_backoff() {
+        let mut retry = SurfaceRetry::default();
+        let mut now = Instant::now();
+        assert_eq!(retry.wait(now), Duration::ZERO);
+        for millis in [16, 32, 64, 128, 250, 250] {
+            retry.postpone(now);
+            let delay = Duration::from_millis(millis);
+            assert_eq!(retry.wait(now), delay);
+            assert_eq!(
+                retry.wait(now + delay - Duration::from_millis(1)),
+                Duration::from_millis(1)
+            );
+            now += delay;
+            assert_eq!(retry.wait(now), Duration::ZERO);
+        }
+        retry = SurfaceRetry::default();
+        retry.postpone(now);
+        assert_eq!(retry.wait(now), Duration::from_millis(16));
+    }
+}
+
 struct MainThreadState {
     event_handler: Box<dyn EventHandler>,
     egl: Option<EglState>,
     window: Option<NativeWindow>,
     #[cfg(feature = "vulkan")]
     vulkan_surface_attached: bool,
+    #[cfg(feature = "vulkan")]
+    surface_retry: SurfaceRetry,
     #[cfg(feature = "vulkan")]
     window_size: (i32, i32),
     #[cfg(feature = "vulkan")]
@@ -277,30 +341,57 @@ impl MainThreadState {
             self.suspend_vulkan_surface();
         }
         self.window = None;
+        #[cfg(feature = "vulkan")]
+        {
+            self.window_size = (0, 0);
+            self.surface_retry = SurfaceRetry::default();
+        }
     }
 
     #[cfg(feature = "vulkan")]
-    fn attach_vulkan_surface(&mut self, size: (u32, u32)) {
-        if let Some(window) = &self.window {
-            match vulkan_context(self.event_handler.as_mut()).resume_android_surface(window, size) {
-                Ok(()) => {
-                    self.vulkan_surface_attached = true;
-                    crate::native_display().lock().unwrap().vulkan_window =
-                        Some(window.vulkan_handle());
-                }
-                Err(vk::Result::ERROR_SURFACE_LOST_KHR | vk::Result::ERROR_OUT_OF_DATE_KHR) => (),
-                Err(error) => panic!("Failed to attach Android Vulkan surface: {:?}", error),
+    fn has_live_vulkan_window(&self) -> bool {
+        self.egl.is_none()
+            && self.window.is_some()
+            && !self.paused
+            && self.window_size.0 > 0
+            && self.window_size.1 > 0
+    }
+
+    fn surface_retry_timeout(&self) -> Option<Duration> {
+        #[cfg(feature = "vulkan")]
+        if self.has_live_vulkan_window() && !self.vulkan_surface_attached {
+            return Some(self.surface_retry.wait(Instant::now()));
+        }
+        None
+    }
+
+    #[cfg(feature = "vulkan")]
+    fn retry_vulkan_surface(&mut self) {
+        if self.surface_retry_timeout() != Some(Duration::ZERO) {
+            return;
+        }
+        let window = self.window.as_ref().unwrap();
+        let (width, height) = self.window_size;
+        let size = (width as u32, height as u32);
+        match vulkan_context(self.event_handler.as_mut()).resume_android_surface(window, size) {
+            Ok(()) => {
+                self.vulkan_surface_attached = true;
+                self.update_requested = true;
+                crate::native_display().lock().unwrap().vulkan_window = Some(window.vulkan_handle());
             }
+            Err(
+                vk::Result::ERROR_SURFACE_LOST_KHR
+                | vk::Result::ERROR_OUT_OF_DATE_KHR
+                | vk::Result::ERROR_NATIVE_WINDOW_IN_USE_KHR,
+            ) => self.surface_retry.postpone(Instant::now()),
+            Err(error) => panic!("Failed to attach Android Vulkan surface: {:?}", error),
         }
     }
 
     fn waiting_for_vulkan_window(&self) -> bool {
         #[cfg(feature = "vulkan")]
         if self.egl.is_none() {
-            return self.paused
-                || !self.vulkan_surface_attached
-                || self.window_size.0 <= 0
-                || self.window_size.1 <= 0;
+            return !self.has_live_vulkan_window() || !self.vulkan_surface_attached;
         }
         false
     }
@@ -309,10 +400,6 @@ impl MainThreadState {
         match msg {
             Message::SurfaceCreated(window) => {
                 self.detach_window();
-                #[cfg(feature = "vulkan")]
-                {
-                    self.window_size = (0, 0);
-                }
                 if let Some(egl) = &mut self.egl {
                     unsafe { egl.attach(&window) };
                 }
@@ -334,9 +421,6 @@ impl MainThreadState {
                 #[cfg(feature = "vulkan")]
                 if self.egl.is_none() {
                     self.window_size = (width, height);
-                    if !self.vulkan_surface_attached && width > 0 && height > 0 {
-                        self.attach_vulkan_surface((width as u32, height as u32));
-                    }
                 }
                 self.update_requested = true;
                 self.event_handler.resize_event(width as _, height as _);
@@ -401,17 +485,10 @@ impl MainThreadState {
             Message::Resume => {
                 #[cfg(feature = "vulkan")]
                 {
-                    self.paused = false;
-                    // A surface lost on pause may come back without a fresh
-                    // SurfaceCreated event (the Activity kept the same view).
-                    let (width, height) = self.window_size;
-                    if self.egl.is_none()
-                        && !self.vulkan_surface_attached
-                        && width > 0
-                        && height > 0
-                    {
-                        self.attach_vulkan_surface((width as u32, height as u32));
+                    if self.paused {
+                        self.surface_retry = SurfaceRetry::default();
                     }
+                    self.paused = false;
                 }
                 self.update_requested = true;
                 if self.fullscreen {
@@ -445,6 +522,7 @@ impl MainThreadState {
         #[cfg(feature = "vulkan")]
         {
             if self.waiting_for_vulkan_window() {
+                self.update_requested = false;
                 self.event_handler.update();
                 return false;
             }
@@ -456,19 +534,30 @@ impl MainThreadState {
                     self.update_requested = false;
                     self.event_handler.update();
                     self.event_handler.draw();
-                    let context = vulkan_context(self.event_handler.as_mut());
-                    if !context.offscreen {
-                        // Present an acquired frame even if the handler did not
-                        // commit it. This is a no-op after commit_frame().
-                        context.present();
-                    }
-                    if context.android_window_needs_attention() {
+                    let needs_attention = {
+                        let context = vulkan_context(self.event_handler.as_mut());
+                        if !context.offscreen {
+                            // Present an acquired frame even if the handler did not
+                            // commit it. This is a no-op after commit_frame().
+                            context.present();
+                        }
+                        context.android_window_needs_attention()
+                    };
+                    if needs_attention {
                         self.update_requested = true;
                         return true;
                     }
+                    // A successful reattachment alone isn't proof of recovery:
+                    // if the next present loses the surface, keep backing off.
+                    self.surface_retry = SurfaceRetry::default();
                 }
                 Ok(false) => return true,
-                Err(vk::Result::ERROR_SURFACE_LOST_KHR) => self.suspend_vulkan_surface(),
+                Err(vk::Result::ERROR_SURFACE_LOST_KHR) => {
+                    // The VkSurface is stale, but the Java view can still own
+                    // the same NativeWindow. A real SurfaceDestroyed drops it.
+                    self.suspend_vulkan_surface();
+                    self.surface_retry.postpone(Instant::now());
+                }
                 Err(error) => panic!("Failed to prepare Android Vulkan frame: {:?}", error),
             }
         }
@@ -638,13 +727,16 @@ where
     }
 
     let f = SendHack(f);
-    let vulkan = conf.platform.rendering_backend == crate::conf::RenderingBackend::Vulkan;
 
     let (tx, rx) = mpsc::channel();
     let tx2 = tx.clone();
     MESSAGES_TX.with(move |messages_tx| *messages_tx.borrow_mut() = Some(tx2));
     #[cfg(feature = "vulkan")]
-    SYNC_SURFACE_DESTROY.with(|sync| sync.set(vulkan));
+    SYNC_SURFACE_DESTROY.with(|sync| {
+        // The runtime choice is not known on the Java thread. Wait for
+        // teardown whenever Vulkan may own the surface, including startup.
+        sync.set(conf.platform.rendering_backend != crate::conf::RenderingBackend::OpenGl);
+    });
 
     thread::spawn(move || {
         // Wait for a current native window and its first nonzero extent. A
@@ -673,7 +765,17 @@ where
         };
         let window = window.unwrap();
 
-        // EGL and a Vulkan surface cannot be connected to the same window.
+        // Commit to a backend before calling the event handler factory. EGL
+        // can attach to the same native window after a failed Vulkan attempt.
+        #[cfg(feature = "vulkan")]
+        let prepared = window.vulkan_handle().prepare(
+            conf.platform.rendering_backend,
+            (screen_width as u32, screen_height as u32),
+        );
+        #[cfg(feature = "vulkan")]
+        let vulkan = prepared.is_some();
+        #[cfg(not(feature = "vulkan"))]
+        let vulkan = false;
         let egl = if vulkan {
             None
         } else {
@@ -686,18 +788,27 @@ where
         crate::set_or_replace_display(NativeDisplayData {
             high_dpi: conf.high_dpi,
             blocking_event_loop: conf.platform.blocking_event_loop,
-            rendering_backend: conf.platform.rendering_backend,
+            rendering_backend: if vulkan {
+                crate::conf::RenderingBackend::Vulkan
+            } else {
+                crate::conf::RenderingBackend::OpenGl
+            },
             #[cfg(feature = "vulkan")]
             vulkan_window: vulkan.then(|| window.vulkan_handle()),
             ..NativeDisplayData::new(screen_width, screen_height, tx_fn, clipboard)
         });
 
+        let event_handler = f.call();
+        #[cfg(feature = "vulkan")]
+        drop(prepared);
         let mut s = MainThreadState {
             egl,
             window: Some(window),
-            event_handler: f.call(),
+            event_handler,
             #[cfg(feature = "vulkan")]
             vulkan_surface_attached: vulkan,
+            #[cfg(feature = "vulkan")]
+            surface_retry: SurfaceRetry::default(),
             #[cfg(feature = "vulkan")]
             window_size: (screen_width, screen_height),
             #[cfg(feature = "vulkan")]
@@ -729,7 +840,9 @@ where
                 || retry_vulkan
                 || (conf.platform.blocking_event_loop && !s.update_requested)
             {
-                let timeout = if retry_vulkan && !waiting_for_window {
+                let timeout = if let Some(retry) = s.surface_retry_timeout() {
+                    Some(rx_timeout.map_or(retry, |tick| tick.min(retry)))
+                } else if retry_vulkan && !waiting_for_window {
                     // Poll Vulkan without blocking on image acquisition while a
                     // Java lifecycle callback may be waiting for this thread.
                     Some(Duration::from_millis(8))
@@ -745,6 +858,13 @@ where
             while !s.quit {
                 let Ok(msg) = rx.try_recv() else { break };
                 s.process_message(msg);
+            }
+
+            // Drain lifecycle changes first so a queued pause or destruction
+            // cancels the retry before it can touch an old native window.
+            #[cfg(feature = "vulkan")]
+            if !s.quit && s.egl.is_none() {
+                s.retry_vulkan_surface();
             }
 
             if !s.quit && (!conf.platform.blocking_event_loop || s.update_requested) {

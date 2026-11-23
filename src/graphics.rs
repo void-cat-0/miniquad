@@ -499,9 +499,9 @@ pub(crate) enum TextureIdInner {
 pub struct TextureId(TextureIdInner);
 
 impl TextureId {
-    /// Wrap a raw platform texture without registering its storage. A raw name
-    /// does not carry Miniquad's size or format metadata and cannot be used for
-    /// size queries, resizing or pixel readback.
+    /// Wrap a raw platform texture for binding without registering its storage.
+    /// The caller keeps it alive. A raw name does not carry Miniquad's size or
+    /// format metadata and cannot be used for size queries or pixel readback.
     pub fn from_raw_id(raw_id: RawId) -> TextureId {
         TextureId(TextureIdInner::Raw(raw_id))
     }
@@ -1290,8 +1290,8 @@ pub trait RenderingBackend {
 
     fn info(&self) -> ContextInfo;
 
-    /// Maximum supported 2D texture dimension when the backend exposes it,
-    /// including any limit set when creating the backend.
+    /// Maximum supported 2D texture dimension when the backend exposes it.
+    /// Includes any limit set when creating the backend.
     fn max_texture_size(&self) -> Option<u32> {
         None
     }
@@ -1340,6 +1340,38 @@ pub trait RenderingBackend {
     fn try_new_render_texture(&mut self, _params: TextureParams) -> Option<TextureId> {
         None
     }
+    /// Choose one sample count for a color/resolve target and its optional depth
+    /// attachment. Backends that cannot resolve use a single sample.
+    fn render_target_sample_count(
+        &self,
+        _color: TextureFormat,
+        _depth: Option<TextureFormat>,
+        requested: i32,
+    ) -> i32 {
+        if self.info().features.resolve_attachments {
+            requested.max(1)
+        } else {
+            1
+        }
+    }
+    /// Whether the texture was allocated with the required color attachment
+    /// usage. Dimensions and sample count must still agree with the pass.
+    fn texture_supports_color_attachment(&self, texture: TextureId) -> bool {
+        let params = self.texture_params(texture);
+        params.kind == TextureKind::Texture2D
+            && !matches!(params.format, TextureFormat::Depth | TextureFormat::Depth32)
+    }
+    /// Try to allocate an uninitialized, single-sample RGBA8 render texture with
+    /// linear filtering, clamp-to-edge wrapping and no mipmaps. No GPU work is
+    /// submitted. Clear or write the texture before sampling or reading it back.
+    /// Returns None on unsupported backends or allocation failure.
+    fn try_new_rgba8_render_texture(&mut self, _width: u32, _height: u32) -> Option<TextureId> {
+        None
+    }
+    /// Make a sampleable color render texture ready for sampling in the current
+    /// frame. Call after ending its producing pass and before starting another
+    /// pass. Does not submit or wait for GPU work; a no-op without an active frame.
+    fn prepare_render_texture_for_sampling(&mut self, _texture: TextureId) {}
     fn new_texture_from_data_and_format(
         &mut self,
         bytes: &[u8],
@@ -1387,8 +1419,8 @@ pub trait RenderingBackend {
         self.texture_set_min_filter(texture, filter, mipmap_filter);
         self.texture_set_mag_filter(texture, filter);
     }
-    /// Copy the current window framebuffer into a texture. Backends with
-    /// explicit swapchain images override this instead of issuing GL calls.
+    /// Copy the current window framebuffer into a texture. An explicit backend
+    /// may require optional swapchain transfer support and a rendered frame.
     fn texture_grab_screen(&mut self, _texture: TextureId) {
         panic!("Framebuffer capture is unsupported by this backend");
     }
@@ -1408,11 +1440,13 @@ pub trait RenderingBackend {
     /// generated.
     fn texture_generate_mipmaps(&mut self, texture: TextureId);
     /// Resize managed storage, optionally supplying tightly packed level-zero
-    /// pixels. Panics if the backend rejects the resize.
+    /// pixels. On OpenGL, panics if the resize is rejected; use
+    /// [`Self::try_texture_resize`] when failure is recoverable.
     fn texture_resize(&mut self, texture: TextureId, width: u32, height: u32, bytes: Option<&[u8]>);
-    /// Resize managed storage without publishing a new size on failure.
-    /// Supplied pixel data must still cover the requested dimensions. Backends
-    /// without fallible resizing return `false` without changing the texture.
+    /// Resize a managed texture without panicking on allocation failure or
+    /// unsupported sizes. Returns false without publishing a new size on
+    /// failure. Backends without fallible resizing return false without changes.
+    /// Supplied pixel data must still cover the requested dimensions.
     fn try_texture_resize(
         &mut self,
         _texture: TextureId,
@@ -1542,7 +1576,9 @@ pub trait RenderingBackend {
     /// Delete GPU buffer, leaving handle unmodified.
     ///
     /// More high-level code on top of miniquad probably is going to call this in Drop
-    /// implementation of some more RAII buffer object.
+    /// implementation of some more RAII buffer object. Vulkan may release the
+    /// allocation after a frame completes. Callers submitting their own Vulkan
+    /// work must synchronize external uses of the buffer before deleting it.
     ///
     /// There is no protection against using deleted buffers later. However its not an UB in OpenGl
     /// and thats why this function is not marked as unsafe

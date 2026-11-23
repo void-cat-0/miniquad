@@ -158,6 +158,10 @@ pub mod window {
                 })
             };
             if let Some((handles, size)) = vulkan_window {
+                if let Some(mut context) = native::vulkan::take_prepared_context() {
+                    context.set_texture_size_limit(max_size);
+                    return Box::new(VulkanBackend::from_context(context));
+                }
                 // Win32 WSI may dispatch window messages synchronously.
                 let (display, window) = handles.handles();
                 return Box::new(VulkanBackend::with_texture_size_limit(
@@ -236,19 +240,17 @@ pub mod window {
     }
     /// Capture mouse cursor to the current window
     /// On WASM this will automatically hide cursor
-    /// On desktop this will bound cursor to windows border
+    /// On desktop this will bound cursor to windows border. No-op on Android.
     /// NOTICE: on desktop cursor will not be automatically released after window lost focus
     ///         so set_cursor_grab(false) on window's focus lost is recommended.
     /// TODO: implement window focus events
     pub fn set_cursor_grab(grab: bool) {
-        let d = native_display().lock().unwrap();
         #[cfg(target_os = "android")]
-        {
-            (d.native_requests)(native::Request::SetCursorGrab(grab));
-        }
+        let _ = grab;
 
         #[cfg(not(target_os = "android"))]
         {
+            let d = native_display().lock().unwrap();
             d.native_requests
                 .send(native::Request::SetCursorGrab(grab))
                 .unwrap();
@@ -540,6 +542,17 @@ pub fn start<F>(conf: conf::Conf, f: F)
 where
     F: 'static + FnOnce() -> Box<dyn EventHandler>,
 {
+    #[cfg(not(all(
+        feature = "vulkan",
+        any(windows, target_os = "android", all(target_os = "linux", not(target_env = "ohos")))
+    )))]
+    let conf = {
+        let mut conf = conf;
+        if conf.platform.rendering_backend == conf::RenderingBackend::VulkanPreferred {
+            conf.platform.rendering_backend = conf::RenderingBackend::OpenGl;
+        }
+        conf
+    };
     if conf.platform.rendering_backend == conf::RenderingBackend::Vulkan {
         assert!(
             cfg!(feature = "vulkan"),
@@ -574,7 +587,8 @@ where
                 if let Err(err) = native::linux_x11::run(&conf, f) {
                     eprintln!("{err:?}");
                     eprintln!("Failed to initialize through X11! Trying wayland instead");
-                    native::linux_wayland::run(&conf, f);
+                    native::linux_wayland::run(&conf, f)
+                        .expect("X11 and Wayland backends failed");
                 }
             }
             conf::LinuxBackend::WaylandWithX11Fallback => {

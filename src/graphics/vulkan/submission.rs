@@ -16,13 +16,21 @@
 
 use ash::{extensions::khr::Swapchain, vk, Device};
 use std::{
-    sync::mpsc::{self, Receiver, SyncSender},
+    sync::mpsc::{self, Receiver, SyncSender, TryRecvError},
     thread::{self, JoinHandle},
 };
 
 use super::MAX_FRAMES_IN_FLIGHT;
 
-type PresentResult = Result<bool, vk::Result>;
+/// Ordered by recovery work required so several worker outcomes can be merged.
+#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
+pub(super) enum Presentation {
+    Ready,
+    Recreate,
+    SurfaceLost,
+}
+
+type PresentResult = Result<Presentation, vk::Result>;
 type AcquireResult = Result<Option<PreparedImage>, vk::Result>;
 
 #[derive(Debug, PartialEq)]
@@ -125,9 +133,12 @@ impl FrameSubmission {
                 "Vulkan::queue_present"
             ));
             match swapchain.queue_present(queue, &present) {
-                Ok(suboptimal) => Ok(suboptimal && !cfg!(target_os = "android")),
-                Err(vk::Result::ERROR_OUT_OF_DATE_KHR) => Ok(true),
-                Err(vk::Result::SUBOPTIMAL_KHR) => Ok(!cfg!(target_os = "android")),
+                Ok(true) | Err(vk::Result::SUBOPTIMAL_KHR) if !cfg!(target_os = "android") => {
+                    Ok(Presentation::Recreate)
+                }
+                Ok(_) | Err(vk::Result::SUBOPTIMAL_KHR) => Ok(Presentation::Ready),
+                Err(vk::Result::ERROR_OUT_OF_DATE_KHR) => Ok(Presentation::Recreate),
+                Err(vk::Result::ERROR_SURFACE_LOST_KHR) => Ok(Presentation::SurfaceLost),
                 Err(error) => Err(error),
             }
         }
@@ -152,7 +163,8 @@ impl SubmissionWorker {
         let device = device.clone();
         let swapchain = swapchain.clone();
         let mut worker =
-            Self::spawn(move |frame, prepared| frame.execute(&device, &swapchain, queue, prepared));
+            Self::spawn(move |frame, prepared| frame.execute(&device, &swapchain, queue, prepared))
+                .ok()?;
         worker.preacquire = super::env_enabled("PRPR_VULKAN_PREACQUIRE");
         Some(worker)
     }
@@ -161,7 +173,7 @@ impl SubmissionWorker {
         mut execute: impl FnMut(FrameSubmission, &mut dyn FnMut(AcquireResult)) -> PresentResult
             + Send
             + 'static,
-    ) -> Self {
+    ) -> std::io::Result<Self> {
         let (requests, receiver) = mpsc::sync_channel::<FrameSubmission>(MAX_FRAMES_IN_FLIGHT);
         let (completed, completion_receiver) = mpsc::channel();
         let thread = thread::Builder::new()
@@ -186,9 +198,8 @@ impl SubmissionWorker {
                     // queued requests before releasing the device references.
                     let _ = completed.send(SubmissionEvent::Completed(slot, result));
                 }
-            })
-            .expect("Failed to create the Vulkan submission thread");
-        Self {
+            })?;
+        Ok(Self {
             requests: Some(requests),
             completed: completion_receiver,
             pending: [false; MAX_FRAMES_IN_FLIGHT],
@@ -196,7 +207,7 @@ impl SubmissionWorker {
             acquiring: false,
             prepared: None,
             thread: Some(thread),
-        }
+        })
     }
 
     pub fn preacquire_enabled(&self) -> bool {
@@ -239,9 +250,12 @@ impl SubmissionWorker {
                 match result {
                     Ok(image) => {
                         self.prepared = image;
-                        Ok(false)
+                        Ok(Presentation::Ready)
                     }
-                    Err(vk::Result::ERROR_OUT_OF_DATE_KHR | vk::Result::SUBOPTIMAL_KHR) => Ok(true),
+                    Err(vk::Result::ERROR_OUT_OF_DATE_KHR | vk::Result::SUBOPTIMAL_KHR) => {
+                        Ok(Presentation::Recreate)
+                    }
+                    Err(vk::Result::ERROR_SURFACE_LOST_KHR) => Ok(Presentation::SurfaceLost),
                     Err(error) => Err(error),
                 }
             }
@@ -249,26 +263,40 @@ impl SubmissionWorker {
     }
 
     fn wait_while(&mut self, pending: impl Fn(&Self) -> bool) -> PresentResult {
-        let mut recreate = false;
+        let mut state = Presentation::Ready;
         while pending(self) {
             let event = self
                 .completed
                 .recv()
                 .expect("Vulkan submission thread stopped");
-            recreate |= self.complete(event)?;
+            state = state.max(self.complete(event)?);
         }
-        Ok(recreate)
+        Ok(state)
     }
 
-    /// Wait only for submission and nonblocking acquisition, leaving the
-    /// current present call free to run while the context records next frame.
-    pub fn wait_prepared(&mut self) -> Result<(Option<PreparedImage>, bool), vk::Result> {
-        #[cfg(feature = "tracy")]
-        let _span = crate::tracy::span(crate::tracy::span_location!(
-            "Vulkan::submit_wait_prepared (wall time)"
-        ));
-        let recreate = self.wait_while(|worker| worker.acquiring)?;
-        Ok((self.prepared.take(), recreate))
+    /// Consume results already available without stalling native event handling.
+    pub fn poll(&mut self) -> PresentResult {
+        let mut state = Presentation::Ready;
+        loop {
+            match self.completed.try_recv() {
+                Ok(event) => state = state.max(self.complete(event)?),
+                Err(TryRecvError::Empty) => return Ok(state),
+                Err(TryRecvError::Disconnected) => panic!("Vulkan submission thread stopped"),
+            }
+        }
+    }
+
+    pub fn frame_ready(&self, slot: usize, recreate: bool) -> bool {
+        if self.acquiring || self.pending[slot] {
+            return false;
+        }
+        // Recording with a preacquired image can overlap present; rebuilding
+        // or acquiring through the host requires exclusive swapchain access.
+        (!recreate && self.prepared.is_some()) || !self.pending.iter().any(|&pending| pending)
+    }
+
+    pub fn take_prepared(&mut self) -> Option<PreparedImage> {
+        self.prepared.take()
     }
 
     pub fn wait_slot(&mut self, slot: usize) -> PresentResult {
@@ -287,11 +315,11 @@ impl SubmissionWorker {
         let _span = crate::tracy::span_with_callstack(crate::tracy::span_location!(
             "Vulkan::submit_drain (wall time)"
         ));
-        let mut recreate = false;
+        let mut state = Presentation::Ready;
         for slot in 0..MAX_FRAMES_IN_FLIGHT {
-            recreate |= self.wait_slot(slot)?;
+            state = state.max(self.wait_slot(slot)?);
         }
-        Ok(recreate)
+        Ok(state)
     }
 }
 

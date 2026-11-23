@@ -150,6 +150,7 @@ crate::declare_module! {
 pub enum EglError {
     NoDisplay,
     InitializeFailed,
+    NoWindowConfig,
     CreateContextFailed,
 }
 
@@ -158,7 +159,8 @@ impl Display for EglError {
         match self {
             Self::NoDisplay => write!(f, "No display"),
             Self::InitializeFailed => write!(f, "Failed to initialize context"),
-            Self::CreateContextFailed => write!(f, "Faild to create context"),
+            Self::NoWindowConfig => write!(f, "No matching EGL window configuration"),
+            Self::CreateContextFailed => write!(f, "Failed to create context"),
         }
     }
 }
@@ -184,6 +186,11 @@ pub unsafe fn create_egl_context(
     }
 
     let alpha_size = if alpha { 8 } else { 0 };
+    let samples = if sample_count > 1 {
+        sample_count as u32
+    } else {
+        0
+    };
     #[rustfmt::skip]
     let cfg_attributes = [
         EGL_SURFACE_TYPE, EGL_WINDOW_BIT,
@@ -193,26 +200,28 @@ pub unsafe fn create_egl_context(
         EGL_ALPHA_SIZE, alpha_size,
         EGL_DEPTH_SIZE, 16,
         EGL_STENCIL_SIZE, 0,
-        EGL_SAMPLES, sample_count as u32,
+        EGL_SAMPLES, samples,
         EGL_NONE,
     ];
-    let mut available_cfgs: Vec<EGLConfig> = vec![null_mut(); 32];
+    let mut available_cfgs: [EGLConfig; 32] = [null_mut(); 32];
     let mut cfg_count = 0;
-
-    (egl.eglChooseConfig)(
+    if (egl.eglChooseConfig)(
         display,
         cfg_attributes.as_ptr() as _,
-        available_cfgs.as_ptr() as _,
-        32,
-        &mut cfg_count as *mut _ as *mut _,
-    );
-    assert!(cfg_count > 0);
-    assert!(cfg_count <= 32);
+        available_cfgs.as_mut_ptr(),
+        available_cfgs.len() as EGLint,
+        &mut cfg_count,
+    ) == 0
+        || cfg_count == 0
+    {
+        (egl.eglTerminate)(display);
+        return Err(EglError::NoWindowConfig);
+    }
 
     // find config with 8-bit rgb buffer if available, ndk sample does not trust egl spec
     let mut config: EGLConfig = null_mut();
     let mut exact_cfg_found = false;
-    for c in &mut available_cfgs[0..cfg_count] {
+    for c in &available_cfgs[..cfg_count as usize] {
         let mut r: i32 = 0;
         let mut g: i32 = 0;
         let mut b: i32 = 0;
@@ -245,6 +254,7 @@ pub unsafe fn create_egl_context(
         ctx_attributes.as_ptr() as _,
     );
     if context.is_null() {
+        (egl.eglTerminate)(display);
         return Err(EglError::CreateContextFailed);
     }
 

@@ -165,6 +165,8 @@ enum GlApi {
 struct TransferCaps {
     api: GlApi,
     split_framebuffers: bool,
+    #[cfg(not(target_arch = "wasm32"))]
+    query_renderbuffer_samples: bool,
     pack_subimage: bool,
     unpack_subimage: bool,
     pixel_buffers: bool,
@@ -238,6 +240,8 @@ impl TransferCaps {
             split_framebuffers: modern
                 || (desktop
                     && (has("GL_ARB_framebuffer_object") || has("GL_EXT_framebuffer_blit"))),
+            #[cfg(not(target_arch = "wasm32"))]
+            query_renderbuffer_samples: (gles && modern) || (desktop && version >= (4, 2)),
             pack_subimage: desktop || modern || has("GL_NV_pack_subimage"),
             unpack_subimage: desktop || modern || has("GL_EXT_unpack_subimage"),
             pixel_buffers: modern
@@ -307,6 +311,26 @@ impl TransferCaps {
             },
             _ => format.into(),
         })
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    fn renderbuffer_sample_counts(&self, format: TextureFormat) -> Vec<GLint> {
+        let format = self.renderbuffer_format(format).unwrap();
+        unsafe {
+            let mut len = 0;
+            glGetInternalformativ(GL_RENDERBUFFER, format, GL_NUM_SAMPLE_COUNTS, 1, &mut len);
+            let mut counts = vec![0; len as usize];
+            if len != 0 {
+                glGetInternalformativ(
+                    GL_RENDERBUFFER,
+                    format,
+                    GL_SAMPLES,
+                    len,
+                    counts.as_mut_ptr(),
+                );
+            }
+            counts
+        }
     }
 
     fn renderbuffer_format(&self, format: TextureFormat) -> Result<GLenum, &'static str> {
@@ -751,7 +775,6 @@ impl Texture {
             );
             #[cfg(not(target_arch = "wasm32"))]
             {
-                params.sample_count = 0;
                 glGetRenderbufferParameteriv(
                     GL_RENDERBUFFER,
                     GL_RENDERBUFFER_SAMPLES,
@@ -1107,11 +1130,6 @@ impl GlContext {
     ) -> Result<TextureId, String> {
         if access != TextureAccess::RenderTarget || !self.info.features.resolve_attachments {
             params.sample_count = 1;
-        } else if params.sample_count > 1 {
-            params.sample_count = params
-                .sample_count
-                .min(unsafe { gl_integer(GL_MAX_SAMPLES) })
-                .max(1);
         }
         let texture = if params.sample_count > 1 {
             if params.kind == TextureKind::CubeMap {
@@ -1507,6 +1525,32 @@ impl RenderingBackend for GlContext {
     fn try_new_render_texture(&mut self, params: TextureParams) -> Option<TextureId> {
         self.allocate_texture(TextureAccess::RenderTarget, TextureSource::Empty, params)
             .ok()
+    }
+
+    fn render_target_sample_count(
+        &self,
+        _color: TextureFormat,
+        _depth: Option<TextureFormat>,
+        requested: i32,
+    ) -> i32 {
+        if requested <= 1 || !self.info.features.resolve_attachments {
+            return 1;
+        }
+        #[cfg(not(target_arch = "wasm32"))]
+        if self.transfer_caps.query_renderbuffer_samples {
+            let color = self.transfer_caps.renderbuffer_sample_counts(_color);
+            let depth = _depth.map(|format| self.transfer_caps.renderbuffer_sample_counts(format));
+            // glGetInternalformativ returns sample counts in descending order.
+            return color
+                .into_iter()
+                .find(|count| {
+                    *count <= requested && depth.as_ref().map_or(true, |d| d.contains(count))
+                })
+                .unwrap_or(1);
+        }
+        // Legacy desktop GL and the current JS host cannot query per-format
+        // counts. The driver may round a request up to its next supported count.
+        requested.min(unsafe { gl_integer(GL_MAX_SAMPLES) }).max(1)
     }
 
     fn delete_texture(&mut self, texture: TextureId) {

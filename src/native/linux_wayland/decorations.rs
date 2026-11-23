@@ -75,27 +75,57 @@ impl Decorations {
         }
     }
 
-    pub(super) unsafe fn set_title(
-        &mut self,
+    pub(super) unsafe fn configure_toplevel(
+        &self,
         client: &mut LibWaylandClient,
-        xdg_toplevel: *mut xdg_toplevel,
-        title: &str,
+        toplevel: *mut xdg_toplevel,
+        conf: &crate::conf::Conf,
     ) {
-        let title = std::ffi::CString::new(title).unwrap();
+        let title = std::ffi::CString::new(conf.window_title.as_str()).unwrap();
+        let app_id = std::ffi::CString::new(conf.platform.linux_wm_class).unwrap();
         match self {
-            Decorations::None | Decorations::Server | Decorations::Fallback(..) => {
-                wl_request!(
-                    client,
-                    xdg_toplevel,
-                    extensions::xdg_shell::xdg_toplevel::set_title,
-                    title.as_ptr()
-                );
-            }
-            Decorations::LibDecor {
-                libdecor, frame, ..
-            } => {
+            Decorations::LibDecor { libdecor, frame, .. } => {
+                // Libdecor can create its xdg_toplevel asynchronously. These
+                // frame setters also work before that protocol object exists.
                 (libdecor.libdecor_frame_set_title)(*frame, title.as_ptr());
+                (libdecor.libdecor_frame_set_app_id)(*frame, app_id.as_ptr());
+                if !conf.window_resizable {
+                    (libdecor.libdecor_frame_set_min_content_size)(
+                        *frame,
+                        conf.window_width,
+                        conf.window_height,
+                    );
+                    (libdecor.libdecor_frame_set_max_content_size)(
+                        *frame,
+                        conf.window_width,
+                        conf.window_height,
+                    );
+                }
             }
+            Decorations::None | Decorations::Server | Decorations::Fallback(..) => {
+                wl_request!(client, toplevel, xdg_toplevel::set_title, title.as_ptr());
+                wl_request!(client, toplevel, xdg_toplevel::set_app_id, app_id.as_ptr());
+                if !conf.window_resizable {
+                    for set_size in [xdg_toplevel::set_max_size, xdg_toplevel::set_min_size] {
+                        wl_request!(
+                            client,
+                            toplevel,
+                            set_size,
+                            conf.window_width,
+                            conf.window_height
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    pub(super) unsafe fn map_libdecor_frame(&self) -> bool {
+        if let Decorations::LibDecor { libdecor, frame, .. } = self {
+            (libdecor.libdecor_frame_map)(*frame);
+            true
+        } else {
+            false
         }
     }
 
@@ -140,14 +170,19 @@ impl Decorations {
     unsafe fn try_libdecor(display: &mut WaylandPayload, resizable: bool) -> Self {
         if let Ok(libdecor) = LibDecor::try_load() {
             let context = (libdecor.libdecor_new)(display.display, &raw mut LIBDECOR_INTERFACE);
+            if context.is_null() {
+                return Decorations::none(display);
+            }
             let frame = (libdecor.libdecor_decorate)(
                 context,
                 display.surface,
                 &raw mut LIBDECOR_FRAME_INTERFACE,
                 display as *mut _ as _,
             );
-            (libdecor.libdecor_frame_map)(frame);
-            display.xdg_toplevel = (libdecor.libdecor_frame_get_xdg_toplevel)(frame);
+            if frame.is_null() {
+                (libdecor.libdecor_unref)(context);
+                return Decorations::none(display);
+            }
             use extensions::libdecor::LIBDECOR_ACTION_RESIZE as RESIZE;
             if resizable {
                 (libdecor.libdecor_frame_set_capabilities)(frame, RESIZE);
@@ -164,7 +199,7 @@ impl Decorations {
         }
     }
 
-    fn libdecor(&mut self) -> Option<&mut LibDecor> {
+    fn libdecor(&self) -> Option<&LibDecor> {
         if let Decorations::LibDecor { libdecor, .. } = self {
             Some(libdecor)
         } else {
@@ -187,13 +222,11 @@ unsafe extern "C" fn xdg_surface_handle_configure(
         extensions::xdg_shell::xdg_surface::ack_configure,
         serial
     );
-    wl_request!(payload.client, payload.surface, WL_SURFACE_COMMIT)
+    wl_request!(payload.client, payload.surface, WL_SURFACE_COMMIT);
+    payload.surface_configured = true;
 }
 
-unsafe extern "C" fn handle_configure(data: *mut std::ffi::c_void, width: i32, height: i32) {
-    assert!(!data.is_null());
-    let payload: &mut WaylandPayload = &mut *(data as *mut _);
-
+unsafe fn handle_configure(payload: &mut WaylandPayload, width: i32, height: i32) {
     if width != 0 && height != 0 {
         let d = crate::native_display().lock().unwrap();
         // Currently non-integer scales are not supported
@@ -210,26 +243,22 @@ unsafe extern "C" fn handle_configure(data: *mut std::ffi::c_void, width: i32, h
                 (fallback::Decorations::BAR_HEIGHT + fallback::Decorations::WIDTH) * dpi_scale;
             fallback.resize(&mut payload.client, width, height);
         }
-        let (screen_width, screen_height) = {
+        // The drawable is the content surface, not the xdg geometry including
+        // fallback decoration subsurfaces. This also applies to EGL fallback.
+        let width = window_width.max(dpi_scale);
+        let height = window_height.max(dpi_scale);
+        {
             let mut d = crate::native_display().lock().unwrap();
-            // Fallback decoration subsurfaces are included in xdg window
-            // geometry. Vulkan renders into the content surface alone.
-            let size = if d.rendering_backend == crate::conf::RenderingBackend::Vulkan {
-                (window_width.max(dpi_scale), window_height.max(dpi_scale))
-            } else {
-                (screen_width, screen_height)
-            };
-            d.screen_width = size.0;
-            d.screen_height = size.1;
-            size
-        };
-        if let Some(egl) = &payload.egl {
-            (egl.wl_egl_window_resize)(payload.egl_window, window_width, window_height, 0, 0);
+            d.screen_width = width;
+            d.screen_height = height;
+        }
+        if !payload.egl_window.is_null() {
+            let egl = payload.egl.as_ref().unwrap();
+            (egl.wl_egl_window_resize)(payload.egl_window, width, height, 0, 0);
         }
         // We need to ensure that the buffer has been correctly resized before setting the
         // dpi_scale, since Wayland would rather crash than letting you have a width that's an
         // odd number on a display with 2x dpi...
-        (payload.client.wl_display_dispatch_pending)(payload.display);
         wl_request!(
             payload.client,
             payload.surface,
@@ -240,13 +269,11 @@ unsafe extern "C" fn handle_configure(data: *mut std::ffi::c_void, width: i32, h
         // probably don't want to fire the resize event for every one of them
         // So if we still have a Resize event in the queue, instead of pushing a new one, we batch
         // them by modifying the dimension
-        if let Some(WaylandEvent::Resize(width, height)) = payload.events.last_mut() {
-            *width = screen_width as _;
-            *height = screen_height as _;
+        let resize = WaylandEvent::Resize(width as _, height as _);
+        if let Some(last @ WaylandEvent::Resize(..)) = payload.events.last_mut() {
+            *last = resize;
         } else {
-            payload
-                .events
-                .push(WaylandEvent::Resize(screen_width as _, screen_height as _));
+            payload.events.push(resize);
         }
     }
 }
@@ -258,7 +285,8 @@ unsafe extern "C" fn xdg_toplevel_handle_configure(
     height: i32,
     _states: *mut wl_array,
 ) {
-    handle_configure(data, width, height);
+    assert!(!data.is_null());
+    handle_configure(&mut *(data as *mut WaylandPayload), width, height);
 }
 
 unsafe extern "C" fn libdecor_frame_handle_configure(
@@ -268,6 +296,7 @@ unsafe extern "C" fn libdecor_frame_handle_configure(
 ) {
     let display: &mut WaylandPayload = &mut *(data as *mut _);
     let libdecor = display.decorations.libdecor().unwrap();
+    display.xdg_toplevel = (libdecor.libdecor_frame_get_xdg_toplevel)(frame);
 
     let mut width: c_int = 0;
     let mut height: c_int = 0;
@@ -278,6 +307,8 @@ unsafe extern "C" fn libdecor_frame_handle_configure(
         &mut width,
         &mut height,
     ) == 0
+        || width <= 0
+        || height <= 0
     {
         let d = crate::native_display().lock().unwrap();
         let dpi_scale = d.dpi_scale as i32;
@@ -288,7 +319,9 @@ unsafe extern "C" fn libdecor_frame_handle_configure(
     (libdecor.libdecor_frame_commit)(frame, state, configuration);
     (libdecor.libdecor_state_free)(state);
 
-    handle_configure(data, width, height);
+    handle_configure(display, width, height);
+    // libdecor_frame_commit acknowledges this configure on our behalf.
+    display.surface_configured = true;
 }
 
 unsafe extern "C" fn xdg_toplevel_handle_close(
@@ -302,11 +335,16 @@ unsafe extern "C" fn libdecor_frame_handle_close(_frame: *mut libdecor_frame, _d
     crate::native_display().try_lock().unwrap().quit_requested = true;
 }
 
-unsafe extern "C" fn libdecor_frame_handle_commit(_frame: *mut libdecor_frame, _data: *mut c_void) {
+unsafe extern "C" fn libdecor_frame_handle_commit(_frame: *mut libdecor_frame, data: *mut c_void) {
+    let display: &mut WaylandPayload = &mut *(data as *mut _);
+    if display.surface_configured {
+        // Apply changes to decoration subsurfaces even with no application redraw.
+        wl_request!(display.client, display.surface, WL_SURFACE_COMMIT);
+    }
 }
 unsafe extern "C" fn libdecor_handle_error(
     _context: *mut libdecor,
-    _error: *mut libdecor_error,
+    _error: c_int,
     message: *const c_char,
 ) {
     let message = core::ffi::CStr::from_ptr(message).to_str().unwrap();
@@ -314,11 +352,14 @@ unsafe extern "C" fn libdecor_handle_error(
 }
 static mut LIBDECOR_INTERFACE: libdecor_interface = libdecor_interface {
     error: libdecor_handle_error,
+    reserved: [None; 10],
 };
 static mut LIBDECOR_FRAME_INTERFACE: libdecor_frame_interface = libdecor_frame_interface {
     configure: libdecor_frame_handle_configure,
     close: libdecor_frame_handle_close,
     commit: libdecor_frame_handle_commit,
+    dismiss_popup: None,
+    reserved: [None; 10],
 };
 static mut XDG_TOPLEVEL_LISTENER: xdg_toplevel_listener = xdg_toplevel_listener {
     configure: xdg_toplevel_handle_configure,

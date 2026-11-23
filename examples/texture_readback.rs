@@ -1,4 +1,4 @@
-//! Desktop OpenGL 3.3+ texture allocation and transfer regression: `cargo run --example texture_readback`.
+//! Desktop OpenGL 3.3+ transfer regression: `cargo run --example texture_readback`.
 
 #[cfg(not(target_arch = "wasm32"))]
 fn main() {
@@ -128,7 +128,8 @@ fn check_transfers(ctx: &mut dyn miniquad::RenderingBackend) {
     assert_eq!(&bytes[..6], &[1, 2, 3, 7, 8, 9]);
     check_state();
 
-    // New allocations do not inherit an unrelated error from earlier GL work.
+    // A fresh object has no previous storage to preserve. Do not confuse an
+    // older GL error with a failure of the new allocation.
     unsafe { glBindTexture(GL_NONE, 0) };
     let fresh = ctx.new_texture_from_rgba8(1, 1, &[37; 4]);
     check_state();
@@ -207,12 +208,37 @@ fn check_transfers(ctx: &mut dyn miniquad::RenderingBackend) {
 #[cfg(not(target_arch = "wasm32"))]
 fn check_resolves(ctx: &mut dyn miniquad::RenderingBackend) {
     use miniquad::{gl::*, PassAction, TextureFormat, TextureParams};
+    use std::panic::{catch_unwind, AssertUnwindSafe};
 
     let params = TextureParams {
         width: 2,
         height: 2,
         ..Default::default()
     };
+    if ctx.info().features.resolve_attachments {
+        // Valid dimensions, but the driver's allocation call must reject too many samples.
+        let mut foreign_renderbuffer = 0;
+        let mut max_samples = 0;
+        unsafe {
+            glGenRenderbuffers(1, &mut foreign_renderbuffer);
+            glBindRenderbuffer(GL_RENDERBUFFER, foreign_renderbuffer);
+            glGetIntegerv(GL_MAX_SAMPLES, &mut max_samples);
+        }
+        assert!(catch_unwind(AssertUnwindSafe(|| {
+            ctx.new_render_texture(TextureParams {
+                sample_count: max_samples + 1,
+                ..params
+            })
+        }))
+        .is_err());
+        unsafe {
+            let mut binding = 0;
+            glGetIntegerv(GL_RENDERBUFFER_BINDING, &mut binding);
+            assert_eq!(binding, foreign_renderbuffer as GLint);
+            assert_eq!(glGetError(), GL_NO_ERROR);
+            glDeleteRenderbuffers(1, &foreign_renderbuffer);
+        }
+    }
     let resolved = [
         ctx.new_render_texture(params),
         ctx.new_render_texture(params),
@@ -221,9 +247,7 @@ fn check_resolves(ctx: &mut dyn miniquad::RenderingBackend) {
     assert_eq!(ctx.render_pass_resolve_texture(pass), None);
     ctx.delete_render_pass(pass);
 
-    let mut max_samples = 0;
-    unsafe { glGetIntegerv(GL_MAX_SAMPLES, &mut max_samples) };
-    let sample_count = 4.min(max_samples);
+    let sample_count = ctx.render_target_sample_count(params.format, Some(TextureFormat::Depth), 4);
     if sample_count > 1 {
         let params = TextureParams {
             sample_count,

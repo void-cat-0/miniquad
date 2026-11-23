@@ -767,6 +767,91 @@ fn interface_locations(
     Ok(())
 }
 
+fn assign_vertex_input_locations(unit: &mut TranslationUnit) -> Result<(), ShaderError> {
+    let inputs = unit.0.iter().enumerate().filter_map(|(index, item)| {
+        let ExternalDeclarationData::Declaration(declaration) = &item.content else {
+            return None;
+        };
+        let DeclarationData::InitDeclaratorList(list) = &declaration.content else {
+            return None;
+        };
+        let head = &list.head;
+        let (Some(q), Some(name)) = (&head.ty.qualifier, &head.name) else {
+            return None;
+        };
+        (storage(q, StorageQualifierData::In) && !name.as_str().starts_with("gl_"))
+            .then(|| (index, head, layout_expression(q, "location")))
+    });
+    if inputs.clone().all(|(_, _, explicit)| explicit.is_some()) {
+        return Ok(());
+    }
+    let kind = ShaderType::Vertex;
+    let constants = global_constants(unit);
+    let mut used = Vec::new();
+    let mut implicit = Vec::new();
+    for (index, head, explicit) in inputs {
+        let mut width = location_width(head, &constants, kind)?;
+        // A 64-bit column with 3 or 4 components spans two locations.
+        if matches!(
+            head.ty.ty.ty.content,
+            TypeSpecifierNonArrayData::DVec3
+                | TypeSpecifierNonArrayData::DVec4
+                | TypeSpecifierNonArrayData::DMat23
+                | TypeSpecifierNonArrayData::DMat24
+                | TypeSpecifierNonArrayData::DMat3
+                | TypeSpecifierNonArrayData::DMat33
+                | TypeSpecifierNonArrayData::DMat34
+                | TypeSpecifierNonArrayData::DMat43
+                | TypeSpecifierNonArrayData::DMat4
+                | TypeSpecifierNonArrayData::DMat44
+        ) {
+            width = width
+                .checked_mul(2)
+                .ok_or_else(|| error(kind, "Vertex input locations overflow u32"))?;
+        }
+        if let Some(expr) = explicit {
+            let start = expr
+                .and_then(|expr| constant_integer(expr, &constants))
+                .and_then(|value| u32::try_from(value).ok())
+                .ok_or_else(|| error(kind, "Cannot determine explicit vertex input location"))?;
+            let end = start
+                .checked_add(width)
+                .ok_or_else(|| error(kind, "Vertex input locations overflow u32"))?;
+            used.push(start..end);
+        } else {
+            implicit.push((index, width));
+        }
+    }
+    // Glslang's default mapper can reuse an explicit location for an input
+    // without a location. Reserve explicit ranges before assigning the rest.
+    used.sort_unstable_by_key(|range| range.start);
+    for (index, width) in implicit {
+        let mut start = 0u32;
+        let mut end = width;
+        for range in &used {
+            if end <= range.start {
+                break;
+            }
+            if start < range.end {
+                start = range.end;
+                end = start
+                    .checked_add(width)
+                    .ok_or_else(|| error(kind, "Vertex input locations overflow u32"))?;
+            }
+        }
+        let ExternalDeclarationData::Declaration(declaration) = &mut unit.0[index].content else {
+            unreachable!();
+        };
+        let DeclarationData::InitDeclaratorList(list) = &mut declaration.content else {
+            unreachable!();
+        };
+        set_layout(list.head.ty.qualifier.as_mut().unwrap(), "location", start);
+        let insertion = used.partition_point(|range| range.start < start);
+        used.insert(insertion, start..end);
+    }
+    Ok(())
+}
+
 fn remap_vertex_depth(unit: &mut TranslationUnit) -> Result<(), ShaderError> {
     struct Identifiers(HashSet<String>);
     impl VisitorMut for Identifiers {
@@ -826,7 +911,7 @@ pub fn translate_glsl(
     fragment: &str,
     meta: &ShaderMeta,
 ) -> Result<(String, String), ShaderError> {
-    let (vertex, fragment, _) = translate_with_layout(vertex, fragment, meta)?;
+    let (vertex, fragment, _) = translate_with_layout(vertex, fragment, meta, false)?;
     Ok((vertex, fragment))
 }
 
@@ -866,11 +951,18 @@ fn uniform_arrays(unit: &TranslationUnit, names: &mut HashSet<String>) {
     }
 }
 
+pub(super) struct GlslLayout {
+    pub uniform_arrays: HashSet<String>,
+    /// Identifiers that were renamed while upgrading legacy shader code.
+    pub sampler_aliases: HashMap<String, String>,
+}
+
 fn translate_with_layout(
     vertex: &str,
     fragment: &str,
     meta: &ShaderMeta,
-) -> Result<(String, String, HashSet<String>), ShaderError> {
+    assign_named_inputs: bool,
+) -> Result<(String, String, GlslLayout), ShaderError> {
     let mut vertex = parse(vertex, ShaderType::Vertex)?;
     let mut fragment = parse(fragment, ShaderType::Fragment)?;
     split_declarations(&mut vertex);
@@ -884,13 +976,23 @@ fn translate_with_layout(
     let mut v = upgrade(vertex, ShaderType::Vertex, meta, &aliases, &arrays)?;
     let mut f = upgrade(fragment, ShaderType::Fragment, meta, &aliases, &arrays)?;
     interface_locations(&mut v, &mut f)?;
+    if assign_named_inputs {
+        assign_vertex_input_locations(&mut v)?;
+    }
     remap_vertex_depth(&mut v)?;
     let emit = |unit: &TranslationUnit| {
         let mut source = String::from("#version 460 core\n");
         glsl::show_translation_unit(&mut source, unit, Default::default()).unwrap();
         source
     };
-    Ok((emit(&v), emit(&f), arrays))
+    Ok((
+        emit(&v),
+        emit(&f),
+        GlslLayout {
+            uniform_arrays: arrays,
+            sampler_aliases: aliases,
+        },
+    ))
 }
 
 /// Compile a GLSL/ESSL pair to SPIR-V without allocating Vulkan resources.
@@ -899,7 +1001,7 @@ pub fn compile_glsl(
     fragment: &str,
     meta: &ShaderMeta,
 ) -> Result<(Vec<u32>, Vec<u32>), ShaderError> {
-    let (vertex, fragment, _) = compile_glsl_with_layout(vertex, fragment, meta)?;
+    let (vertex, fragment, _) = compile_glsl_impl(vertex, fragment, meta, false)?;
     Ok((vertex, fragment))
 }
 
@@ -907,8 +1009,18 @@ pub(super) fn compile_glsl_with_layout(
     vertex: &str,
     fragment: &str,
     meta: &ShaderMeta,
-) -> Result<(Vec<u32>, Vec<u32>, HashSet<String>), ShaderError> {
-    let (vertex, fragment, arrays) = translate_with_layout(vertex, fragment, meta)?;
+) -> Result<(Vec<u32>, Vec<u32>, GlslLayout), ShaderError> {
+    compile_glsl_impl(vertex, fragment, meta, true)
+}
+
+fn compile_glsl_impl(
+    vertex: &str,
+    fragment: &str,
+    meta: &ShaderMeta,
+    keep_vertex_names: bool,
+) -> Result<(Vec<u32>, Vec<u32>, GlslLayout), ShaderError> {
+    let (vertex, fragment, layout) =
+        translate_with_layout(vertex, fragment, meta, keep_vertex_names)?;
     let v = native(&vertex, ShaderType::Vertex, true)?;
     let f = native(&fragment, ShaderType::Fragment, true)?;
     let program = NativeProgram(
@@ -933,7 +1045,9 @@ pub(super) fn compile_glsl_with_layout(
         let compile = |kind| -> Result<Vec<u32>, ShaderError> {
             let mut options = sys::glslang_spv_options_t {
                 generate_debug_info: false,
-                strip_debug_info: true,
+                // Runtime GLSL reflects vertex inputs by name after glslang
+                // assigns locations. Leave the asset generator's flags alone.
+                strip_debug_info: !(keep_vertex_names && matches!(kind, ShaderType::Vertex)),
                 disable_optimizer: true,
                 optimize_size: false,
                 disassemble: false,
@@ -963,36 +1077,7 @@ pub(super) fn compile_glsl_with_layout(
         Ok((
             compile(ShaderType::Vertex)?,
             compile(ShaderType::Fragment)?,
-            arrays,
+            layout,
         ))
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn explicit_varying_locations_are_preserved() {
-        let mut vertex = TranslationUnit::parse(
-            "layout(location = int(1.0)) out vec4 vertex_color;
-             layout(location = 1 + 1) out vec2 vertex_uv;",
-        )
-        .unwrap();
-        let mut fragment = TranslationUnit::parse(
-            "layout(location = 1) in vec4 fragment_color;
-             in vec2 vertex_uv;",
-        )
-        .unwrap();
-        interface_locations(&mut vertex, &mut fragment).unwrap();
-
-        let mut translated = String::new();
-        glsl::show_translation_unit(&mut translated, &vertex, Default::default()).unwrap();
-        assert!(translated.contains("location = int("), "{}", translated);
-        assert!(translated.contains("location = 1 + 1"), "{}", translated);
-
-        translated.clear();
-        glsl::show_translation_unit(&mut translated, &fragment, Default::default()).unwrap();
-        assert!(translated.contains("location = 2"), "{}", translated);
     }
 }

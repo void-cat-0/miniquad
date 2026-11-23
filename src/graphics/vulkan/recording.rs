@@ -220,18 +220,16 @@ struct RecordingFrame {
 }
 
 impl RecordingFrame {
-    fn new(device: &Device, family: u32, cache_descriptors: bool) -> Self {
+    fn new(device: &Device, family: u32, cache_descriptors: bool) -> Result<Self, vk::Result> {
         let command_pool = unsafe {
-            device
-                .create_command_pool(
-                    &vk::CommandPoolCreateInfo::builder()
-                        .queue_family_index(family)
-                        .flags(vk::CommandPoolCreateFlags::TRANSIENT),
-                    None,
-                )
-                .expect("Failed to create a recording command pool")
+            device.create_command_pool(
+                &vk::CommandPoolCreateInfo::builder()
+                    .queue_family_index(family)
+                    .flags(vk::CommandPoolCreateFlags::TRANSIENT),
+                None,
+            )?
         };
-        Self {
+        Ok(Self {
             command_pool,
             command_buffers: Vec::new(),
             used: 0,
@@ -242,7 +240,7 @@ impl RecordingFrame {
             descriptor_cache: DescriptorCache::default(),
             descriptor_updates: 0,
             descriptor_cache_hits: 0,
-        }
+        })
     }
 
     fn reset(&mut self, device: &Device) {
@@ -445,6 +443,7 @@ impl RecordingWorker {
     }
 }
 
+#[derive(Default)]
 pub(crate) struct CommandRecorder {
     pool: Option<rayon::ThreadPool>,
     #[cfg(feature = "tracy")]
@@ -489,7 +488,7 @@ fn plan_rendering_contents(
 }
 
 impl CommandRecorder {
-    pub fn new(device: &Device, family: u32) -> Self {
+    pub fn new(device: &Device, family: u32) -> Result<Self, vk::Result> {
         let threads = std::env::var("PRPR_VULKAN_THREADS")
             .ok()
             .and_then(|value| value.parse::<usize>().ok())
@@ -499,49 +498,41 @@ impl CommandRecorder {
                     .map_or(1, |value| value.get())
                     .min(8)
             });
-        let pool = if threads > 1 {
-            Some(
-                rayon::ThreadPoolBuilder::new()
-                    .num_threads(threads)
-                    .thread_name(|id| format!("vulkan-record-{id}"))
-                    .start_handler(|id| {
-                        #[cfg(feature = "tracy")]
-                        crate::tracy::register_thread(&format!("vulkan-record-{id}"));
-                        #[cfg(not(feature = "tracy"))]
-                        let _ = id;
-                    })
-                    .build()
-                    .expect("Failed to create the Vulkan recording pool"),
-            )
-        } else {
-            None
-        };
-        let cache_descriptors = super::env_enabled("PRPR_VULKAN_DESCRIPTOR_CACHE");
-        let workers = (0..if pool.is_some() { threads } else { 0 })
-            .map(|_| RecordingWorker {
-                frames: (0..MAX_FRAMES_IN_FLIGHT)
-                    .map(|_| RecordingFrame::new(device, family, cache_descriptors))
-                    .collect(),
-                results: Vec::new(),
-                thread: None,
-            })
-            .collect();
-        Self {
-            pool,
-            #[cfg(feature = "tracy")]
-            tracy_registered: false,
-            workers,
-            draws: Vec::new(),
-            batches: Vec::new(),
-            jobs: Vec::new(),
-            batch_count: 0,
-            primary: Vec::new(),
-            rendering_contents: None,
-            stats: CommandRecordingStats {
-                threads,
-                ..Default::default()
-            },
+        let mut recorder = Self::default();
+        if threads > 1 {
+            recorder.pool = rayon::ThreadPoolBuilder::new()
+                .num_threads(threads)
+                .thread_name(|id| format!("vulkan-record-{id}"))
+                .start_handler(|id| {
+                    #[cfg(feature = "tracy")]
+                    crate::tracy::register_thread(&format!("vulkan-record-{id}"));
+                    #[cfg(not(feature = "tracy"))]
+                    let _ = id;
+                })
+                .build()
+                .ok();
         }
+        recorder.stats.threads = if recorder.enabled() { threads } else { 1 };
+        if recorder.enabled() {
+            let cache_descriptors = super::env_enabled("PRPR_VULKAN_DESCRIPTOR_CACHE");
+            for _ in 0..threads {
+                recorder.workers.push(RecordingWorker {
+                    frames: Vec::with_capacity(MAX_FRAMES_IN_FLIGHT),
+                    results: Vec::new(),
+                    thread: None,
+                });
+                for _ in 0..MAX_FRAMES_IN_FLIGHT {
+                    match RecordingFrame::new(device, family, cache_descriptors) {
+                        Ok(frame) => recorder.workers.last_mut().unwrap().frames.push(frame),
+                        Err(error) => {
+                            recorder.destroy(device);
+                            return Err(error);
+                        }
+                    }
+                }
+            }
+        }
+        Ok(recorder)
     }
 
     pub fn enabled(&self) -> bool {

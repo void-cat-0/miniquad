@@ -595,7 +595,7 @@ crate::declare_module!(
     pub fn wl_display_get_fd(*mut wl_display) -> c_int,
     pub fn wl_display_create_queue(*mut wl_display) -> *mut wl_event_queue,
     pub fn wl_event_queue_destroy(*mut wl_event_queue),
-    pub fn wl_display_flush(*mut wl_display),
+    pub fn wl_display_flush(*mut wl_display) -> c_int,
     pub fn wl_display_roundtrip(*mut wl_display) -> c_int,
     pub fn wl_display_roundtrip_queue(*mut wl_display, *mut wl_event_queue) -> c_int,
     pub fn wl_display_prepare_read(*mut wl_display) -> c_int,

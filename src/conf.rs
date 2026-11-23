@@ -126,13 +126,18 @@ pub enum RenderingBackend {
     /// with `VK_KHR_dynamic_rendering`. On Android this is experimental and
     /// requires a compatible system loader (normally Android 13+) and driver.
     Vulkan,
+    /// Try Vulkan on the actual window before creating the event handler. Use
+    /// OpenGL (GLES on Android) if Vulkan is unavailable or initialization
+    /// fails. This does not switch renderers after the app has started.
+    VulkanPreferred,
 }
 
 /// Platform-specific settings.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub struct Platform {
     /// Rendering API on Windows, desktop Linux, and Android; defaults to OpenGL.
-    /// Selecting Vulkan requires the `vulkan` Cargo feature.
+    /// Strict Vulkan requires the `vulkan` Cargo feature. `VulkanPreferred`
+    /// can also be used without it and selects OpenGL in that case.
     pub rendering_backend: RenderingBackend,
 
     /// Determines how to load an OpenGL context on X11 (via GLX or EGL).
@@ -152,7 +157,8 @@ pub struct Platform {
     /// Note that this is highly platform- and driver-dependent.
     /// There is no guarantee the FPS will match the specified `swap_interval`.
     /// In other words, `swap_interval` is only a hint to the GPU driver and
-    /// not a reliable way to limit the game's FPS.
+    /// not a reliable way to limit the game's FPS. Vulkan uses its own
+    /// presentation mode and does not honor this hint.
     pub swap_interval: Option<i32>,
 
     /// If `true`, the event loop will block until [`schedule_update`] is called.
@@ -239,8 +245,9 @@ pub struct Conf {
     /// Defaults to `false`.
     pub fullscreen: bool,
 
-    /// MSAA sample count.
-    /// Defaults to `1`.
+    /// Window framebuffer MSAA sample count. Defaults to `1`.
+    /// Vulkan window passes remain single-sampled; use a multisampled
+    /// offscreen render pass and resolve to a texture for Vulkan MSAA.
     pub sample_count: i32,
 
     /// If `true`, the user can resize the window.

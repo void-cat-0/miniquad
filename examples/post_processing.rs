@@ -8,6 +8,8 @@ struct Stage {
     offscreen_pipeline: Pipeline,
     offscreen_bind: Bindings,
     offscreen_pass: RenderPass,
+    offscreen_color: TextureId,
+    offscreen_depth: TextureId,
     rx: f32,
     ry: f32,
 
@@ -180,6 +182,8 @@ impl Stage {
             offscreen_pipeline,
             offscreen_bind,
             offscreen_pass,
+            offscreen_color: color_img,
+            offscreen_depth: depth_img,
             rx: 0.,
             ry: 0.,
             ctx,
@@ -191,6 +195,9 @@ impl EventHandler for Stage {
     fn update(&mut self) {}
 
     fn resize_event(&mut self, width: f32, height: f32) {
+        if width < 1. || height < 1. {
+            return;
+        }
         let color_img = self.ctx.new_render_texture(TextureParams {
             width: width as _,
             height: height as _,
@@ -206,8 +213,13 @@ impl EventHandler for Stage {
 
         let offscreen_pass = self.ctx.new_render_pass(color_img, Some(depth_img));
 
+        // Pass deletion only frees the framebuffer; this stage owns its textures.
         self.ctx.delete_render_pass(self.offscreen_pass);
+        self.ctx.delete_texture(self.offscreen_color);
+        self.ctx.delete_texture(self.offscreen_depth);
         self.offscreen_pass = offscreen_pass;
+        self.offscreen_color = color_img;
+        self.offscreen_depth = depth_img;
         self.post_processing_bind.images[0] = color_img;
     }
 
@@ -232,8 +244,6 @@ impl EventHandler for Stage {
             PassAction::clear_color(1.0, 1.0, 1.0, 1.0),
         );
         self.ctx.apply_pipeline(&self.offscreen_pipeline);
-        self.ctx
-            .apply_uniforms(UniformsSource::table(&self.offscreen_bind));
         self.ctx.apply_bindings(&self.offscreen_bind);
         self.ctx
             .apply_uniforms(UniformsSource::table(&offscreen_shader::Uniforms {

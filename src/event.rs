@@ -181,6 +181,19 @@ pub trait EventHandler {
         None
     }
 
+    /// Opt in to pre-acquiring a drawable Vulkan frame before desktop update
+    /// and draw callbacks. Return the context used by `draw`. Callbacks are
+    /// deferred while the surface is temporarily unavailable. Without this
+    /// hook, the first pass attempts acquisition and a missed frame cannot
+    /// produce new pixels (e.g. for synchronous readback).
+    #[cfg(all(
+        feature = "vulkan",
+        any(windows, all(target_os = "linux", not(target_env = "ohos")))
+    ))]
+    fn desktop_vulkan_context(&mut self) -> Option<&mut crate::graphics::vulkan::VulkanContext> {
+        None
+    }
+
     fn resize_event(&mut self, _width: f32, _height: f32) {}
 
     /// When supported by the backend, called immediately before a callback with
@@ -266,4 +279,34 @@ pub trait EventHandler {
         _composing_end: Option<usize>,
         _element_id: u64,
     ) {}
+}
+
+#[cfg(all(
+    feature = "vulkan",
+    any(windows, all(target_os = "linux", not(target_env = "ohos")))
+))]
+pub(crate) const VULKAN_FRAME_RETRY_MS: u32 = 8;
+
+#[cfg(all(
+    feature = "vulkan",
+    any(windows, all(target_os = "linux", not(target_env = "ohos")))
+))]
+pub(crate) fn draw_desktop_vulkan_frame(handler: &mut dyn EventHandler) -> bool {
+    let (width, height) = crate::window::screen_size();
+    if let Some(context) = handler.desktop_vulkan_context() {
+        context.set_window_size(width as u32, height as u32);
+        if !context.prepare_desktop_frame() {
+            return false;
+        }
+    }
+    handler.update();
+    handler.draw();
+    if let Some(context) = handler.desktop_vulkan_context() {
+        if !context.offscreen {
+            // Most handlers committed the frame in draw(). Retire unused
+            // acquired images too, without requiring a second callback.
+            context.present();
+        }
+    }
+    true
 }
