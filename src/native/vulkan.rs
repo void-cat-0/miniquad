@@ -63,6 +63,25 @@ impl VulkanWindow {
                     NonZeroU32::MAX,
                 ) {
                     Ok(context) => {
+                        #[cfg(target_os = "android")]
+                        {
+                            let properties = unsafe {
+                                context
+                                    .instance
+                                    .get_physical_device_properties(context.physical_device)
+                            };
+                            let device_name = unsafe {
+                                std::ffi::CStr::from_ptr(properties.device_name.as_ptr())
+                            }
+                            .to_string_lossy();
+                            crate::native::android::log_diagnostic(
+                                "INFO",
+                                &format!(
+                                    "Vulkan initialized: {device_name}, API 0x{:x}.",
+                                    properties.api_version
+                                ),
+                            );
+                        }
                         PREPARED_CONTEXT.with(|slot| *slot.borrow_mut() = Some(context));
                         Some(PreparedVulkan)
                     }

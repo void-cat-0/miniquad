@@ -471,11 +471,13 @@ impl VulkanContext {
     fn android_frame_not_ready(&mut self, error: vk::Result) -> Result<bool, vk::Result> {
         match error {
             vk::Result::ERROR_OUT_OF_DATE_KHR => {
+                crate::native::android::report_vulkan_recovery_error("swapchain/acquire", error);
                 self.presentation_needs_recreate = true;
                 Ok(false)
             }
             vk::Result::NOT_READY | vk::Result::TIMEOUT => Ok(false),
             vk::Result::ERROR_SURFACE_LOST_KHR => {
+                crate::native::android::report_vulkan_recovery_error("surface/acquire", error);
                 self.surface_lost = true;
                 Err(error)
             }
@@ -1910,7 +1912,14 @@ impl VulkanContext {
                 |_| {},
             ) {
                 Ok(state) => self.update_presentation(state),
-                Err(error) => panic!("Failed to submit or present the frame: {:?}", error),
+                Err(error) => {
+                    super::report_vulkan_message(
+                        vk::DebugUtilsMessageSeverityFlagsEXT::ERROR,
+                        vk::DebugUtilsMessageTypeFlagsEXT::GENERAL,
+                        &format!("Frame submit/present failed: {error:?}"),
+                    );
+                    panic!("Failed to submit or present the frame: {error:?}");
+                }
             }
         }
         // Android's compositor handles rotation; IDENTITY can legitimately be

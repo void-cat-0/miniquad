@@ -6,7 +6,20 @@ use crate::{
     },
 };
 
-use std::{cell::RefCell, ptr::NonNull, sync::mpsc, thread, time::Duration};
+use std::{
+    cell::RefCell,
+    ffi::{CStr, CString},
+    fs::{File, OpenOptions},
+    io::{self, Write},
+    path::Path,
+    ptr::NonNull,
+    sync::{
+        atomic::{AtomicBool, AtomicU32, Ordering::Relaxed},
+        mpsc, Mutex, OnceLock,
+    },
+    thread,
+    time::{Duration, SystemTime, UNIX_EPOCH},
+};
 
 #[cfg(feature = "vulkan")]
 use {crate::graphics::vulkan::VulkanContext, ash::vk, std::time::Instant};
@@ -123,50 +136,77 @@ fn send_message(message: Message) {
 
 pub static mut ACTIVITY: ndk_sys::jobject = std::ptr::null_mut();
 static mut VM: *mut ndk_sys::JavaVM = std::ptr::null_mut();
+static DIAGNOSTIC_LOG: OnceLock<Mutex<Option<File>>> = OnceLock::new();
+static ANDROID_VULKAN_ACTIVE: AtomicBool = AtomicBool::new(false);
+static ANDROID_GLES_RESTART_REQUESTED: AtomicBool = AtomicBool::new(false);
+#[cfg(feature = "vulkan")]
+static ANDROID_VULKAN_RECOVERY_FAILURES: AtomicU32 = AtomicU32::new(0);
+
+/// Send Android diagnostics to logcat and the app-private file selected by Java.
+pub fn log_diagnostic(level: &str, message: &str) {
+    let priority = match level {
+        "ERROR" => ndk_sys::android_LogPriority_ANDROID_LOG_ERROR,
+        "WARN" => ndk_sys::android_LogPriority_ANDROID_LOG_WARN,
+        "DEBUG" => ndk_sys::android_LogPriority_ANDROID_LOG_DEBUG,
+        _ => ndk_sys::android_LogPriority_ANDROID_LOG_INFO,
+    } as _;
+    let message = message.replace('\0', "�");
+    let c_message = CString::new(message.clone()).expect("NUL was replaced");
+    unsafe {
+        ndk_sys::__android_log_write(priority, b"SAPP\0".as_ptr() as _, c_message.as_ptr());
+    }
+    if let Some(log) = DIAGNOSTIC_LOG.get()
+        && let Ok(mut log) = log.lock()
+        && let Some(file) = log.as_mut()
+    {
+        let time = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default();
+        let _ = writeln!(
+            file,
+            "{}.{:03} [{level}] {message}",
+            time.as_secs(),
+            time.subsec_millis()
+        );
+        let _ = file.flush();
+    }
+}
+
+/// Set the file where startup and renderer diagnostics are exported.
+pub fn set_diagnostic_log_file(path: impl AsRef<Path>) -> io::Result<()> {
+    let file = OpenOptions::new().create(true).append(true).open(path)?;
+    let log = DIAGNOSTIC_LOG.get_or_init(|| Mutex::new(None));
+    *log.lock().unwrap() = Some(file);
+    log_diagnostic("INFO", "Native diagnostic log connected.");
+    Ok(())
+}
+
+unsafe fn console_log(msg: *const ::core::ffi::c_char, level: &str) {
+    log_diagnostic(level, &CStr::from_ptr(msg).to_string_lossy());
+}
 
 pub unsafe fn console_debug(msg: *const ::core::ffi::c_char) {
-    ndk_sys::__android_log_write(
-        ndk_sys::android_LogPriority_ANDROID_LOG_DEBUG as _,
-        b"SAPP\0".as_ptr() as _,
-        msg,
-    );
+    console_log(msg, "DEBUG");
 }
 
 pub unsafe fn console_info(msg: *const ::core::ffi::c_char) {
-    ndk_sys::__android_log_write(
-        ndk_sys::android_LogPriority_ANDROID_LOG_INFO as _,
-        b"SAPP\0".as_ptr() as _,
-        msg,
-    );
+    console_log(msg, "INFO");
 }
 
 pub unsafe fn console_warn(msg: *const ::core::ffi::c_char) {
-    ndk_sys::__android_log_write(
-        ndk_sys::android_LogPriority_ANDROID_LOG_WARN as _,
-        b"SAPP\0".as_ptr() as _,
-        msg,
-    );
+    console_log(msg, "WARN");
 }
 
 pub unsafe fn console_error(msg: *const ::core::ffi::c_char) {
-    ndk_sys::__android_log_write(
-        ndk_sys::android_LogPriority_ANDROID_LOG_ERROR as _,
-        b"SAPP\0".as_ptr() as _,
-        msg,
-    );
+    console_log(msg, "ERROR");
 }
 
 #[cfg(feature = "vulkan")]
 pub(crate) fn warn_vulkan_fallback(error: &impl std::fmt::Display) {
-    let message = std::ffi::CString::new(format!("Vulkan startup failed ({error}); using GLES"))
-        .expect("Vulkan startup diagnostics contain no NUL bytes");
-    unsafe {
-        ndk_sys::__android_log_write(
-            ndk_sys::android_LogPriority_ANDROID_LOG_WARN as _,
-            b"SAPP\0".as_ptr() as _,
-            message.as_ptr(),
-        );
-    }
+    log_diagnostic(
+        "WARN",
+        &format!("Vulkan startup failed ({error}); using GLES"),
+    );
 }
 
 // fn log_info(message: &str) {
@@ -311,6 +351,7 @@ struct MainThreadState {
     window_size: (i32, i32),
     #[cfg(feature = "vulkan")]
     paused: bool,
+    first_present_logged: bool,
     quit: bool,
     fullscreen: bool,
     update_requested: bool,
@@ -377,13 +418,19 @@ impl MainThreadState {
             Ok(()) => {
                 self.vulkan_surface_attached = true;
                 self.update_requested = true;
-                crate::native_display().lock().unwrap().vulkan_window = Some(window.vulkan_handle());
+                self.surface_retry = SurfaceRetry::default();
+                report_vulkan_frame_success();
+                crate::native_display().lock().unwrap().vulkan_window =
+                    Some(window.vulkan_handle());
             }
             Err(
-                vk::Result::ERROR_SURFACE_LOST_KHR
+                error @ (vk::Result::ERROR_SURFACE_LOST_KHR
                 | vk::Result::ERROR_OUT_OF_DATE_KHR
-                | vk::Result::ERROR_NATIVE_WINDOW_IN_USE_KHR,
-            ) => self.surface_retry.postpone(Instant::now()),
+                | vk::Result::ERROR_NATIVE_WINDOW_IN_USE_KHR),
+            ) => {
+                report_vulkan_recovery_error("surface reattach", error);
+                self.surface_retry.postpone(Instant::now());
+            }
             Err(error) => panic!("Failed to attach Android Vulkan surface: {:?}", error),
         }
     }
@@ -432,7 +479,8 @@ impl MainThreadState {
                 y,
                 time,
             } => {
-                self.event_handler.touch_event(phase, touch_id, x, y, time as f64 / 1000.);
+                self.event_handler
+                    .touch_event(phase, touch_id, x, y, time as f64 / 1000.);
             }
             Message::Character { character } => {
                 if let Some(character) = char::from_u32(character) {
@@ -468,14 +516,31 @@ impl MainThreadState {
             Message::ImeCommit(text) => {
                 self.event_handler.on_ime_commit(text.as_deref());
             }
-            Message::ImeStateChanged { text, selection_start, selection_end, composing_start, composing_end, element_id } => {
-                self.event_handler.on_ime_state_changed(&text, selection_start, selection_end, composing_start, composing_end, element_id);
+            Message::ImeStateChanged {
+                text,
+                selection_start,
+                selection_end,
+                composing_start,
+                composing_end,
+                element_id,
+            } => {
+                self.event_handler.on_ime_state_changed(
+                    &text,
+                    selection_start,
+                    selection_end,
+                    composing_start,
+                    composing_end,
+                    element_id,
+                );
             }
             Message::ImeAction(_action_code) => {
-                self.event_handler.key_down_event(KeyCode::Enter, self.keymods, false);
-                self.event_handler.key_up_event(KeyCode::Enter, self.keymods);
+                self.event_handler
+                    .key_down_event(KeyCode::Enter, self.keymods, false);
+                self.event_handler
+                    .key_up_event(KeyCode::Enter, self.keymods);
             }
             Message::Pause => {
+                log_diagnostic("INFO", "Android Activity paused.");
                 #[cfg(feature = "vulkan")]
                 {
                     self.paused = true;
@@ -483,6 +548,7 @@ impl MainThreadState {
                 self.event_handler.window_minimized_event();
             }
             Message::Resume => {
+                log_diagnostic("INFO", "Android Activity resumed.");
                 #[cfg(feature = "vulkan")]
                 {
                     if self.paused {
@@ -515,7 +581,18 @@ impl MainThreadState {
             if !egl.surface.is_null() {
                 self.update_requested = false;
                 self.event_handler.draw();
-                unsafe { (egl.libegl.eglSwapBuffers)(egl.display, egl.surface) };
+                let presented = unsafe { (egl.libegl.eglSwapBuffers)(egl.display, egl.surface) };
+                if presented == 0 {
+                    log_diagnostic(
+                        "ERROR",
+                        &format!("GLES eglSwapBuffers failed: 0x{:x}", unsafe {
+                            (egl.libegl.eglGetError)()
+                        }),
+                    );
+                } else if !self.first_present_logged {
+                    self.first_present_logged = true;
+                    log_diagnostic("INFO", "First GLES frame presented.");
+                }
             }
             return false;
         }
@@ -537,12 +614,16 @@ impl MainThreadState {
                     let needs_attention = {
                         let context = vulkan_context(self.event_handler.as_mut());
                         if !context.offscreen {
-                            // Present an acquired frame even if the handler did not
+                            // Present the acquired frame even if the handler did not
                             // commit it. This is a no-op after commit_frame().
                             context.present();
                         }
                         context.android_window_needs_attention()
                     };
+                    if !self.first_present_logged {
+                        self.first_present_logged = true;
+                        log_diagnostic("INFO", "First Vulkan frame submitted for presentation.");
+                    }
                     if needs_attention {
                         self.update_requested = true;
                         return true;
@@ -550,9 +631,11 @@ impl MainThreadState {
                     // A successful reattachment alone isn't proof of recovery:
                     // if the next present loses the surface, keep backing off.
                     self.surface_retry = SurfaceRetry::default();
+                    report_vulkan_frame_success();
                 }
                 Ok(false) => return true,
                 Err(vk::Result::ERROR_SURFACE_LOST_KHR) => {
+                    report_vulkan_recovery_error("surface", vk::Result::ERROR_SURFACE_LOST_KHR);
                     // The VkSurface is stale, but the Java view can still own
                     // the same NativeWindow. A real SurfaceDestroyed drops it.
                     self.suspend_vulkan_surface();
@@ -696,6 +779,33 @@ impl crate::native::Clipboard for AndroidClipboard {
     }
 }
 
+unsafe fn request_gles_fallback() {
+    let env = attach_jni_env();
+    ndk_utils::call_void_method!(env, ACTIVITY, "requestGlesFallback", "()V");
+}
+
+#[cfg(feature = "vulkan")]
+pub(crate) fn report_vulkan_recovery_error(stage: &str, error: vk::Result) {
+    log_diagnostic("WARN", &format!("Vulkan {stage} returned {error:?}."));
+    let failures = ANDROID_VULKAN_RECOVERY_FAILURES.fetch_add(1, Relaxed) + 1;
+    if failures >= 8 {
+        schedule_gles_fallback("Android Vulkan surface/acquire repeatedly failed.");
+    }
+}
+
+#[cfg(feature = "vulkan")]
+pub(crate) fn report_vulkan_frame_success() {
+    ANDROID_VULKAN_RECOVERY_FAILURES.store(0, Relaxed);
+}
+
+fn schedule_gles_fallback(reason: &str) {
+    if !ANDROID_VULKAN_ACTIVE.load(Relaxed) || ANDROID_GLES_RESTART_REQUESTED.swap(true, Relaxed) {
+        return;
+    }
+    log_diagnostic("ERROR", &format!("{reason} Restarting the app with GLES."));
+    unsafe { request_gles_fallback() };
+}
+
 pub unsafe fn run<F>(conf: crate::conf::Conf, f: F)
 where
     F: 'static + FnOnce() -> Box<dyn EventHandler>,
@@ -704,11 +814,20 @@ where
         use std::ffi::CString;
         use std::panic;
 
-        panic::set_hook(Box::new(|info| {
-            let msg = CString::new(format!("{info}")).unwrap_or_else(|_| {
+        panic::set_hook(Box::new(|info| unsafe {
+            use std::backtrace::Backtrace;
+
+            let panic_message = format!("{info}");
+            let msg = format!("{panic_message}\n{}", Backtrace::force_capture());
+            let msg = CString::new(msg).unwrap_or_else(|_| {
                 CString::new(format!("MALFORMED ERROR MESSAGE {:?}", info.location())).unwrap()
             });
             console_error(msg.as_ptr());
+            if ANDROID_VULKAN_ACTIVE.load(Relaxed) {
+                schedule_gles_fallback(&format!(
+                    "The application panicked while Vulkan was active: {panic_message}"
+                ));
+            }
         }));
     }
 
@@ -755,6 +874,10 @@ where
                 Ok(Message::SurfaceChanged { width, height })
                     if window.is_some() && width > 0 && height > 0 =>
                 {
+                    log_diagnostic(
+                        "INFO",
+                        &format!("Android window surface ready: {width}x{height}."),
+                    );
                     break (width, height);
                 }
                 Ok(Message::Pause) => paused = true,
@@ -776,6 +899,16 @@ where
         let vulkan = prepared.is_some();
         #[cfg(not(feature = "vulkan"))]
         let vulkan = false;
+        ANDROID_VULKAN_ACTIVE.store(vulkan, Relaxed);
+        ANDROID_GLES_RESTART_REQUESTED.store(false, Relaxed);
+        log_diagnostic(
+            "INFO",
+            if vulkan {
+                "Android renderer initialized: Vulkan. Waiting for first present."
+            } else {
+                "Android renderer initialized: GLES."
+            },
+        );
         let egl = if vulkan {
             None
         } else {
@@ -813,6 +946,7 @@ where
             window_size: (screen_width, screen_height),
             #[cfg(feature = "vulkan")]
             paused,
+            first_present_logged: false,
             quit: false,
             fullscreen: conf.fullscreen,
             update_requested: true,
@@ -905,6 +1039,27 @@ unsafe fn create_native_window(surface: ndk_sys::jobject) -> Option<NativeWindow
 }
 
 #[unsafe(no_mangle)]
+pub extern "system" fn Java_quad_1native_QuadNative_setDiagnosticLogPath<'local>(
+    mut env: jni::JNIEnv<'local>,
+    _class: jni::objects::JClass<'local>,
+    path: jni::objects::JString<'local>,
+) {
+    let path = match env.get_string(&path) {
+        Ok(path) => String::from(path),
+        Err(error) => {
+            log_diagnostic(
+                "ERROR",
+                &format!("Cannot read diagnostic log path: {error}"),
+            );
+            return;
+        }
+    };
+    if let Err(error) = set_diagnostic_log_file(path) {
+        log_diagnostic("ERROR", &format!("Cannot open diagnostic log: {error}"));
+    }
+}
+
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn Java_quad_1native_QuadNative_initializeContext(
     env: *mut ndk_sys::JNIEnv,
     _: ndk_sys::jobject,
@@ -935,6 +1090,7 @@ pub unsafe extern "C" fn Java_quad_1native_QuadNative_activityOnCreate(
 ) {
     let env = attach_jni_env();
     ACTIVITY = (**env).NewGlobalRef.unwrap()(env, activity);
+    log_diagnostic("INFO", "MainActivity called native activityOnCreate.");
     quad_main();
 }
 
@@ -969,6 +1125,7 @@ extern "C" fn Java_quad_1native_QuadNative_surfaceOnSurfaceCreated(
     surface: ndk_sys::jobject,
 ) {
     if let Some(window) = unsafe { create_native_window(surface) } {
+        log_diagnostic("INFO", "Android native window surface created.");
         send_message(Message::SurfaceCreated(window));
     }
 }
@@ -978,6 +1135,7 @@ extern "C" fn Java_quad_1native_QuadNative_surfaceOnSurfaceDestroyed(
     _: *mut ndk_sys::JNIEnv,
     _: ndk_sys::jobject,
 ) {
+    log_diagnostic("INFO", "Android native window surface destroyed.");
     #[cfg(feature = "vulkan")]
     if SYNC_SURFACE_DESTROY.with(|sync| sync.get()) {
         // SurfaceHolder requires the render thread to stop using its surface
@@ -1100,14 +1258,30 @@ pub unsafe extern "C" fn Java_quad_1native_QuadNative_surfaceOnImeStateChanged(
     element_id: ndk_sys::jlong,
 ) {
     let s = jstring_to_string(env, text).unwrap_or_default();
-    let sel_start = if selection_start >= 0 { selection_start as usize } else { 0 };
-    let sel_end = if selection_end >= 0 { selection_end as usize } else { 0 };
+    let sel_start = if selection_start >= 0 {
+        selection_start as usize
+    } else {
+        0
+    };
+    let sel_end = if selection_end >= 0 {
+        selection_end as usize
+    } else {
+        0
+    };
     send_message(Message::ImeStateChanged {
         text: s,
         selection_start: sel_start,
         selection_end: sel_end,
-        composing_start: if composing_start >= 0 { Some(composing_start as usize) } else { None },
-        composing_end: if composing_end >= 0 { Some(composing_end as usize) } else { None },
+        composing_start: if composing_start >= 0 {
+            Some(composing_start as usize)
+        } else {
+            None
+        },
+        composing_end: if composing_end >= 0 {
+            Some(composing_end as usize)
+        } else {
+            None
+        },
         element_id: element_id as u64,
     });
 }

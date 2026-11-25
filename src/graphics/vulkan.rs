@@ -280,6 +280,30 @@ pub struct VulkanContext {
     bound_textures: Vec<Option<usize>>,
 }
 
+fn report_vulkan_message(
+    severity: vk::DebugUtilsMessageSeverityFlagsEXT,
+    message_type: vk::DebugUtilsMessageTypeFlagsEXT,
+    message: &str,
+) {
+    let level = if severity.intersects(
+        vk::DebugUtilsMessageSeverityFlagsEXT::ERROR
+            | vk::DebugUtilsMessageSeverityFlagsEXT::WARNING,
+    ) {
+        "WARN"
+    } else {
+        "INFO"
+    };
+    let message = format!("[miniquad][vulkan] {severity:?}/{message_type:?}: {message}");
+    #[cfg(target_os = "android")]
+    crate::native::android::log_diagnostic(level, &message);
+    #[cfg(not(target_os = "android"))]
+    if level == "WARN" {
+        eprintln!("{message}");
+    } else {
+        println!("{message}");
+    }
+}
+
 unsafe extern "system" fn debug_callback(
     message_severity: vk::DebugUtilsMessageSeverityFlagsEXT,
     message_type: vk::DebugUtilsMessageTypeFlagsEXT,
@@ -295,21 +319,7 @@ unsafe extern "system" fn debug_callback(
         ""
     };
 
-    match message_severity {
-        vk::DebugUtilsMessageSeverityFlagsEXT::ERROR
-        | vk::DebugUtilsMessageSeverityFlagsEXT::WARNING => {
-            eprintln!(
-                "[miniquad][vulkan] {:?}/{:?}: {}",
-                message_severity, message_type, message
-            );
-        }
-        _ => {
-            println!(
-                "[miniquad][vulkan] {:?}/{:?}: {}",
-                message_severity, message_type, message
-            );
-        }
-    }
+    report_vulkan_message(message_severity, message_type, message);
 
     vk::FALSE
 }
@@ -329,7 +339,8 @@ impl Drop for SurfaceSetup<'_> {
         unsafe {
             self.surface_loader.destroy_surface(self.surface, None);
             if let Some(messenger) = self.debug_messenger {
-                self.debug_utils_loader.destroy_debug_utils_messenger(messenger, None);
+                self.debug_utils_loader
+                    .destroy_debug_utils_messenger(messenger, None);
             }
             self.instance.destroy_instance(None);
         }
@@ -382,7 +393,10 @@ impl VulkanContext {
     ) -> Result<Self, VulkanInitError> {
         unsafe {
             let entry = Entry::load().map_err(|_| {
-                VulkanInitError("load Vulkan loader", vk::Result::ERROR_INITIALIZATION_FAILED)
+                VulkanInitError(
+                    "load Vulkan loader",
+                    vk::Result::ERROR_INITIALIZATION_FAILED,
+                )
             })?;
             let app_name = CStr::from_bytes_with_nul_unchecked(b"miniquad\0");
 
@@ -431,7 +445,9 @@ impl VulkanContext {
                 .enabled_layer_names(&layer_names)
                 .enabled_extension_names(&extension_names);
 
-            let instance = entry.create_instance(&create_info, None).at("create Vulkan instance")?;
+            let instance = entry
+                .create_instance(&create_info, None)
+                .at("create Vulkan instance")?;
 
             let debug_info = vk::DebugUtilsMessengerCreateInfoEXT::builder()
                 .message_severity(
@@ -456,14 +472,17 @@ impl VulkanContext {
                 debug_messenger: None,
             };
             if validation {
-                setup.debug_messenger = Some(debug_utils_loader
-                    .create_debug_utils_messenger(&debug_info, None)
-                    .at("create Vulkan validation messenger")?);
+                setup.debug_messenger = Some(
+                    debug_utils_loader
+                        .create_debug_utils_messenger(&debug_info, None)
+                        .at("create Vulkan validation messenger")?,
+                );
             }
             setup.surface = ash_window::create_surface(&entry, &instance, display, window, None)
                 .at("create Vulkan window surface")?;
             let surface = setup.surface;
-            let physical_devices = instance.enumerate_physical_devices()
+            let physical_devices = instance
+                .enumerate_physical_devices()
                 .at("enumerate Vulkan devices")?;
 
             let has_extension = |extensions: &[vk::ExtensionProperties], name: &CStr| {
@@ -485,7 +504,9 @@ impl VulkanContext {
                     if api < vk::API_VERSION_1_2 {
                         return None;
                     }
-                    let extensions = instance.enumerate_device_extension_properties(device).ok()?;
+                    let extensions = instance
+                        .enumerate_device_extension_properties(device)
+                        .ok()?;
                     let use_khr = api < vk::API_VERSION_1_3;
                     if !has_extension(&extensions, Swapchain::name())
                         || (use_khr && !has_extension(&extensions, KhrDynamicRendering::name()))
@@ -572,7 +593,8 @@ impl VulkanContext {
                 device_create_info.push_next(&mut dynamic_rendering_13)
             };
 
-            let device = instance.create_device(physical_device, &device_create_info, None)
+            let device = instance
+                .create_device(physical_device, &device_create_info, None)
                 .at("create Vulkan logical device")?;
             let debug_messenger = setup.debug_messenger;
             // The context takes ownership of the successfully created window objects.
@@ -717,8 +739,9 @@ impl VulkanContext {
                 .create_command_pool(&command_pool, None)
                 .at("create Vulkan command pool")?;
             for _ in 0..MAX_FRAMES_IN_FLIGHT {
-                self.descriptor_pools
-                    .push(create_descriptor_pool(&self.device).at("create Vulkan descriptor pool")?);
+                self.descriptor_pools.push(
+                    create_descriptor_pool(&self.device).at("create Vulkan descriptor pool")?,
+                );
                 self.in_flight
                     .push(try_create_fence(&self.device).at("create Vulkan frame fence")?);
             }
@@ -737,7 +760,9 @@ impl VulkanContext {
         }
         match self.create_swapchain(self.window_size) {
             Ok(()) => (),
-            Err(vk::Result::ERROR_OUT_OF_DATE_KHR | vk::Result::NOT_READY | vk::Result::TIMEOUT) => {
+            Err(
+                vk::Result::ERROR_OUT_OF_DATE_KHR | vk::Result::NOT_READY | vk::Result::TIMEOUT,
+            ) => {
                 self.presentation_needs_recreate = true;
             }
             Err(vk::Result::ERROR_SURFACE_LOST_KHR) => self.surface_lost = true,
@@ -755,7 +780,9 @@ impl VulkanContext {
         // submission on that thread there, and on the render thread on Android.
         if !cfg!(any(windows, target_os = "android")) {
             self.submission = submission::SubmissionWorker::new(
-                &self.device, &self.swapchain_loader, self.graphics_queue,
+                &self.device,
+                &self.swapchain_loader,
+                self.graphics_queue,
             );
         }
         Ok(())
@@ -815,7 +842,10 @@ impl VulkanContext {
 
     pub fn cleanup(&mut self) {
         self.drain_submissions();
-        let prepared = self.submission.as_mut().and_then(submission::SubmissionWorker::take_prepared);
+        let prepared = self
+            .submission
+            .as_mut()
+            .and_then(submission::SubmissionWorker::take_prepared);
         if let Some(image) = prepared {
             self.wait_acquired_semaphore(image.semaphore);
         }
@@ -944,7 +974,10 @@ impl VulkanContext {
     /// submission worker only transfers host ownership; it is not a GPU wait.
     fn wait_for_swapchain_idle(&mut self) -> Result<(), vk::Result> {
         self.drain_submissions();
-        let prepared = self.submission.as_mut().and_then(submission::SubmissionWorker::take_prepared);
+        let prepared = self
+            .submission
+            .as_mut()
+            .and_then(submission::SubmissionWorker::take_prepared);
         if let Some(image) = prepared {
             self.wait_acquired_semaphore(image.semaphore);
         }
@@ -1241,7 +1274,9 @@ impl VulkanContext {
             );
             if !matches!(present, Ok(true)) {
                 self.surface_loader.destroy_surface(surface, None);
-                return Err(present.err().unwrap_or(vk::Result::ERROR_INITIALIZATION_FAILED));
+                return Err(present
+                    .err()
+                    .unwrap_or(vk::Result::ERROR_INITIALIZATION_FAILED));
             }
         }
         self.surface = surface;
@@ -1531,7 +1566,9 @@ impl VulkanContext {
     /// caller's responsibility.
     pub(crate) fn drain_submissions(&mut self) {
         if let Some(worker) = &mut self.submission {
-            let state = worker.drain().expect("Failed to submit or present the frame");
+            let state = worker
+                .drain()
+                .expect("Failed to submit or present the frame");
             self.update_presentation(state);
         }
     }
