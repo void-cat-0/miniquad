@@ -71,6 +71,7 @@ struct WaylandPayload {
     events: Vec<WaylandEvent>,
     keyboard_context: KeyboardContext,
     drag_n_drop: drag_n_drop::WaylandDnD,
+    clipboard: clipboard::ClipboardState,
     update_requested: bool,
 }
 
@@ -1485,6 +1486,7 @@ where
             pointer_context: PointerContext::new(),
             keyboard_context: KeyboardContext::new(),
             drag_n_drop: Default::default(),
+            clipboard: Default::default(),
             update_requested: true,
         };
 
@@ -1497,7 +1499,11 @@ where
         );
 
         let (tx, rx) = std::sync::mpsc::channel();
-        let clipboard = Box::new(clipboard::WaylandClipboard::new(&mut display as *mut _));
+        let clipboard_payload = std::sync::Arc::new(std::sync::atomic::AtomicPtr::new(
+            &mut display as *mut WaylandPayload,
+        ));
+        let clipboard = Box::new(clipboard::WaylandClipboard::new(clipboard_payload.clone()));
+        let _clipboard_detach = clipboard::DetachOnDrop(clipboard_payload);
         crate::set_display(NativeDisplayData {
             high_dpi: conf.high_dpi,
             dpi_scale: 1., // At this point dpi_scale is not known to us
