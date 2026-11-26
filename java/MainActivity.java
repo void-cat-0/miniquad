@@ -326,6 +326,10 @@ class QuadSurface
     @SuppressWarnings("deprecation")
     @Override
     public boolean onKey(View v, int keyCode, KeyEvent event) {
+        // Back goes through Activity.onBackPressed, which forwards it.
+        if (keyCode == KeyEvent.KEYCODE_BACK) {
+            return false;
+        }
         if (MainActivity.sFocusedElementId != -1 && MainActivity.sFocusedElementId != 0) {
             return false;
         }
@@ -587,13 +591,22 @@ public class MainActivity extends Activity {
         //% MAIN_ACTIVITY_ON_RESUME
     }
 
+    // The back button (and back gesture) is delivered to the application as
+    // KeyCode::Back. The application closes the activity with
+    // miniquad::window::order_quit() when it has nothing to go back to.
     @Override
     public void onBackPressed() {
-        Log.w("SAPP", "onBackPressed");
+        QuadNative.surfaceOnKeyDown(KeyEvent.KEYCODE_BACK);
+        QuadNative.surfaceOnKeyUp(KeyEvent.KEYCODE_BACK);
+    }
 
-        // TODO: here is the place to handle request_quit/order_quit/cancel_quit
-
-        super.onBackPressed();
+    public void quitApp() {
+        runOnUiThread(new Runnable() {
+            @Override
+            public void run() {
+                finish();
+            }
+        });
     }
 
     @Override

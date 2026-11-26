@@ -587,6 +587,16 @@ where
                 s.frame();
             }
 
+            // order_quit() closes the activity; Destroy then ends this loop.
+            let quit_ordered = {
+                let mut d = crate::native_display().lock().unwrap();
+                std::mem::replace(&mut d.quit_ordered, false)
+            };
+            if quit_ordered {
+                let env = attach_jni_env();
+                ndk_utils::call_void_method!(env, ACTIVITY, "quitApp", "()V");
+            }
+
             thread::yield_now();
         }
 
