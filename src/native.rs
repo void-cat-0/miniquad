@@ -12,7 +12,7 @@ pub(crate) struct NativeDisplayData {
     pub screen_width: i32,
     pub screen_height: i32,
     pub screen_position: (u32, u32),
-    pub ime_enabled: bool,
+    pub text_input: Option<crate::TextInputConfig>,
     pub dpi_scale: f32,
     pub high_dpi: bool,
     pub quit_requested: bool,
@@ -49,7 +49,7 @@ impl NativeDisplayData {
             screen_width,
             screen_height,
             screen_position: (0, 0),
-            ime_enabled: false,
+            text_input: None,
             dpi_scale: 1.,
             high_dpi: false,
             quit_requested: false,
@@ -78,17 +78,54 @@ pub(crate) enum Request {
     SetWindowPosition { new_x: u32, new_y: u32 },
     SetFullscreen(bool),
     ShowKeyboard(bool),
-    SetImePosition { x: i32, y: i32 },
-    SetImeEnabled(bool),
-    UpdateTextInputState {
-        text: String,
-        selection_start: usize,
-        selection_end: usize,
-        is_password: bool,
-        is_multiline: bool,
-        element_id: u64,
-        max_length: usize,
-    },
+    StartTextInput(crate::TextInputConfig),
+    StopTextInput,
+    SetTextInputState(crate::TextInputState),
+    SetTextInputRect { x: f32, y: f32, w: f32, h: f32 },
+}
+
+/// The legacy combined text input update used by the mobile and web
+/// backends, derived from a new-style request and the active session.
+#[allow(dead_code)]
+pub(crate) struct LegacyTextInput {
+    pub text: String,
+    pub selection_start: usize,
+    pub selection_end: usize,
+    pub is_password: bool,
+    pub is_multiline: bool,
+    /// 1 during a session, 0 to end it.
+    pub element_id: u64,
+    pub max_length: usize,
+}
+
+#[allow(dead_code)]
+impl LegacyTextInput {
+    pub fn from_request(request: &Request) -> Self {
+        let config = crate::text_input::session();
+        match request {
+            Request::SetTextInputState(state) if config.is_some() => {
+                let config = config.unwrap();
+                Self {
+                    text: state.text.clone(),
+                    selection_start: state.selection_start.max(0) as usize,
+                    selection_end: state.selection_end.max(0) as usize,
+                    is_password: config.is_secure(),
+                    is_multiline: config.is_multiline(),
+                    element_id: 1,
+                    max_length: 0,
+                }
+            }
+            _ => Self {
+                text: String::new(),
+                selection_start: 0,
+                selection_end: 0,
+                is_password: false,
+                is_multiline: false,
+                element_id: 0,
+                max_length: 0,
+            },
+        }
+    }
 }
 
 pub trait Clipboard: Send + Sync {

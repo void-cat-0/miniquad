@@ -248,15 +248,18 @@ impl IosDisplay {
             ShowKeyboard(show) => {
                 self.show_keyboard(show);
             }
-            UpdateTextInputState {
-                text,
-                selection_start,
-                selection_end,
-                is_password,
-                is_multiline: _,
-                element_id,
-                max_length: _,
-            } => unsafe {
+            request @ (SetTextInputState(_) | StopTextInput) => unsafe {
+                #[allow(unused_variables)]
+                let crate::native::LegacyTextInput {
+                    text,
+                    selection_start,
+                    selection_end,
+                    is_password,
+                    is_multiline,
+                    element_id,
+                    max_length,
+                } = crate::native::LegacyTextInput::from_request(&request);
+
                 self.current_element_id = element_id;
 
                 if element_id == 0 {
@@ -304,8 +307,7 @@ impl IosDisplay {
                     }
                 }
             },
-            SetImePosition { .. } => {}
-            SetImeEnabled(..) => {}
+            SetTextInputRect { .. } => {}
             _ => {}
         }
     }

@@ -248,7 +248,9 @@ pub extern "C" fn frame() {
                 Request::ShowKeyboard(show) => unsafe {
                     sapp_show_keyboard(show);
                 },
-                Request::UpdateTextInputState {
+                request @ (Request::SetTextInputState(_) | Request::StopTextInput) => unsafe {
+                #[allow(unused_variables)]
+                let crate::native::LegacyTextInput {
                     text,
                     selection_start,
                     selection_end,
@@ -256,7 +258,8 @@ pub extern "C" fn frame() {
                     is_multiline,
                     element_id,
                     max_length,
-                } => unsafe {
+                } = crate::native::LegacyTextInput::from_request(&request);
+
                     sapp_update_text_input_state(
                         text.as_ptr(),
                         text.len(),
@@ -268,11 +271,12 @@ pub extern "C" fn frame() {
                         max_length,
                     );
                 },
-                Request::SetImePosition { x, y } => unsafe {
+                Request::SetTextInputRect { x, y, .. } => unsafe {
+                    let (x, y) = (x as i32, y as i32);
                     sapp_set_ime_position(x, y);
                 },
-                Request::SetImeEnabled(enabled) => unsafe {
-                    sapp_set_ime_enabled(enabled);
+                Request::StartTextInput(_) => unsafe {
+                    sapp_set_ime_enabled(true);
                 },
                 _ => {}
             }

@@ -1553,7 +1553,8 @@ where
                             .pointer_context
                             .set_cursor(&mut display.client, cursor_visible.then_some(cursor_icon));
                     }
-                    Request::SetImeEnabled(enabled) => {
+                    request @ (Request::StartTextInput(_) | Request::StopTextInput) => {
+                        let enabled = matches!(request, Request::StartTextInput(_));
                         if !enabled {
                             display.external_ime_active = false;
                         }
@@ -1578,7 +1579,8 @@ where
                             );
                         }
                     }
-                    Request::SetImePosition { x, y } => {
+                    Request::SetTextInputRect { x, y, .. } => {
+                        let (x, y) = (x as i32, y as i32);
                         if !display.text_input.is_null() {
                             wl_request!(
                                 display.client,

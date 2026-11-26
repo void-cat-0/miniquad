@@ -308,15 +308,18 @@ impl MainThreadState {
                 let env = attach_jni_env();
                 ndk_utils::call_void_method!(env, ACTIVITY, "showKeyboard", "(Z)V", show as i32);
             },
-            UpdateTextInputState {
-                text,
-                selection_start,
-                selection_end,
-                is_password,
-                is_multiline,
-                element_id,
-                max_length,
-            } => unsafe {
+            request @ (SetTextInputState(_) | StopTextInput) => unsafe {
+                #[allow(unused_variables)]
+                let crate::native::LegacyTextInput {
+                    text,
+                    selection_start,
+                    selection_end,
+                    is_password,
+                    is_multiline,
+                    element_id,
+                    max_length,
+                } = crate::native::LegacyTextInput::from_request(&request);
+
                 let env = attach_jni_env();
                 let c_text = std::ffi::CString::new(text).unwrap_or_default();
                 let text_jstring = (**env).NewStringUTF.unwrap()(env, c_text.as_ptr());
@@ -335,12 +338,7 @@ impl MainThreadState {
                 );
                 (**env).DeleteLocalRef.unwrap()(env, text_jstring);
             },
-            SetImePosition { .. } => {
-                // IME position control not applicable on Android
-            }
-            SetImeEnabled(..) => {
-                // IME enable/disable not applicable on Android
-            }
+            SetTextInputRect { .. } => {}
             _ => {}
         }
     }

@@ -240,13 +240,19 @@ pub trait EventHandler {
     /// can be requested with `ctx.dropped_file_bytes()`.
     fn files_dropped_event(&mut self) {}
 
-    /// Get IME preedit text and the cursor position in UTF-16 code units.
+    /// Composition (preedit) text from a desktop input method and the caret
+    /// inside it, in UTF-16 code units. Empty text ends the composition.
+    /// See [`crate::text_input`].
     fn on_ime_preedit(&mut self, _text: &str, _cursor_pos: usize) {}
-    
-    /// Called when IME composition is committed with final text
+
+    /// Final text from a desktop input method, replacing the composition.
+    /// `None` cancels a composition without inserting text.
     fn on_ime_commit(&mut self, _text: Option<&str>) {}
 
-    /// Called when IME state changes on mobile (text, selection, composing range)
+    /// The whole editing state of a platform text mirror (Android, iOS, web)
+    /// after an input-method edit. Offsets are UTF-16 code units; the
+    /// selection is anchor (`start`) to extent (`end`). `element_id` is kept
+    /// for compatibility and is always 1 during a session.
     fn on_ime_state_changed(
         &mut self,
         _text: &str,
@@ -255,5 +261,16 @@ pub trait EventHandler {
         _composing_start: Option<usize>,
         _composing_end: Option<usize>,
         _element_id: u64,
-    ) {}
+    ) {
+    }
+
+    /// The keyboard's action key was pressed (or Enter in a single-line
+    /// field on a mirroring platform).
+    fn text_input_action_event(&mut self, _action: crate::TextInputAction) {}
+
+    /// A soft keyboard appeared, moved, or hid. The frame is in physical
+    /// window pixels; it is empty when the keyboard is hidden. On platforms
+    /// that shrink the window above the keyboard (Android, iOS), the frame
+    /// lies just below the window and a resize event reports the new size.
+    fn soft_keyboard_event(&mut self, _visible: bool, _x: f32, _y: f32, _w: f32, _h: f32) {}
 }

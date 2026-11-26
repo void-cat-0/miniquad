@@ -271,7 +271,8 @@ impl MacosDisplay {
             ShowKeyboard(..) => {
                 // Not applicable on macOS desktop
             }
-            SetImePosition { x, y } => {
+            SetTextInputRect { x, y, .. } => {
+                let (x, y) = (x as i32, y as i32);
                 self.ime_position = (x, y);
                 unsafe {
                     let input_context: ObjcId = msg_send![self.view, inputContext];
@@ -282,7 +283,8 @@ impl MacosDisplay {
                     }
                 }
             }
-            SetImeEnabled(enabled) => {
+            request @ (StartTextInput(_) | StopTextInput) => {
+                let enabled = matches!(request, StartTextInput(_));
                 self.ime_enabled = enabled;
                 unsafe {
                     if enabled && self.window != nil && self.view != nil {
@@ -308,7 +310,7 @@ impl MacosDisplay {
                     }
                 }
             }
-            UpdateTextInputState { .. } => {}
+            SetTextInputState(_) => {}
         }
     }
 }

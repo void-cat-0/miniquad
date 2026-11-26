@@ -1260,13 +1260,15 @@ impl WindowsDisplay {
                     IME_USER_DISABLED.store(true, std::sync::atomic::Ordering::Relaxed);
                 }
             }
-            SetImePosition { x, y } => {
+            SetTextInputRect { x, y, .. } => {
+                let (x, y) = (x as i32, y as i32);
                 self.set_ime_position(x, y);
             }
-            SetImeEnabled(enabled) => {
+            request @ (StartTextInput(_) | StopTextInput) => {
+                let enabled = matches!(request, StartTextInput(_));
                 self.set_ime_enabled(enabled);
             }
-            UpdateTextInputState { .. } => {}
+            SetTextInputState(_) => {}
         }
     }
 }

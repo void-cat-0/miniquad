@@ -312,7 +312,7 @@ impl X11Display {
                 self.pending_preedit_update = false;
                 let ime_active = crate::native_display()
                     .try_lock()
-                    .map(|d| d.ime_enabled)
+                    .map(|d| d.text_input.is_some())
                     .unwrap_or(false);
                 if ime_active {
                     event_handler.on_ime_preedit(&self.preedit_text, self.preedit_cursor);
@@ -325,7 +325,7 @@ impl X11Display {
             self.pending_preedit_update = false;
             let ime_active = crate::native_display()
                 .try_lock()
-                .map(|d| d.ime_enabled)
+                .map(|d| d.text_input.is_some())
                 .unwrap_or(false);
             if ime_active {
                 event_handler.on_ime_preedit(&self.preedit_text, self.preedit_cursor);
@@ -357,7 +357,7 @@ impl X11Display {
                             self.preedit_text.clear();
                             let ime_active = crate::native_display()
                                 .try_lock()
-                                .map(|d| d.ime_enabled)
+                                .map(|d| d.text_input.is_some())
                                 .unwrap_or(false);
                             if ime_active {
                                 event_handler.on_ime_preedit("", 0);
@@ -747,7 +747,8 @@ impl X11Display {
                 ShowKeyboard(..) => {
                     eprintln!("Not implemented for X11")
                 }
-                SetImePosition { x, y } => {
+                SetTextInputRect { x, y, .. } => {
+                    let (x, y) = (x as i32, y as i32);
                     if self.ime_pos != (x as i32, y as i32) {
                         self.ime_pos = (x as i32, y as i32);
                         if !self.xic.is_null() {
@@ -777,7 +778,8 @@ impl X11Display {
                         }
                     }
                 }
-                SetImeEnabled(enabled) => {
+                request @ (StartTextInput(_) | StopTextInput) => {
+                    let enabled = matches!(request, StartTextInput(_));
                     if !enabled {
                         self.preedit_text.clear();
                         self.pending_preedit_update = true;
@@ -790,7 +792,7 @@ impl X11Display {
                         }
                     }
                 }
-                UpdateTextInputState { .. } => {}
+                SetTextInputState(_) => {}
             }
         }
     }
