@@ -11,8 +11,8 @@ use crate::graphics::*;
 use super::backend::{IndexType, Texture};
 use super::cstr;
 use super::{
-    find_memory_type_index, TextureUploadArena, VulkanContext, DEPTH_FORMAT, IMAGE_BINDING_BASE,
-    TEXTURE_UPLOAD_ARENA_SIZE, UNIFORM_BINDING,
+    find_memory_type_index, PassRendering, TextureUploadArena, VulkanContext, DEPTH_FORMAT,
+    IMAGE_BINDING_BASE, TEXTURE_UPLOAD_ARENA_SIZE, UNIFORM_BINDING,
 };
 
 pub struct ShaderModule {
@@ -651,9 +651,8 @@ impl VulkanContext {
         Pipeline(index)
     }
 
-    /// The pipeline a target of `color_format` with `samples` samples per pixel
-    /// needs. Both are baked into the `VkPipeline`, so the first draw into a new
-    /// kind of target compiles the variant for it.
+    /// The pipeline for the given attachment formats and sample count.
+    /// The first draw into a different kind of target compiles a new variant.
     pub fn pipeline_for_target(
         &mut self,
         pipeline: Pipeline,
@@ -671,14 +670,19 @@ impl VulkanContext {
         }) {
             return existing.pipeline;
         }
-        let shader = module.shader;
+        let render_pass = match &mut self.rendering {
+            PassRendering::Legacy(passes) => {
+                passes.pipeline_pass(&self.device, color_formats, depth_format, samples)
+            }
+            PassRendering::Dynamic(_) => vk::RenderPass::null(),
+        };
         let created = self.create_graphics_pipeline(
-            shader,
-            &module.inputs,
+            module,
             &params,
             samples,
             color_formats,
             depth_format,
+            render_pass,
         );
         self.pipelines[pipeline.0].variants.push(PipelineVariant {
             color_formats: color_formats.to_vec(),
@@ -709,14 +713,15 @@ impl VulkanContext {
 
     fn create_graphics_pipeline(
         &self,
-        shader: usize,
-        inputs: &[VertexInput],
+        module: &PipelineModule,
         params: &PipelineParams,
         samples: u32,
         color_formats: &[vk::Format],
         depth_format: Option<vk::Format>,
+        render_pass: vk::RenderPass,
     ) -> vk::Pipeline {
-        let shader = &self.shaders[shader];
+        let shader = &self.shaders[module.shader];
+        let inputs = &module.inputs;
         unsafe {
             let entry_name = cstr(b"main\0");
             let stages = [
@@ -861,17 +866,6 @@ impl VulkanContext {
                 ..Default::default()
             };
 
-            // Dynamic rendering: the pipeline declares its attachment formats
-            // here instead of being tied to one `VkRenderPass`, so it has to be
-            // told the format of the target it is about to draw into.
-
-            let mut rendering =
-                vk::PipelineRenderingCreateInfo::builder().color_attachment_formats(color_formats);
-            if let Some(depth_format) = depth_format {
-                rendering = rendering.depth_attachment_format(depth_format);
-            }
-            let mut rendering = rendering.build();
-
             let create_info = vk::GraphicsPipelineCreateInfo::builder()
                 .stages(&stages)
                 .vertex_input_state(&vertex_input_state)
@@ -883,9 +877,16 @@ impl VulkanContext {
                 .color_blend_state(&color_blend_state)
                 .dynamic_state(&dynamic_state)
                 .layout(shader.pipeline_layout)
-                .push_next(&mut rendering)
-                .render_pass(vk::RenderPass::null())
+                .render_pass(render_pass)
                 .subpass(0);
+            let mut rendering = vk::PipelineRenderingCreateInfo::builder()
+                .color_attachment_formats(color_formats)
+                .depth_attachment_format(depth_format.unwrap_or(vk::Format::UNDEFINED));
+            let create_info = if render_pass == vk::RenderPass::null() {
+                create_info.push_next(&mut rendering)
+            } else {
+                create_info
+            };
 
             self.device
                 .create_graphics_pipelines(vk::PipelineCache::null(), &[create_info.build()], None)
@@ -1319,7 +1320,7 @@ impl VulkanContext {
                 vk::SampleCountFlags::TYPE_1,
             )?;
             let mut allocation = ResourceAllocation::new(&self.device, image, memory);
-            let attachment_levels = if access == TextureAccess::RenderTarget {
+            let attachment_levels = if depth || access == TextureAccess::RenderTarget {
                 1
             } else {
                 mip_levels
@@ -1634,6 +1635,9 @@ impl VulkanContext {
             }
             if let Some(sample_view) = module.sample_view {
                 self.device.destroy_image_view(sample_view, None);
+            }
+            if let PassRendering::Legacy(passes) = &mut self.rendering {
+                passes.release_framebuffers(&self.device, &[module.view]);
             }
             self.device.destroy_image_view(module.view, None);
             self.device.destroy_image(module.image, None);
@@ -2211,7 +2215,7 @@ impl VulkanContext {
     }
 
     pub fn delete_render_pass(&mut self, index: usize) {
-        // Dynamic rendering records attachment handles, not this pass ID.
+        // Native render passes and framebuffers don't belong to this ID.
         // End the matching pass so it cannot be reopened with a recycled ID.
         self.end_render_pass_if_target(Some(RenderPass(index)));
         if self.passes[index].take().is_some() {
@@ -2615,7 +2619,7 @@ fn align_to(align: u32, offset: u32) -> u32 {
 }
 
 /// Compute the std140 layout of a `UniformBlockLayout` alongside the tight
-/// offsets `apply_uniforms_from_bytes` uses to address the values.
+/// offsets `apply_uniforms_from_slice` uses to address the values.
 ///
 /// Returns `(tight offset, std140 offset, byte size, stride, count)` per uniform in
 /// declaration order, plus the total std140 block size.

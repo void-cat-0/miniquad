@@ -122,9 +122,10 @@ pub enum WaylandDecorations {
 pub enum RenderingBackend {
     #[default]
     OpenGl,
-    /// Requires the `vulkan` feature and either Vulkan 1.3 or Vulkan 1.2
-    /// with `VK_KHR_dynamic_rendering`. On Android this is experimental and
-    /// requires a compatible system loader (normally Android 13+) and driver.
+    /// Requires the `vulkan` feature, Vulkan 1.1 or newer, and window
+    /// presentation support. Uses dynamic rendering on Vulkan 1.3+ or on
+    /// Vulkan 1.2 with `VK_KHR_dynamic_rendering` and its feature enabled.
+    /// On Android this is experimental and depends on the system loader and driver.
     Vulkan,
     /// Try Vulkan on the actual window before creating the event handler. Use
     /// OpenGL (GLES on Android) if Vulkan is unavailable or initialization

@@ -153,7 +153,9 @@ pub mod window {
             let vulkan_window = {
                 let d = native_display().lock().unwrap();
                 (d.rendering_backend == conf::RenderingBackend::Vulkan).then(|| {
-                    let handles = d.vulkan_window.expect("Vulkan window handles are unavailable");
+                    let handles = d
+                        .vulkan_window
+                        .expect("Vulkan window handles are unavailable");
                     (handles, (d.screen_width as u32, d.screen_height as u32))
                 })
             };
@@ -443,7 +445,8 @@ pub mod window {
 
         #[cfg(not(target_os = "android"))]
         {
-            let _ = d.native_requests
+            let _ = d
+                .native_requests
                 .send(native::Request::UpdateTextInputState {
                     text,
                     selection_start,
@@ -485,7 +488,7 @@ pub mod window {
     pub fn set_ime_enabled(enabled: bool) {
         let mut d = native_display().lock().unwrap();
         d.ime_enabled = enabled;
-        
+
         #[cfg(target_os = "android")]
         {
             let _ = enabled; // IME control not applicable on Android
@@ -498,7 +501,7 @@ pub mod window {
                 .unwrap();
         }
     }
-    
+
     pub fn is_ime_enabled() -> bool {
         let d = native_display().lock().unwrap();
         d.ime_enabled
@@ -544,7 +547,11 @@ where
 {
     #[cfg(not(all(
         feature = "vulkan",
-        any(windows, target_os = "android", all(target_os = "linux", not(target_env = "ohos")))
+        any(
+            windows,
+            target_os = "android",
+            all(target_os = "linux", not(target_env = "ohos"))
+        )
     )))]
     let conf = {
         let mut conf = conf;
@@ -554,18 +561,20 @@ where
         conf
     };
     if conf.platform.rendering_backend == conf::RenderingBackend::Vulkan {
-        assert!(
-            cfg!(feature = "vulkan"),
-            "Vulkan requires the `vulkan` Cargo feature"
-        );
-        assert!(
-            cfg!(any(
-                windows,
-                target_os = "android",
-                all(target_os = "linux", not(target_env = "ohos"))
-            )),
-            "Vulkan is supported on Windows, desktop Linux, and Android"
-        );
+        const {
+            assert!(
+                cfg!(feature = "vulkan"),
+                "Vulkan requires the `vulkan` Cargo feature"
+            );
+            assert!(
+                cfg!(any(
+                    windows,
+                    target_os = "android",
+                    all(target_os = "linux", not(target_env = "ohos"))
+                )),
+                "Vulkan is supported on Windows, desktop Linux, and Android"
+            );
+        }
     }
     #[cfg(target_env = "ohos")]
     unsafe {
@@ -587,8 +596,7 @@ where
                 if let Err(err) = native::linux_x11::run(&conf, f) {
                     eprintln!("{err:?}");
                     eprintln!("Failed to initialize through X11! Trying wayland instead");
-                    native::linux_wayland::run(&conf, f)
-                        .expect("X11 and Wayland backends failed");
+                    native::linux_wayland::run(&conf, f).expect("X11 and Wayland backends failed");
                 }
             }
             conf::LinuxBackend::WaylandWithX11Fallback => {

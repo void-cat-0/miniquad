@@ -1148,7 +1148,9 @@ impl RenderingBackend for MetalContext {
         }
     }
 
-    fn apply_uniforms_from_bytes(&mut self, uniform_ptr: *const u8, size: usize) {
+    fn apply_uniforms_from_slice(&mut self, bytes: &[u8]) {
+        let uniform_ptr = bytes.as_ptr();
+        let size = bytes.len();
         assert!(
             self.current_pipeline.is_some(),
             "apply_uniforms before apply_pipeline"

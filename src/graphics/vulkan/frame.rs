@@ -1,5 +1,6 @@
+use super::pass::{AttachmentView, ColorAttachment, PassTarget};
 use super::resource::{image_barrier, transfer_destination_layout, vk_index_type};
-use super::{VulkanContext, DEPTH_FORMAT, MAX_FRAMES_IN_FLIGHT};
+use super::{PassRendering, VulkanContext, MAX_FRAMES_IN_FLIGHT};
 use crate::graphics::*;
 use ash::vk;
 use ash::vk::Handle;
@@ -1076,199 +1077,83 @@ impl VulkanContext {
         self.bound_textures.clear();
     }
 
-    fn open_pass(&mut self, action: PassAction) -> vk::Rect2D {
-        let (
-            color_views,
-            resolve_views,
-            depth_view,
-            samples,
-            width,
-            height,
-            color_formats,
-            depth_format,
-        ) = match self.cur_target {
-            None => {
-                self.transition_swapchain_image();
-                self.transition_pass_texture(
-                    self.default_depth.texture as usize,
-                    vk::ImageLayout::DEPTH_STENCIL_ATTACHMENT_OPTIMAL,
-                );
-                (
-                    vec![self.swapchain_image_views[self.acquired_image.unwrap()]],
-                    vec![vk::ImageView::null()],
-                    self.textures[self.default_depth.texture as usize].view,
-                    1,
-                    self.swapchain_extent.width,
-                    self.swapchain_extent.height,
-                    vec![self.surface_format.format],
-                    DEPTH_FORMAT,
-                )
-            }
-            Some(pass) => {
-                self.transition_attachments(pass);
-                let module = self.passes[pass]
-                    .as_ref()
-                    .expect("the render pass has been deleted");
-                let target = module
+    fn pass_target(&mut self) -> PassTarget {
+        let attachment = |texture: &super::TextureModule| AttachmentView {
+            view: texture.view,
+            format: texture.format,
+        };
+        if let Some(pass) = self.cur_target {
+            self.transition_attachments(pass);
+            let module = self.passes[pass]
+                .as_ref()
+                .expect("the render pass has been deleted");
+            let texture = |texture: super::Texture| &self.textures[texture.texture as usize];
+            let first = texture(module.colors.first().copied().or(module.depth).unwrap());
+            PassTarget {
+                colors: module
                     .colors
-                    .first()
-                    .copied()
-                    .or(module.depth)
-                    .expect("Render pass has no attachments");
-                (
-                    module
-                        .colors
-                        .iter()
-                        .map(|color| self.textures[color.texture as usize].view)
-                        .collect(),
-                    module
-                        .resolves
-                        .iter()
-                        .map(|resolve| {
-                            resolve.map_or(vk::ImageView::null(), |r| {
-                                self.textures[r.texture as usize].view
-                            })
-                        })
-                        .collect::<Vec<_>>(),
-                    module.depth.map_or(vk::ImageView::null(), |depth| {
-                        self.textures[depth.texture as usize].view
-                    }),
-                    module.samples,
-                    self.textures[target.texture as usize].width,
-                    self.textures[target.texture as usize].height,
-                    module
-                        .colors
-                        .iter()
-                        .map(|color| self.textures[color.texture as usize].format)
-                        .collect(),
-                    module.depth.map_or(DEPTH_FORMAT, |depth| {
-                        self.textures[depth.texture as usize].format
-                    }),
-                )
-            }
-        };
-        self.cur_samples = samples;
-        self.cur_color_formats = color_formats;
-        self.cur_depth_format = if depth_view == vk::ImageView::null() {
-            None
-        } else {
-            Some(depth_format)
-        };
-
-        let mut clear = vk::ClearValue {
-            color: vk::ClearColorValue {
-                float32: [0.0, 0.0, 0.0, 1.0],
-            },
-        };
-        let mut clear_depth = vk::ClearDepthStencilValue {
-            depth: 1.0,
-            stencil: 0,
-        };
-        let (color_load_op, depth_load_op) = match action {
-            PassAction::Nothing => (vk::AttachmentLoadOp::LOAD, vk::AttachmentLoadOp::LOAD),
-            PassAction::Clear {
-                color: clear_color,
-                depth,
-                stencil,
-            } => {
-                if let Some((r, g, b, a)) = clear_color {
-                    clear.color = vk::ClearColorValue {
-                        float32: [r, g, b, a],
-                    };
-                }
-                if let Some(v) = depth {
-                    clear_depth.depth = v;
-                }
-                if let Some(v) = stencil {
-                    clear_depth.stencil = v as u32;
-                }
-                (
-                    if clear_color.is_some() {
-                        vk::AttachmentLoadOp::CLEAR
-                    } else {
-                        vk::AttachmentLoadOp::LOAD
-                    },
-                    if depth.is_some() {
-                        vk::AttachmentLoadOp::CLEAR
-                    } else {
-                        vk::AttachmentLoadOp::LOAD
-                    },
-                )
-            }
-        };
-
-        let color_layout = vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL;
-        let color_attachments: Vec<_> = color_views
-            .iter()
-            .zip(&resolve_views)
-            .map(|(&color_view, &resolve_view)| {
-                let has_resolve = resolve_view != vk::ImageView::null();
-                vk::RenderingAttachmentInfo::builder()
-                    .image_view(color_view)
-                    .image_layout(color_layout)
-                    .resolve_mode(if has_resolve {
-                        vk::ResolveModeFlags::AVERAGE
-                    } else {
-                        vk::ResolveModeFlags::NONE
+                    .iter()
+                    .zip(&module.resolves)
+                    .map(|(&color, &resolve)| ColorAttachment {
+                        image: attachment(texture(color)),
+                        resolve: resolve.map(|resolve| texture(resolve).view),
                     })
-                    .resolve_image_view(resolve_view)
-                    .resolve_image_layout(if has_resolve {
-                        vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL
-                    } else {
-                        vk::ImageLayout::UNDEFINED
-                    })
-                    .load_op(color_load_op)
-                    .store_op(vk::AttachmentStoreOp::STORE)
-                    .clear_value(clear)
-                    .build()
-            })
-            .collect();
-        let has_depth = depth_view != vk::ImageView::null();
-        let depth_attachments = [vk::RenderingAttachmentInfo::builder()
-            .image_view(depth_view)
-            .image_layout(vk::ImageLayout::DEPTH_STENCIL_ATTACHMENT_OPTIMAL)
-            .load_op(depth_load_op)
-            .store_op(vk::AttachmentStoreOp::STORE)
-            .clear_value(vk::ClearValue {
-                depth_stencil: clear_depth,
-            })
-            .build()];
-
-        let area = vk::Rect2D {
-            offset: vk::Offset2D { x: 0, y: 0 },
-            extent: vk::Extent2D { width, height },
-        };
-        let rendering_info = vk::RenderingInfo {
-            render_area: area,
-            layer_count: 1,
-            color_attachment_count: color_attachments.len() as u32,
-            p_color_attachments: color_attachments.as_ptr(),
-            p_depth_attachment: if has_depth {
-                depth_attachments.as_ptr()
-            } else {
-                std::ptr::null()
-            },
-            p_stencil_attachment: std::ptr::null(),
-            ..Default::default()
-        };
-
-        if self.recorder.enabled() {
-            self.recorder.begin(
-                area,
-                &color_attachments,
-                if has_depth {
-                    Some(depth_attachments[0])
-                } else {
-                    None
+                    .collect(),
+                depth: module.depth.map(|depth| attachment(texture(depth))),
+                extent: vk::Extent2D {
+                    width: first.width,
+                    height: first.height,
                 },
-            );
+                samples: module.samples,
+            }
         } else {
-            unsafe {
-                self.dynamic_rendering.begin(
-                    &self.device,
-                    self.frame_command_buffer(),
-                    &rendering_info,
-                );
+            self.transition_swapchain_image();
+            let depth = self.default_depth.texture as usize;
+            self.transition_pass_texture(depth, vk::ImageLayout::DEPTH_STENCIL_ATTACHMENT_OPTIMAL);
+            PassTarget {
+                colors: vec![ColorAttachment {
+                    image: AttachmentView {
+                        view: self.swapchain_image_views[self.acquired_image.unwrap()],
+                        format: self.surface_format.format,
+                    },
+                    resolve: None,
+                }],
+                depth: Some(attachment(&self.textures[depth])),
+                extent: self.swapchain_extent,
+                samples: 1,
+            }
+        }
+    }
+
+    fn open_pass(&mut self, action: PassAction) -> vk::Rect2D {
+        let target = self.pass_target();
+        self.cur_samples = target.samples;
+        self.cur_color_formats.clear();
+        self.cur_color_formats
+            .extend(target.colors.iter().map(|color| color.image.format));
+        self.cur_depth_format = target.depth.map(|depth| depth.format);
+        let area = target.area();
+        let command = self.frame_command_buffer();
+        match &mut self.rendering {
+            PassRendering::Legacy(passes) => {
+                passes.begin(&self.device, command, &target, action.into())
+            }
+            PassRendering::Dynamic(dynamic) => {
+                let (colors, depth) = target.dynamic_attachments(action.into());
+                if self.recorder.enabled() {
+                    self.recorder.begin(area, &colors, depth);
+                } else {
+                    let info = vk::RenderingInfo::builder()
+                        .render_area(area)
+                        .layer_count(1)
+                        .color_attachments(&colors);
+                    let info = if let Some(depth) = &depth {
+                        info.depth_attachment(depth)
+                    } else {
+                        info
+                    };
+                    unsafe { dynamic.begin(&self.device, command, &info) };
+                }
             }
         }
 
@@ -1316,18 +1201,21 @@ impl VulkanContext {
         if !self.pass_open {
             return;
         }
-        if self.recorder.enabled() {
-            self.recorder.batch(
-                &self.cur_color_formats,
-                self.cur_depth_format,
-                self.cur_samples,
-            );
-            self.recorder.end();
-        } else {
-            unsafe {
-                self.dynamic_rendering
-                    .end(&self.device, self.frame_command_buffer());
+        match &self.rendering {
+            PassRendering::Legacy(_) => unsafe {
+                self.device.cmd_end_render_pass(self.frame_command_buffer());
+            },
+            PassRendering::Dynamic(_) if self.recorder.enabled() => {
+                self.recorder.batch(
+                    &self.cur_color_formats,
+                    self.cur_depth_format,
+                    self.cur_samples,
+                );
+                self.recorder.end();
             }
+            PassRendering::Dynamic(dynamic) => unsafe {
+                dynamic.end(&self.device, self.frame_command_buffer());
+            },
         }
         self.pass_open = false;
         self.cmd_dirty = true;
@@ -1336,6 +1224,9 @@ impl VulkanContext {
     pub fn flush_draw_commands(&mut self) {
         #[cfg(feature = "tracy")]
         let _span = crate::tracy::span(crate::tracy::span_location!("Vulkan::flush_draw_commands"));
+        let PassRendering::Dynamic(dynamic) = &self.rendering else {
+            return;
+        };
         if self.recorder.enabled() && self.frame_active {
             if self.pass_open {
                 self.recorder.batch(
@@ -1345,12 +1236,8 @@ impl VulkanContext {
                 );
             }
             let command_buffer = self.frame_command_buffer();
-            self.recorder.execute(
-                &self.device,
-                &self.dynamic_rendering,
-                command_buffer,
-                self.current_frame,
-            );
+            self.recorder
+                .execute(&self.device, dynamic, command_buffer, self.current_frame);
         }
     }
 
@@ -1378,10 +1265,8 @@ impl VulkanContext {
         }
     }
 
-    /// `vkCmdBeginRendering` has no `initialLayout` to transition from, so the
-    /// acquired swap chain image has to be moved into attachment layout
-    /// explicitly. Its previous contents are never needed: the first pass of
-    /// every frame clears.
+    /// Both rendering paths expect swapchain images in attachment layout.
+    /// The first pass of the frame can discard the previous frame's pixels.
     fn transition_swapchain_image(&mut self) {
         let index = self.acquired_image.unwrap();
         let image = self.swapchain_images[index];
@@ -1578,9 +1463,8 @@ impl VulkanContext {
         self.textures[index].layout = to;
     }
 
-    /// # Safety
-    /// `uniform_ptr` must address `size` readable bytes in the bound shader's uniform layout.
-    pub unsafe fn apply_uniforms_from_bytes(&mut self, uniform_ptr: *const u8, size: usize) {
+    /// Copies the caller's uniform bytes into the bound shader's std140 block.
+    pub fn apply_uniforms_from_slice(&mut self, bytes: &[u8]) {
         if !self.frame_active {
             return;
         }
@@ -1603,18 +1487,17 @@ impl VulkanContext {
         // may differ and the unused std140 padding stays zeroed.
         for &(tight, std140, element, stride, count) in &module.uniform_offsets {
             assert!(
-                tight as usize + count as usize * element as usize <= size,
+                tight as usize + count as usize * element as usize <= bytes.len(),
                 "Uniforms struct does not match shader uniforms layout"
             );
-            for index in 0..count {
-                ptr::copy_nonoverlapping(
-                    uniform_ptr.add((tight + index * element) as usize).cast(),
-                    uniforms
-                        .bytes
-                        .as_mut_ptr()
-                        .add((std140 + index * stride) as usize),
-                    element as usize,
-                );
+            for index in 0..count as usize {
+                let source =
+                    &bytes[(tight as usize + index * element as usize)..][..element as usize];
+                let destination = &mut uniforms.bytes
+                    [(std140 as usize + index * stride as usize)..][..element as usize];
+                for (destination, source) in destination.iter_mut().zip(source) {
+                    destination.write(*source);
+                }
             }
         }
     }

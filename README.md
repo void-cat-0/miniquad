@@ -24,10 +24,18 @@ Miniquad aims to provide a graphics abstraction that works the same way on any p
 Build with `--features vulkan` and set `Conf.platform.rendering_backend` to
 `RenderingBackend::Vulkan` to require Vulkan or `RenderingBackend::VulkanPreferred`
 to try Vulkan on the actual window and use OpenGL/GLES if startup fails. Vulkan
-requires a 1.3 device with dynamic rendering, or Vulkan 1.2 with
-`VK_KHR_dynamic_rendering`. Android also needs a compatible system loader
-(normally Android 13 or newer) and driver. Vulkan builds require a C++ compiler
-for glslang.
+requires a 1.1+ loader and device with `VK_KHR_swapchain` and window presentation.
+It uses core dynamic rendering on Vulkan 1.3+, or `VK_KHR_dynamic_rendering` on
+Vulkan 1.2 when the feature is available. Otherwise it uses a traditional render
+pass. Android support depends on the system loader and GPU driver. Vulkan builds
+require a C++ compiler for glslang.
+
+For testing, `MINIQUAD_VULKAN_MAX_API=1.1` selects traditional render passes even
+on newer drivers. `MINIQUAD_VULKAN_MAX_API=1.2` allows testing the KHR path on a
+newer driver that advertises the extension. The traditional path records draws
+inline, without the dynamic path's parallel command recorder. To check selection
+and attachment behavior, run `vulkan_pass_regression` with
+`--expect-rendering=legacy`, `--expect-rendering=khr`, or `--expect-rendering=core`.
 
 Vulkan supports offscreen MSAA with resolve attachments, but the default window
 framebuffer stays single-sampled and ignores `Platform.swap_interval`. Stencil

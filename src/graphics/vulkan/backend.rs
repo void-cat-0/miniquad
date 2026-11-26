@@ -76,7 +76,9 @@ impl VulkanBackend {
         size: (u32, u32),
         max_size: NonZeroU32,
     ) -> Self {
-        Self::from_context(VulkanContext::with_texture_size_limit(display, window, size, max_size))
+        Self::from_context(VulkanContext::with_texture_size_limit(
+            display, window, size, max_size,
+        ))
     }
 
     pub(crate) fn from_context(context: VulkanContext) -> Self {
@@ -592,8 +594,8 @@ impl RenderingBackend for VulkanBackend {
             images.iter().map(|id| self.texture_index(*id)),
         );
     }
-    fn apply_uniforms_from_bytes(&mut self, ptr: *const u8, size: usize) {
-        unsafe { self.context.get_mut().apply_uniforms_from_bytes(ptr, size) };
+    fn apply_uniforms_from_slice(&mut self, bytes: &[u8]) {
+        self.context.get_mut().apply_uniforms_from_slice(bytes);
     }
     fn clear(
         &mut self,

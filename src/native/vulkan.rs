@@ -1,7 +1,10 @@
 use raw_window_handle_vulkan::*;
 use std::{cell::RefCell, num::NonZeroU32};
 
-use crate::{conf::RenderingBackend, vulkan::VulkanContext};
+use crate::{
+    conf::RenderingBackend,
+    vulkan::{report_startup_api, VulkanContext},
+};
 
 thread_local! {
     static PREPARED_CONTEXT: RefCell<Option<VulkanContext>> = const { RefCell::new(None) };
@@ -77,8 +80,10 @@ impl VulkanWindow {
                             crate::native::android::log_diagnostic(
                                 "INFO",
                                 &format!(
-                                    "Vulkan initialized: {device_name}, API 0x{:x}.",
-                                    properties.api_version
+                                    "Vulkan initialized: {device_name}, device API {}, effective API {}, render passes: {:?}.",
+                                    crate::vulkan::format_api_version(context.physical_device_api_version()),
+                                    crate::vulkan::format_api_version(context.api_version()),
+                                    context.rendering_mode(),
                                 ),
                             );
                         }
@@ -90,6 +95,7 @@ impl VulkanWindow {
                         super::android::warn_vulkan_fallback(&error);
                         #[cfg(not(target_os = "android"))]
                         eprintln!("Vulkan startup failed ({error}); using OpenGL");
+                        report_startup_api();
                         None
                     }
                 }

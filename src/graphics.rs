@@ -1102,6 +1102,18 @@ impl<'a> UniformsSource<'a> {
             _phantom: std::marker::PhantomData,
         })
     }
+
+    /// Uniform bytes whose layout the shader's `ShaderMeta` describes, e.g. a
+    /// material's pre-packed `Vec<f32>`.
+    pub fn slice<T>(data: &'a [T]) -> UniformsSource<'a> {
+        Self(Arg {
+            ptr: data.as_ptr() as _,
+            size: std::mem::size_of_val(data),
+            element_size: std::mem::size_of::<T>(),
+            is_slice: true,
+            _phantom: std::marker::PhantomData,
+        })
+    }
 }
 
 #[derive(Debug)]
@@ -1626,9 +1638,13 @@ pub trait RenderingBackend {
     }
 
     fn apply_uniforms(&mut self, uniforms: UniformsSource) {
-        self.apply_uniforms_from_bytes(uniforms.0.ptr as _, uniforms.0.size)
+        // Safety: `UniformsSource` only holds a pointer to a live borrow, and
+        // `u8` slices have no alignment requirement.
+        let bytes =
+            unsafe { std::slice::from_raw_parts(uniforms.0.ptr as *const u8, uniforms.0.size) };
+        self.apply_uniforms_from_slice(bytes)
     }
-    fn apply_uniforms_from_bytes(&mut self, uniform_ptr: *const u8, size: usize);
+    fn apply_uniforms_from_slice(&mut self, bytes: &[u8]);
 
     fn clear(
         &mut self,

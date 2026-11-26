@@ -2200,7 +2200,9 @@ impl RenderingBackend for GlContext {
         }
     }
 
-    fn apply_uniforms_from_bytes(&mut self, uniform_ptr: *const u8, size: usize) {
+    fn apply_uniforms_from_slice(&mut self, bytes: &[u8]) {
+        let uniform_ptr = bytes.as_ptr();
+        let size = bytes.len();
         let pip = &self.pipelines[self.cache.cur_pipeline.unwrap().0];
         let shader = &self.shaders[pip.shader.0];
 

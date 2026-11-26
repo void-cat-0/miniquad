@@ -4,7 +4,9 @@ use std::num::NonZeroU32;
 use std::os::raw::c_char;
 
 use ash::extensions::ext::DebugUtils;
-use ash::extensions::khr::{DynamicRendering as KhrDynamicRendering, Surface, Swapchain};
+use ash::extensions::khr::{
+    DynamicRendering as KhrDynamicRendering, Surface, Swapchain, Synchronization2,
+};
 use ash::vk::Handle;
 use ash::{vk, Device, Entry, Instance};
 use raw_window_handle_vulkan::{RawDisplayHandle, RawWindowHandle};
@@ -17,6 +19,7 @@ use backend::Texture;
 pub use backend::VulkanBackend;
 mod shader;
 pub use shader::{compile_glsl, translate_glsl};
+mod pass;
 mod recording;
 mod resource;
 mod submission;
@@ -94,6 +97,22 @@ struct TextureUploadArena {
     offset: vk::DeviceSize,
 }
 
+/// The render-pass API used by an initialized Vulkan backend.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum VulkanRenderingMode {
+    /// Traditional VkRenderPass and VkFramebuffer.
+    Legacy,
+    /// VK_KHR_dynamic_rendering on Vulkan 1.2.
+    DynamicKhr,
+    /// Core dynamic rendering on Vulkan 1.3 or newer.
+    DynamicCore,
+}
+
+enum PassRendering {
+    Legacy(pass::LegacyRenderPasses),
+    Dynamic(DynamicRenderingMode),
+}
+
 pub(crate) enum DynamicRenderingMode {
     Core,
     Khr(KhrDynamicRendering),
@@ -130,6 +149,8 @@ pub struct VulkanContext {
 
     pub surface: vk::SurfaceKHR,
     pub physical_device: vk::PhysicalDevice,
+    api_version: u32,
+    physical_device_api_version: u32,
     pub memory_properties: vk::PhysicalDeviceMemoryProperties,
     /// Initial limit for managed texture dimensions. Changing this informational
     /// field does not affect allocation or resize validation.
@@ -152,7 +173,7 @@ pub struct VulkanContext {
     /// Indexed by frame slot, independently of the acquired swapchain image.
     pub command_buffers: Vec<vk::CommandBuffer>,
     pub(crate) recorder: recording::CommandRecorder,
-    pub(crate) dynamic_rendering: DynamicRenderingMode,
+    rendering: PassRendering,
     /// Only this worker accesses the graphics queue between a frame handoff
     /// and `drain_submissions`. Synchronous resource operations drain first.
     submission: Option<submission::SubmissionWorker>,
@@ -240,7 +261,7 @@ pub struct VulkanContext {
     pub acquired_image: Option<usize>,
     pub recording: bool,
     pub pass_open: bool,
-    /// A transfer ended dynamic rendering, but the caller still owns this pass.
+    /// A transfer ended native rendering, but the caller still owns this pass.
     pass_suspended: bool,
     pub frame_active: bool,
     /// Whether commands have been recorded into the frame command buffer since
@@ -366,6 +387,78 @@ impl<T> AtStartup<T> for Result<T, vk::Result> {
     }
 }
 
+pub(crate) fn format_api_version(version: u32) -> String {
+    format!(
+        "{}.{}.{} (0x{version:08x})",
+        vk::api_version_major(version),
+        vk::api_version_minor(version),
+        vk::api_version_patch(version),
+    )
+}
+
+/// Query Vulkan independently of window extensions, presentation, and the
+/// requested validation layer: any of those may have blocked startup.
+pub(crate) fn report_startup_api() {
+    fn log(message: &str) {
+        #[cfg(target_os = "android")]
+        crate::native::android::log_diagnostic("WARN", message);
+        #[cfg(not(target_os = "android"))]
+        eprintln!("{message}");
+    }
+
+    let entry = match unsafe { Entry::load() } {
+        Ok(entry) => entry,
+        Err(error) => {
+            log(&format!(
+                "Vulkan loader and device API unavailable: {error}"
+            ));
+            return;
+        }
+    };
+    match entry.try_enumerate_instance_version() {
+        Ok(version) => log(&format!(
+            "Vulkan loader API: {}",
+            format_api_version(version.unwrap_or(vk::API_VERSION_1_0)),
+        )),
+        Err(error) => log(&format!("Vulkan loader API unavailable: {error:?}")),
+    }
+
+    // The default Vulkan 1.0 instance is sufficient to query the version each
+    // physical device advertises, even when the loader is too old for rendering.
+    unsafe {
+        let instance = match entry.create_instance(&vk::InstanceCreateInfo::default(), None) {
+            Ok(instance) => instance,
+            Err(error) => {
+                log(&format!(
+                    "Vulkan device API unavailable: create diagnostic instance: {error:?}"
+                ));
+                return;
+            }
+        };
+        match instance.enumerate_physical_devices() {
+            Ok(devices) if devices.is_empty() => {
+                log("Vulkan device API unavailable: no physical devices reported");
+            }
+            Ok(devices) => {
+                for device in devices {
+                    let properties = instance.get_physical_device_properties(device);
+                    let name = CStr::from_ptr(properties.device_name.as_ptr()).to_string_lossy();
+                    log(&format!(
+                        "Vulkan device API: {} — {name} (vendor 0x{:04x}, device 0x{:04x})",
+                        format_api_version(properties.api_version),
+                        properties.vendor_id,
+                        properties.device_id,
+                    ));
+                }
+            }
+            Err(error) => log(&format!(
+                "Vulkan device API unavailable: enumerate physical devices: {error:?}"
+            )),
+        }
+        instance.destroy_instance(None);
+    }
+}
+
 impl VulkanContext {
     pub fn new(
         display: RawDisplayHandle,
@@ -381,8 +474,12 @@ impl VulkanContext {
         window_size: (u32, u32),
         max_size: NonZeroU32,
     ) -> Self {
-        Self::try_with_texture_size_limit(display, window, window_size, max_size)
-            .unwrap_or_else(|error| panic!("Vulkan startup failed: {}", error))
+        Self::try_with_texture_size_limit(display, window, window_size, max_size).unwrap_or_else(
+            |error| {
+                report_startup_api();
+                panic!("Vulkan startup failed: {error}")
+            },
+        )
     }
 
     pub(crate) fn try_with_texture_size_limit(
@@ -423,14 +520,27 @@ impl VulkanContext {
             }
 
             // The loader and physical device both limit the effective API.
+            // A lower application API lets tests exercise the fallback without
+            // changing drivers or relying on which GPU the loader finds first.
+            let max_api = match std::env::var("MINIQUAD_VULKAN_MAX_API").as_deref() {
+                Ok("1.1") => vk::API_VERSION_1_1,
+                Ok("1.2") => vk::API_VERSION_1_2,
+                Ok("1.3") | Err(_) => vk::API_VERSION_1_3,
+                Ok(_) => {
+                    return Err(VulkanInitError(
+                        "MINIQUAD_VULKAN_MAX_API must be 1.1, 1.2 or 1.3",
+                        vk::Result::ERROR_INITIALIZATION_FAILED,
+                    ))
+                }
+            };
             let instance_api = entry
                 .try_enumerate_instance_version()
                 .at("query Vulkan loader version")?
                 .unwrap_or(vk::API_VERSION_1_0)
-                .min(vk::API_VERSION_1_3);
-            if instance_api < vk::API_VERSION_1_2 {
+                .min(max_api);
+            if instance_api < vk::API_VERSION_1_1 {
                 return Err(VulkanInitError(
-                    "Vulkan needs a 1.2+ loader",
+                    "Vulkan needs a 1.1+ loader",
                     vk::Result::ERROR_INCOMPATIBLE_DRIVER,
                 ));
             }
@@ -490,35 +600,28 @@ impl VulkanContext {
                     .iter()
                     .any(|extension| CStr::from_ptr(extension.extension_name.as_ptr()) == name)
             };
+            // Keep the existing preference for a presentable dynamic-rendering
+            // device; otherwise use the first one that can render traditionally.
+            let mut legacy_device = None;
             let (
                 physical_device,
                 properties,
                 available_extensions,
                 queue_family_index,
-                use_khr_dynamic_rendering,
+                api,
+                rendering_mode,
             ) = physical_devices
                 .into_iter()
                 .find_map(|device| {
                     let properties = instance.get_physical_device_properties(device);
                     let api = properties.api_version.min(instance_api);
-                    if api < vk::API_VERSION_1_2 {
+                    if api < vk::API_VERSION_1_1 {
                         return None;
                     }
                     let extensions = instance
                         .enumerate_device_extension_properties(device)
                         .ok()?;
-                    let use_khr = api < vk::API_VERSION_1_3;
-                    if !has_extension(&extensions, Swapchain::name())
-                        || (use_khr && !has_extension(&extensions, KhrDynamicRendering::name()))
-                    {
-                        return None;
-                    }
-                    let mut dynamic = vk::PhysicalDeviceDynamicRenderingFeatures::default();
-                    let mut features = vk::PhysicalDeviceFeatures2::builder()
-                        .push_next(&mut dynamic)
-                        .build();
-                    instance.get_physical_device_features2(device, &mut features);
-                    if dynamic.dynamic_rendering != vk::TRUE {
+                    if !has_extension(&extensions, Swapchain::name()) {
                         return None;
                     }
                     let queues = instance.get_physical_device_queue_family_properties(device);
@@ -529,14 +632,45 @@ impl VulkanContext {
                                 .unwrap_or(false))
                         .then_some(index as u32)
                     })?;
-                    Some((device, properties, extensions, family, use_khr))
+                    let core_dynamic_rendering = api >= vk::API_VERSION_1_3;
+                    let khr_dynamic_rendering = api >= vk::API_VERSION_1_2
+                        && has_extension(&extensions, KhrDynamicRendering::name());
+                    let dynamic_rendering = if core_dynamic_rendering || khr_dynamic_rendering {
+                        let mut dynamic = vk::PhysicalDeviceDynamicRenderingFeatures::default();
+                        let mut features = vk::PhysicalDeviceFeatures2::builder()
+                            .push_next(&mut dynamic)
+                            .build();
+                        instance.get_physical_device_features2(device, &mut features);
+                        dynamic.dynamic_rendering == vk::TRUE
+                    } else {
+                        false
+                    };
+                    let rendering_mode = if !dynamic_rendering {
+                        VulkanRenderingMode::Legacy
+                    } else if core_dynamic_rendering {
+                        VulkanRenderingMode::DynamicCore
+                    } else {
+                        VulkanRenderingMode::DynamicKhr
+                    };
+                    let candidate = (device, properties, extensions, family, api, rendering_mode);
+                    if rendering_mode == VulkanRenderingMode::Legacy {
+                        legacy_device.get_or_insert(candidate);
+                        None
+                    } else {
+                        Some(candidate)
+                    }
                 })
+                .or(legacy_device)
                 .ok_or(VulkanInitError(
-                    "no Vulkan 1.2+ device with dynamic rendering and window presentation",
+                    "no Vulkan 1.1+ graphics device with VK_KHR_swapchain and window presentation",
                     vk::Result::ERROR_FEATURE_NOT_PRESENT,
                 ))?;
             // Vulkan video export is not part of the Android window path.
+            // Below 1.3 its extensions depend on VK_KHR_synchronization2.
+            let needs_video_sync_extension = api < vk::API_VERSION_1_3;
             let video_queue_supported = !cfg!(target_os = "android")
+                && (!needs_video_sync_extension
+                    || has_extension(&available_extensions, Synchronization2::name()))
                 && has_extension(&available_extensions, cstr(b"VK_KHR_video_queue\0"))
                 && has_extension(&available_extensions, cstr(b"VK_KHR_video_encode_queue\0"))
                 && has_extension(&available_extensions, cstr(b"VK_KHR_video_encode_h264\0"));
@@ -554,10 +688,13 @@ impl VulkanContext {
             };
 
             let mut device_extension_names = vec![Swapchain::name().as_ptr()];
-            if use_khr_dynamic_rendering {
+            if rendering_mode == VulkanRenderingMode::DynamicKhr {
                 device_extension_names.push(KhrDynamicRendering::name().as_ptr());
             }
-            if video_queue_supported {
+            if video_queue_family.is_some() {
+                if needs_video_sync_extension {
+                    device_extension_names.push(Synchronization2::name().as_ptr());
+                }
                 device_extension_names.push(cstr(b"VK_KHR_video_queue\0").as_ptr());
                 device_extension_names.push(cstr(b"VK_KHR_video_encode_queue\0").as_ptr());
                 device_extension_names.push(cstr(b"VK_KHR_video_encode_h264\0").as_ptr());
@@ -587,10 +724,14 @@ impl VulkanContext {
             let device_create_info = vk::DeviceCreateInfo::builder()
                 .queue_create_infos(&queue_infos)
                 .enabled_extension_names(&device_extension_names);
-            let device_create_info = if use_khr_dynamic_rendering {
-                device_create_info.push_next(&mut dynamic_rendering_khr)
-            } else {
-                device_create_info.push_next(&mut dynamic_rendering_13)
+            let device_create_info = match rendering_mode {
+                VulkanRenderingMode::Legacy => device_create_info,
+                VulkanRenderingMode::DynamicKhr => {
+                    device_create_info.push_next(&mut dynamic_rendering_khr)
+                }
+                VulkanRenderingMode::DynamicCore => {
+                    device_create_info.push_next(&mut dynamic_rendering_13)
+                }
             };
 
             let device = instance
@@ -600,10 +741,14 @@ impl VulkanContext {
             // The context takes ownership of the successfully created window objects.
             std::mem::forget(setup);
 
-            let dynamic_rendering = if use_khr_dynamic_rendering {
-                DynamicRenderingMode::Khr(KhrDynamicRendering::new(&instance, &device))
-            } else {
-                DynamicRenderingMode::Core
+            let rendering = match rendering_mode {
+                VulkanRenderingMode::Legacy => PassRendering::Legacy(Default::default()),
+                VulkanRenderingMode::DynamicKhr => PassRendering::Dynamic(
+                    DynamicRenderingMode::Khr(KhrDynamicRendering::new(&instance, &device)),
+                ),
+                VulkanRenderingMode::DynamicCore => {
+                    PassRendering::Dynamic(DynamicRenderingMode::Core)
+                }
             };
             let graphics_queue = device.get_device_queue(queue_family_index, 0);
             let video_queue = video_queue_family
@@ -630,6 +775,8 @@ impl VulkanContext {
 
                 surface,
                 physical_device,
+                api_version: api,
+                physical_device_api_version: properties.api_version,
                 memory_properties,
                 max_texture_size: texture_size_limit.max(),
                 texture_size_limit,
@@ -646,7 +793,7 @@ impl VulkanContext {
                 command_pool: vk::CommandPool::null(),
                 command_buffers: Vec::new(),
                 recorder: Default::default(),
-                dynamic_rendering,
+                rendering,
                 submission: None,
                 presentation_needs_recreate: false,
                 surface_lost: false,
@@ -685,6 +832,7 @@ impl VulkanContext {
                 free_pipelines: Vec::new(),
                 buffers: Vec::new(),
                 free_buffers: Vec::new(),
+                // Texture::empty() reserves index zero, including for default_depth.
                 textures: vec![empty_texture_module()],
                 free_textures: Vec::new(),
                 passes: Vec::new(),
@@ -774,8 +922,11 @@ impl VulkanContext {
             .at("create Vulkan stream arenas")?;
         self.initialize_dummy_texture()
             .at("initialize Vulkan fallback image")?;
-        self.recorder = recording::CommandRecorder::new(&self.device, self.queue_family_index)
-            .at("create Vulkan recording pools")?;
+        // The parallel recorder's secondary buffers use dynamic inheritance.
+        if matches!(self.rendering, PassRendering::Dynamic(_)) {
+            self.recorder = recording::CommandRecorder::new(&self.device, self.queue_family_index)
+                .at("create Vulkan recording pools")?;
+        }
         // Win32 WSI can synchronously send messages to the HWND owner. Keep
         // submission on that thread there, and on the render thread on Android.
         if !cfg!(any(windows, target_os = "android")) {
@@ -831,6 +982,25 @@ impl VulkanContext {
             });
         }
         Ok(())
+    }
+
+    /// The effective Vulkan API, limited by both the instance and the selected device.
+    pub fn api_version(&self) -> u32 {
+        self.api_version
+    }
+
+    /// The API version reported by the selected physical device.
+    pub fn physical_device_api_version(&self) -> u32 {
+        self.physical_device_api_version
+    }
+
+    /// The render-pass API selected for this Vulkan context.
+    pub fn rendering_mode(&self) -> VulkanRenderingMode {
+        match self.rendering {
+            PassRendering::Legacy(_) => VulkanRenderingMode::Legacy,
+            PassRendering::Dynamic(DynamicRenderingMode::Khr(_)) => VulkanRenderingMode::DynamicKhr,
+            PassRendering::Dynamic(DynamicRenderingMode::Core) => VulkanRenderingMode::DynamicCore,
+        }
     }
 
     pub fn features(&self) -> Features {
@@ -915,6 +1085,9 @@ impl VulkanContext {
                 self.device.destroy_buffer(buffer.buffer, None);
                 self.device.free_memory(buffer.memory, None);
             }
+            if let PassRendering::Legacy(passes) = &mut self.rendering {
+                passes.destroy(&self.device);
+            }
             self.default_depth = Texture::empty();
             for index in 0..self.textures.len() {
                 self.destroy_texture(index);
@@ -994,6 +1167,9 @@ impl VulkanContext {
                 self.device
                     .free_command_buffers(self.command_pool, &self.command_buffers);
                 self.command_buffers.clear();
+            }
+            if let PassRendering::Legacy(passes) = &mut self.rendering {
+                passes.release_framebuffers(&self.device, &self.swapchain_image_views);
             }
             for view in self.swapchain_image_views.drain(..) {
                 self.device.destroy_image_view(view, None);

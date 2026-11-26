@@ -15,7 +15,7 @@ keywords = ["graphics", "3D", "opengl", "gamedev", "windowing"]
 categories = ["rendering::graphics-api"]
 
 [features]
-
+default = ["vulkan"]
 # Optional log-rs like macros implementation
 # disabled by default
 log-impl = []

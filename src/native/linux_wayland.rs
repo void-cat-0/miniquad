@@ -247,11 +247,9 @@ impl WaylandPayload {
                     }
                     (libxkb.xkb_compose_state_reset)(compose_state);
                 }
-                XKB_COMPOSE_NOTHING => {
-                    if self.compose_preediting {
-                        self.compose_preediting = false;
-                        self.events.push(WaylandEvent::ImePreedit(String::new(), 0));
-                    }
+                XKB_COMPOSE_NOTHING if self.compose_preediting => {
+                    self.compose_preediting = false;
+                    self.events.push(WaylandEvent::ImePreedit(String::new(), 0));
                 }
                 _ => {}
             }
@@ -1404,7 +1402,10 @@ where
         let (egl, mut egl_driver) = if request_vulkan {
             (None, None)
         } else {
-            (Some(LibWaylandEgl::try_load().ok()?), Some(egl::LibEgl::try_load().ok()?))
+            (
+                Some(LibWaylandEgl::try_load().ok()?),
+                Some(egl::LibEgl::try_load().ok()?),
+            )
         };
         let xkb = LibXkbCommon::try_load().ok()?;
 
@@ -1529,9 +1530,19 @@ where
         // configuration) is our readiness signal, even for a 0x0 size hint.
         // Once acknowledged, don't block waiting for an unrelated second batch:
         // some compositors won't send another event until we submit a buffer.
+        // A compositor that answers the registry but never configures would
+        // otherwise hang startup, before the event loop can even poll.
+        const CONFIGURE_TIMEOUT: Duration = Duration::from_secs(5);
+        let deadline = std::time::Instant::now() + CONFIGURE_TIMEOUT;
         while !display.surface_configured {
-            if (display.client.wl_display_dispatch)(display.display) < 0 {
+            let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+            if !display.poll_new_event(remaining.as_millis() as i32) {
                 return display.abort_startup("compositor disconnected before surface configure");
+            }
+            if !display.surface_configured && std::time::Instant::now() >= deadline {
+                return display.abort_startup(format!(
+                    "compositor did not configure the surface within {CONFIGURE_TIMEOUT:?}"
+                ));
             }
         }
         if uses_libdecor && conf.fullscreen {
@@ -1660,23 +1671,21 @@ where
                             );
                         }
                     }
-                    Request::SetImePosition { x, y } => {
-                        if !display.text_input.is_null() {
-                            wl_request!(
-                                display.client,
-                                display.text_input,
-                                extensions::text_input::zwp_text_input_v3::set_cursor_rectangle,
-                                x,
-                                y,
-                                0,
-                                0
-                            );
-                            wl_request!(
-                                display.client,
-                                display.text_input,
-                                extensions::text_input::zwp_text_input_v3::commit
-                            );
-                        }
+                    Request::SetImePosition { x, y } if !display.text_input.is_null() => {
+                        wl_request!(
+                            display.client,
+                            display.text_input,
+                            extensions::text_input::zwp_text_input_v3::set_cursor_rectangle,
+                            x,
+                            y,
+                            0,
+                            0
+                        );
+                        wl_request!(
+                            display.client,
+                            display.text_input,
+                            extensions::text_input::zwp_text_input_v3::commit
+                        );
                     }
                     // TODO: implement the other events
                     _ => (),
