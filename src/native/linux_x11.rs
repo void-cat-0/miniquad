@@ -128,7 +128,8 @@ unsafe extern "C" fn preedit_draw_callback(
     }
 
     display.preedit_text = chars.into_iter().collect();
-    display.preedit_cursor = draw_data.caret as usize;
+    display.preedit_cursor =
+        crate::text_input::chars_to_utf16(&display.preedit_text, draw_data.caret.max(0) as usize);
     display.pending_preedit_update = true;
 }
 
@@ -140,9 +141,38 @@ unsafe extern "C" fn preedit_caret_callback(
     0
 }
 
+/// Whether a text input session that composes (not a password field) is active.
+fn ime_session_active() -> bool {
+    crate::text_input::session().is_some_and(|config| !config.is_secure() && !config.read_only)
+}
+
 impl X11Display {
+    unsafe fn set_spot_location(&mut self) {
+        if self.xic.is_null() {
+            return;
+        }
+        let pt = libx11::XPoint {
+            x: self.ime_pos.0 as libc::c_short,
+            y: self.ime_pos.1 as libc::c_short,
+        };
+        let preedit_attr = (self.libx11.XVaCreateNestedList)(
+            0,
+            libx11::XNSpotLocation.as_ptr() as *const core::ffi::c_char,
+            &pt as *const libx11::XPoint,
+            std::ptr::null::<core::ffi::c_void>(),
+        );
+        if !preedit_attr.is_null() {
+            (self.libx11.XSetICValues)(
+                self.xic,
+                libx11::XNPreeditAttributes.as_ptr() as *const core::ffi::c_char,
+                preedit_attr,
+                std::ptr::null::<core::ffi::c_void>(),
+            );
+            (self.libx11.XFree)(preedit_attr);
+        }
+    }
+
     pub unsafe fn init_xim(&mut self, window: Window) {
-        libc::setlocale(libc::LC_ALL, b"\0".as_ptr() as _);
         libc::setlocale(libc::LC_CTYPE, b"\0".as_ptr() as _);
 
         let mod_res = (self.libx11.XSetLocaleModifiers)(b"\0".as_ptr() as _);
@@ -270,8 +300,6 @@ impl X11Display {
             return;
         }
 
-        (self.libx11.XSetICFocus)(self.xic);
-
         let mut fe_mask: libc::c_long = 0;
         let res = (self.libx11.XGetICValues)(
             self.xic,
@@ -310,11 +338,8 @@ impl X11Display {
             let filtered = (self.libx11.XFilterEvent)(event as *mut _, win);
             if self.pending_preedit_update {
                 self.pending_preedit_update = false;
-                let ime_active = crate::native_display()
-                    .try_lock()
-                    .map(|d| d.text_input.is_some())
-                    .unwrap_or(false);
-                if ime_active {
+                // A cleared preedit is delivered even after the session ended.
+                if ime_session_active() || self.preedit_text.is_empty() {
                     event_handler.on_ime_preedit(&self.preedit_text, self.preedit_cursor);
                 }
             }
@@ -323,11 +348,8 @@ impl X11Display {
             }
         } else if self.pending_preedit_update {
             self.pending_preedit_update = false;
-            let ime_active = crate::native_display()
-                .try_lock()
-                .map(|d| d.text_input.is_some())
-                .unwrap_or(false);
-            if ime_active {
+            // A cleared preedit is delivered even after the session ended.
+            if ime_session_active() || self.preedit_text.is_empty() {
                 event_handler.on_ime_preedit(&self.preedit_text, self.preedit_cursor);
             }
         }
@@ -355,10 +377,7 @@ impl X11Display {
                     if status == libx11::XLookupChars || status == libx11::XLookupBoth {
                         if let Ok(s) = std::str::from_utf8(&buf[..n as usize]) {
                             self.preedit_text.clear();
-                            let ime_active = crate::native_display()
-                                .try_lock()
-                                .map(|d| d.text_input.is_some())
-                                .unwrap_or(false);
+                            let ime_active = ime_session_active();
                             if ime_active {
                                 event_handler.on_ime_preedit("", 0);
                                 if s.chars().count() > 1 {
@@ -456,7 +475,7 @@ impl X11Display {
                 event_handler.mouse_leave_event();
             }
             9 => {
-                if !self.xic.is_null() {
+                if !self.xic.is_null() && ime_session_active() {
                     (self.libx11.XSetICFocus)(self.xic);
                 }
                 event_handler.window_restored_event();
@@ -747,50 +766,36 @@ impl X11Display {
                 ShowKeyboard(..) => {
                     eprintln!("Not implemented for X11")
                 }
-                SetTextInputRect { x, y, .. } => {
-                    let (x, y) = (x as i32, y as i32);
-                    if self.ime_pos != (x as i32, y as i32) {
-                        self.ime_pos = (x as i32, y as i32);
-                        if !self.xic.is_null() {
-                            let pt = libx11::XPoint {
-                                x: x as libc::c_short,
-                                y: y as libc::c_short,
-                            };
-                            let preedit_attr = (self.libx11.XVaCreateNestedList)(
-                                0,
-                                libx11::XNSpotLocation.as_ptr() as *const core::ffi::c_char,
-                                &pt as *const libx11::XPoint,
-                                std::ptr::null::<core::ffi::c_void>(),
-                            );
-                            if !preedit_attr.is_null() {
-                                let ret = (self.libx11.XSetICValues)(
-                                    self.xic,
-                                    libx11::XNPreeditAttributes.as_ptr() as *const core::ffi::c_char,
-                                    preedit_attr,
-                                    std::ptr::null::<core::ffi::c_void>(),
-                                );
-                                if !ret.is_null() {
-                                    let err_str = std::ffi::CStr::from_ptr(ret).to_string_lossy();
-                                    eprintln!("WARNING: XSetICValues(XNPreeditAttributes) returned attribute: {}", err_str);
-                                }
-                                (self.libx11.XFree)(preedit_attr);
-                            }
-                        }
+                SetTextInputRect { x, y, h, .. } => {
+                    // The spot is the baseline position of the next character.
+                    let spot = (x.round() as i32, (y + h).round() as i32);
+                    if self.ime_pos != spot {
+                        self.ime_pos = spot;
+                        self.set_spot_location();
                     }
                 }
-                request @ (StartTextInput(_) | StopTextInput) => {
-                    let enabled = matches!(request, StartTextInput(_));
-                    if !enabled {
-                        self.preedit_text.clear();
-                        self.pending_preedit_update = true;
-                    }
+                StartTextInput(config) => {
                     if !self.xic.is_null() {
-                        if enabled {
+                        if !config.is_secure() && !config.read_only {
                             (self.libx11.XSetICFocus)(self.xic);
+                            self.set_spot_location();
                         } else {
                             (self.libx11.XUnsetICFocus)(self.xic);
                         }
                     }
+                }
+                StopTextInput => {
+                    self.preedit_text.clear();
+                    if !self.xic.is_null() {
+                        // Drop any composition before the IC loses focus.
+                        let reset = (self.libx11.Xutf8ResetIC)(self.xic);
+                        if !reset.is_null() {
+                            (self.libx11.XFree)(reset as *mut libc::c_void);
+                        }
+                        (self.libx11.XUnsetICFocus)(self.xic);
+                    }
+                    // Delivered by the next event pass (see process_event).
+                    self.pending_preedit_update = true;
                 }
                 SetTextInputState(_) => {}
             }
@@ -831,6 +836,7 @@ where
     if !conf.headless {
         display.libx11.show_window(display.display, display.window);
     }
+    display.init_xim(display.window);
 
     (display.libx11.XFlush)(display.display);
 
@@ -946,6 +952,7 @@ where
     if !conf.headless {
         display.libx11.show_window(display.display, display.window);
     }
+    display.init_xim(display.window);
     let (w, h) = display
         .libx11
         .query_window_size(display.display, display.window);

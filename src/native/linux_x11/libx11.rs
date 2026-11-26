@@ -1005,6 +1005,7 @@ crate::declare_module!(
     pub fn XDestroyIC(XIC),
     pub fn XSetICFocus(XIC),
     pub fn XUnsetICFocus(XIC),
+    pub fn Xutf8ResetIC(XIC) -> *mut c_char,
     pub fn Xutf8LookupString(XIC, *mut XKeyEvent, *mut c_char, c_int, *mut KeySym, *mut c_int) -> c_int,
     ...
     pub fn XCreateIC(XIM, ...) -> XIC,
