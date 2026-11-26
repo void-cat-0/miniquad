@@ -339,6 +339,8 @@ impl MacosDisplay {
                 self.clear_marked_text();
             }
             SetTextInputState(_) => {}
+            // Desktop platforms have no haptics.
+            HapticFeedback(_) => {}
         }
     }
 }

@@ -24,6 +24,21 @@ pub use text_input::{
     TextInputAction, TextInputCapitalization, TextInputConfig, TextInputKind, TextInputState,
 };
 
+/// A haptic feedback pattern for [`window::haptic_feedback`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum HapticFeedback {
+    /// A light tap, such as a key press or a small toggle.
+    Light,
+    Medium,
+    /// A strong tap, such as a long press.
+    Heavy,
+    /// A selection moving through discrete values (pickers, sliders).
+    Selection,
+    Success,
+    Warning,
+    Error,
+}
+
 pub use graphics::*;
 
 mod default_icon;
@@ -443,6 +458,14 @@ pub mod window {
                 h: height,
             },
         );
+    }
+
+    /// Play a haptic feedback pattern: Android `performHapticFeedback`, iOS
+    /// feedback generators, and `navigator.vibrate` on the web. Does nothing
+    /// on desktop platforms or where the user disabled haptics.
+    pub fn haptic_feedback(kind: crate::HapticFeedback) {
+        let d = native_display().lock().unwrap();
+        send_request(&d, native::Request::HapticFeedback(kind));
     }
 
     /// Whether the platform keeps its own copy of the text and reports whole

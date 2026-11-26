@@ -157,6 +157,7 @@ extern "C" {
         comp_end: i32,
     );
     pub fn sapp_set_text_input_rect(x: f32, y: f32, w: f32, h: f32);
+    pub fn sapp_vibrate(milliseconds: u32);
 }
 
 unsafe fn show_mouse(shown: bool) {
@@ -275,6 +276,15 @@ pub extern "C" fn frame() {
                 },
                 Request::SetTextInputRect { x, y, w, h } => unsafe {
                     sapp_set_text_input_rect(x, y, w, h);
+                },
+                Request::HapticFeedback(kind) => unsafe {
+                    use crate::HapticFeedback as H;
+                    sapp_vibrate(match kind {
+                        H::Light | H::Selection => 8,
+                        H::Medium | H::Success => 15,
+                        H::Heavy | H::Warning => 25,
+                        H::Error => 40,
+                    });
                 },
                 _ => {}
             }

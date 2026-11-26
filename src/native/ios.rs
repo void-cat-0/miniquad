@@ -373,6 +373,42 @@ impl IosDisplay {
                 self.ignore_sync = false;
             },
             SetTextInputRect { .. } => {}
+            HapticFeedback(kind) => unsafe {
+                use crate::HapticFeedback as H;
+                match kind {
+                    H::Light | H::Medium | H::Heavy => {
+                        // UIImpactFeedbackStyle: light 0, medium 1, heavy 2.
+                        let style: i64 = match kind {
+                            H::Light => 0,
+                            H::Medium => 1,
+                            _ => 2,
+                        };
+                        let generator: ObjcId =
+                            msg_send![class!(UIImpactFeedbackGenerator), alloc];
+                        let generator: ObjcId = msg_send![generator, initWithStyle: style];
+                        msg_send_![generator, impactOccurred];
+                        msg_send_![generator, release];
+                    }
+                    H::Selection => {
+                        let generator: ObjcId =
+                            msg_send![class!(UISelectionFeedbackGenerator), new];
+                        msg_send_![generator, selectionChanged];
+                        msg_send_![generator, release];
+                    }
+                    H::Success | H::Warning | H::Error => {
+                        // UINotificationFeedbackType: success 0, warning 1, error 2.
+                        let feedback: i64 = match kind {
+                            H::Success => 0,
+                            H::Warning => 1,
+                            _ => 2,
+                        };
+                        let generator: ObjcId =
+                            msg_send![class!(UINotificationFeedbackGenerator), new];
+                        msg_send_![generator, notificationOccurred: feedback];
+                        msg_send_![generator, release];
+                    }
+                }
+            },
             _ => {}
         }
     }

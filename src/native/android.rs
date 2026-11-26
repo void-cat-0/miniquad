@@ -366,6 +366,10 @@ impl MainThreadState {
                 (**env).DeleteLocalRef.unwrap()(env, text);
             },
             SetTextInputRect { .. } => {}
+            HapticFeedback(kind) => unsafe {
+                let env = attach_jni_env();
+                ndk_utils::call_void_method!(env, ACTIVITY, "hapticFeedback", "(I)V", kind as i32);
+            },
             _ => {}
         }
     }

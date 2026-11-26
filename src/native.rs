@@ -82,6 +82,7 @@ pub(crate) enum Request {
     StopTextInput,
     SetTextInputState(crate::TextInputState),
     SetTextInputRect { x: f32, y: f32, w: f32, h: f32 },
+    HapticFeedback(crate::HapticFeedback),
 }
 
 pub trait Clipboard: Send + Sync {

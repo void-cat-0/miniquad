@@ -798,6 +798,8 @@ impl X11Display {
                     self.pending_preedit_update = true;
                 }
                 SetTextInputState(_) => {}
+                // Desktop platforms have no haptics.
+                HapticFeedback(_) => {}
             }
         }
     }

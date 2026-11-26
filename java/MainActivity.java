@@ -600,6 +600,31 @@ public class MainActivity extends Activity {
         QuadNative.surfaceOnKeyUp(KeyEvent.KEYCODE_BACK);
     }
 
+    // Haptic kinds follow miniquad's HapticFeedback order.
+    public void hapticFeedback(final int kind) {
+        runOnUiThread(new Runnable() {
+            @Override
+            public void run() {
+                int constant;
+                switch (kind) {
+                    case 0: constant = android.view.HapticFeedbackConstants.KEYBOARD_TAP; break;
+                    case 1: constant = android.view.HapticFeedbackConstants.VIRTUAL_KEY; break;
+                    case 2: constant = android.view.HapticFeedbackConstants.LONG_PRESS; break;
+                    case 3: constant = android.view.HapticFeedbackConstants.CLOCK_TICK; break;
+                    case 4: constant = Build.VERSION.SDK_INT >= 30
+                        ? android.view.HapticFeedbackConstants.CONFIRM
+                        : android.view.HapticFeedbackConstants.VIRTUAL_KEY; break;
+                    default: constant = Build.VERSION.SDK_INT >= 30
+                        ? android.view.HapticFeedbackConstants.REJECT
+                        : android.view.HapticFeedbackConstants.LONG_PRESS; break;
+                }
+                if (view != null) {
+                    view.performHapticFeedback(constant);
+                }
+            }
+        });
+    }
+
     public void quitApp() {
         runOnUiThread(new Runnable() {
             @Override

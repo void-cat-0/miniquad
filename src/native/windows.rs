@@ -1242,6 +1242,8 @@ impl WindowsDisplay {
             // IMM32 has no surrounding-text channel.
             SetTextInputState(_) => {}
             SetTextInputRect { x, y, w, h } => self.set_text_input_rect(x, y, w, h),
+            // Desktop platforms have no haptics.
+            HapticFeedback(_) => {}
         }
     }
 }

@@ -1699,6 +1699,11 @@ var importObject = {
                 html_input_syncing = false;
             }
         },
+        sapp_vibrate: function (milliseconds) {
+            if (navigator.vibrate) {
+                try { navigator.vibrate(milliseconds); } catch (e) {}
+            }
+        },
         sapp_set_text_input_rect: function (x, y, w, h) {
             if (!html_input_element) return;
             // Keep the mirror at the caret so the browser scrolls and places
