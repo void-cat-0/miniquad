@@ -11,9 +11,18 @@ use std::num::NonZeroU32;
 // https://developer.apple.com/metal/Metal-Feature-Set-Tables.pdf
 const MAX_UNIFORM_BUFFER_SIZE: u64 = 4 * 1024 * 1024;
 const NUM_INFLIGHT_FRAMES: usize = 3;
-#[cfg(any(target_os = "macos", all(target_os = "ios", target_arch = "x86_64")))]
+// iOS simulator on Apple Silicon Macs (`target_abi = "sim"`) runs
+// iOS arm64 code but issues Metal commands against the host Mac's
+// GPU — which validates with the 256-byte rule, not iOS arm64's
+// 16-byte. Without breaking the simulator out of the iOS-arm64
+// branch below, the first draw fails Metal validation on
+// uniform-buffer offset alignment.
+#[cfg(any(
+    target_os = "macos",
+    all(target_os = "ios", any(target_arch = "x86_64", target_abi = "sim")),
+))]
 const UNIFORM_BUFFER_ALIGN: u64 = 256;
-#[cfg(all(target_os = "ios", not(target_arch = "x86_64")))]
+#[cfg(all(target_os = "ios", target_arch = "aarch64", not(target_abi = "sim")))]
 const UNIFORM_BUFFER_ALIGN: u64 = 16;
 
 impl From<VertexFormat> for MTLVertexFormat {
@@ -192,20 +201,19 @@ fn roundup_ub_buffer(current_buffer: u64) -> u64 {
     ((current_buffer) + ((UNIFORM_BUFFER_ALIGN) - 1)) & !((UNIFORM_BUFFER_ALIGN) - 1)
 }
 
-// this scenario:
-// buffer.update(); draw(buffer); buffer.update(); draw(buffer);
-// is very problematic with metal's ownership model.
-// buffer.update() half-update buffer - it doesn't really send data to the GPU claiming ownership,
-// it postpone reading the CPU memory until drawcall will actually happen.
-// There is no way to flush the buffer and makes metal's "update" function to update GPU memory right away.
-// Thus miniquad keeps a lot of buffer's copies...
-const BUFFERS_IN_ROTATION: usize = 30;
-
-#[derive(Clone, Copy, Debug)]
+// Per-buffer rotation pool for the within-frame update-draw-update-draw
+// pattern. Metal's `update` doesn't synchronously claim ownership, so
+// each within-frame update needs its own backing `MTLBuffer` to keep
+// the previous update's data alive until the draw consumes it. `raw`
+// grows on demand, so memory tracks actual per-frame usage rather
+// than a fixed worst-case ceiling.
+#[derive(Clone, Debug)]
 pub struct Buffer {
-    raw: [ObjcId; BUFFERS_IN_ROTATION],
+    raw: Vec<ObjcId>,
     //buffer_type: BufferType,
     size: usize,
+    /// Cached `MTLResourceOptions` for grow-on-demand allocations.
+    options: u64,
     //index_type: Option<IndexType>,
     value: usize,
     next_value: usize,
@@ -273,6 +281,10 @@ pub struct MetalContext {
     command_queue: ObjcId,
     command_buffer: Option<ObjcId>,
     render_encoder: Option<ObjcId>,
+    /// Active pass's color-attachment dimensions in pixels — pivot
+    /// for `apply_scissor_rect`'s Y-flip + clamp.
+    current_pass_width: u32,
+    current_pass_height: u32,
     view: ObjcId,
     device: ObjcId,
     current_frame_index: usize,
@@ -372,6 +384,8 @@ impl MetalContext {
                 command_queue,
                 command_buffer: None,
                 render_encoder: None,
+                current_pass_width: 0,
+                current_pass_height: 0,
                 view,
                 device,
                 buffers: vec![],
@@ -424,12 +438,25 @@ impl RenderingBackend for MetalContext {
     fn apply_scissor_rect(&mut self, x: i32, y: i32, w: i32, h: i32) {
         assert!(self.render_encoder.is_some());
 
-        let (_, screen_height) = crate::window::screen_size();
+        // Flip against the active pass height, not the screen —
+        // they diverge for off-screen targets at high DPI. Then
+        // clamp into `[0, pass_size]` on both axes: callers
+        // (macroquad) can briefly request a scissor sized against
+        // a stale screen cache (e.g. mid-rotation, where the
+        // caller's `screen_size()` lags MTKView's drawable
+        // dimensions by a frame), and an unclamped scissor would
+        // trip Metal validation.
+        let pass_width = self.current_pass_width as i32;
+        let pass_height = self.current_pass_height as i32;
+        let x_clamped = x.clamp(0, pass_width);
+        let y_metal = (pass_height - (y + h)).clamp(0, pass_height);
+        let w_clamped = (pass_width - x_clamped).clamp(0, w.max(0));
+        let h_clamped = (pass_height - y_metal).clamp(0, h.max(0));
         let r = MTLScissorRect {
-            x: x as _,
-            y: (screen_height as i32 - (y + h)) as u64,
-            width: w as _,
-            height: h as _,
+            x: x_clamped as u64,
+            y: y_metal as u64,
+            width: w_clamped as u64,
+            height: h_clamped as u64,
         };
         unsafe { msg_send_![self.render_encoder.unwrap(), setScissorRect: r] };
     }
@@ -510,13 +537,21 @@ impl RenderingBackend for MetalContext {
         unimplemented!()
     }
     fn texture_generate_mipmaps(&mut self, texture: TextureId) {
+        let texture = self.textures.get(texture);
+        // Catch the bug at the call site instead of letting Metal
+        // assert on `mipmapLevelCount > 1` deep inside the blit
+        // encoder. Set `TextureParams::allocate_mipmaps = true` at
+        // creation to use this entry point.
+        assert!(
+            texture.params.allocate_mipmaps,
+            "texture_generate_mipmaps called on a texture allocated without mipmaps",
+        );
         unsafe {
             if self.command_buffer.is_none() {
                 self.command_buffer = Some(msg_send![self.command_queue, commandBuffer]);
             }
             let command_buffer = self.command_buffer.unwrap();
             let encoder = msg_send_![command_buffer, blitCommandEncoder];
-            let texture = self.textures.get(texture);
             msg_send_![encoder, generateMipmapsForTexture: texture.texture];
             msg_send_![encoder, endEncoding];
         }
@@ -557,8 +592,12 @@ impl RenderingBackend for MetalContext {
         resolve_img: Option<&[TextureId]>,
         depth_img: Option<TextureId>,
     ) -> RenderPass {
-        if resolve_img.is_some() {
-            unimplemented!("resolve textures are not yet implemented on metal");
+        if let Some(resolve_img) = resolve_img {
+            assert_eq!(
+                resolve_img.len(),
+                color_img.len(),
+                "resolve_img must have one entry per color attachment"
+            );
         }
         unsafe {
             let render_pass_desc =
@@ -570,7 +609,19 @@ impl RenderingBackend for MetalContext {
                 let color_attachment = msg_send_![msg_send_![render_pass_desc, colorAttachments], objectAtIndexedSubscript:i];
                 msg_send_![color_attachment, setTexture: color_texture];
                 msg_send_![color_attachment, setLoadAction: MTLLoadAction::Clear];
-                msg_send_![color_attachment, setStoreAction: MTLStoreAction::Store];
+                // Multisample resolve: when the caller passes a resolve
+                // texture for this attachment, downsample into it on
+                // store. Required for any MSAA render target.
+                if let Some(resolve_img) = resolve_img {
+                    let resolve_texture = self.textures.get(resolve_img[i]).texture;
+                    msg_send_![color_attachment, setResolveTexture: resolve_texture];
+                    msg_send_![
+                        color_attachment,
+                        setStoreAction: MTLStoreAction::MultisampleResolve
+                    ];
+                } else {
+                    msg_send_![color_attachment, setStoreAction: MTLStoreAction::Store];
+                }
             }
             if let Some(depth_img) = depth_img {
                 let depth_texture = self.textures.get(depth_img).texture;
@@ -608,43 +659,48 @@ impl RenderingBackend for MetalContext {
     }
 
     fn new_buffer(&mut self, _: BufferType, _usage: BufferUsage, data: BufferSource) -> BufferId {
-        let mut raw = [nil; BUFFERS_IN_ROTATION];
         let size = match &data {
             BufferSource::Slice(data) => data.size,
             BufferSource::Empty { size, .. } => *size,
         };
-        #[allow(clippy::needless_range_loop)]
-        for i in 0..BUFFERS_IN_ROTATION {
-            let buffer: ObjcId = if let BufferSource::Slice(data) = &data {
-                debug_assert!(data.is_slice);
-                let size = data.size as u64;
-                unsafe {
-                    msg_send![self.device,
-                              newBufferWithBytes:data.ptr
-                              length:size
-                              options:MTLResourceOptions::StorageModeShared]
-                }
-            } else {
-                #[cfg(target_os = "macos")]
-                let options = MTLResourceOptions::CPUCacheModeWriteCombined
-                    | MTLResourceOptions::StorageModeManaged;
-                #[cfg(target_os = "ios")]
-                let options = MTLResourceOptions::CPUCacheModeWriteCombined;
-                unsafe {
-                    msg_send![self.device,
-                              newBufferWithLength:size
-                              options:options]
-                }
-            };
-
-            unsafe {
-                msg_send_![buffer, retain];
+        // Cached on the `Buffer` so grow-on-demand allocations in
+        // `buffer_update` match the original storage mode.
+        let options = if matches!(data, BufferSource::Slice(_)) {
+            MTLResourceOptions::StorageModeShared
+        } else {
+            #[cfg(target_os = "macos")]
+            {
+                MTLResourceOptions::CPUCacheModeWriteCombined
+                    | MTLResourceOptions::StorageModeManaged
             }
-            raw[i] = buffer;
+            #[cfg(target_os = "ios")]
+            {
+                MTLResourceOptions::CPUCacheModeWriteCombined
+            }
+        };
+        let buffer: ObjcId = if let BufferSource::Slice(data) = &data {
+            debug_assert!(data.is_slice);
+            let size = data.size as u64;
+            unsafe {
+                msg_send![self.device,
+                          newBufferWithBytes:data.ptr
+                          length:size
+                          options:options]
+            }
+        } else {
+            unsafe {
+                msg_send![self.device,
+                          newBufferWithLength:size
+                          options:options]
+            }
+        };
+        unsafe {
+            msg_send_![buffer, retain];
         }
         let buffer = Buffer {
-            raw,
+            raw: vec![buffer],
             size,
+            options,
             value: 0,
             next_value: 0,
         };
@@ -659,6 +715,19 @@ impl RenderingBackend for MetalContext {
         };
         let buffer = &mut self.buffers[buffer.0];
         assert!(data.size <= buffer.size);
+
+        // Grow `raw` lazily on first hit of a new per-frame max.
+        if buffer.next_value >= buffer.raw.len() {
+            let new_slot: ObjcId = unsafe {
+                msg_send![self.device,
+                          newBufferWithLength:buffer.size
+                          options:buffer.options]
+            };
+            unsafe {
+                msg_send_![new_slot, retain];
+            }
+            buffer.raw.push(new_slot);
+        }
 
         unsafe {
             let dest: *mut std::ffi::c_void = msg_send![buffer.raw[buffer.next_value], contents];
@@ -740,8 +809,14 @@ impl RenderingBackend for MetalContext {
 
             if access == TextureAccess::RenderTarget {
                 if params.format != TextureFormat::Depth {
-                    let pixel_format: MTLPixelFormat = params.format.into();
-                    msg_send_![descriptor, setPixelFormat: pixel_format];
+                    // Match the view's `colorPixelFormat` — pipelines
+                    // bake it and reject mismatched attachments, and
+                    // MTKView's presentable formats are all `BGRA*` /
+                    // `RGBA16Float` so honoring `RGBA8` literally
+                    // would break every offscreen color target.
+                    let view_pixel_format: MTLPixelFormat =
+                        msg_send![self.view, colorPixelFormat];
+                    msg_send_![descriptor, setPixelFormat: view_pixel_format];
                 }
                 msg_send_![descriptor, setStorageMode: MTLStorageMode::Private];
                 msg_send_![
@@ -971,8 +1046,11 @@ impl RenderingBackend for MetalContext {
             msg_send_![descriptor, setVertexFunction:shader_internal.vertex_function];
             msg_send_![descriptor, setFragmentFunction:shader_internal.fragment_function];
             msg_send_![descriptor, setVertexDescriptor: vertex_descriptor];
+            // Only attachment 0 — the backend has no MRT path and
+            // setting attachment 1 to a non-Invalid pixelFormat
+            // fails Metal validation when no texture is bound.
             let color_attachments = msg_send_![descriptor, colorAttachments];
-            for i in 0..2 {
+            for i in 0..1usize {
                 let color_attachment = msg_send_![color_attachments, objectAtIndexedSubscript: i];
                 let view_pixel_format: MTLPixelFormat = msg_send![self.view, colorPixelFormat];
                 msg_send_![color_attachment, setPixelFormat: view_pixel_format];
@@ -1019,14 +1097,23 @@ impl RenderingBackend for MetalContext {
                     ];
                 }
             }
-            msg_send_![
-                descriptor,
-                setDepthAttachmentPixelFormat: MTLPixelFormat::Depth32Float_Stencil8
-            ];
-            msg_send_![
-                descriptor,
-                setStencilAttachmentPixelFormat: MTLPixelFormat::Depth32Float_Stencil8
-            ];
+            // Pipeline depth/stencil formats must match whatever
+            // render pass uses this pipeline. MTKView reports
+            // `Invalid` when no depth/stencil is configured —
+            // leave the descriptor's defaults (also `Invalid`)
+            // alone in that case; otherwise mirror the view.
+            let view_depth_stencil_format: MTLPixelFormat =
+                msg_send![self.view, depthStencilPixelFormat];
+            if view_depth_stencil_format != MTLPixelFormat::Invalid {
+                msg_send_![
+                    descriptor,
+                    setDepthAttachmentPixelFormat: view_depth_stencil_format
+                ];
+                msg_send_![
+                    descriptor,
+                    setStencilAttachmentPixelFormat: view_depth_stencil_format
+                ];
+            }
 
             let mut error: ObjcId = nil;
             let pipeline_state: ObjcId = msg_send![
@@ -1202,14 +1289,23 @@ impl RenderingBackend for MetalContext {
                 self.command_buffer = Some(msg_send![self.command_queue, commandBuffer]);
             }
 
-            let (descriptor, _, _) = match pass {
+            let (descriptor, width_px, height_px) = match pass {
                 None => {
-                    let (screen_width, screen_height) = crate::window::screen_size();
-                    (
-                        msg_send_![self.view, currentRenderPassDescriptor],
-                        screen_width as f64,
-                        screen_height as f64,
-                    )
+                    // Read dimensions from the actual pass attachment
+                    // texture, not `screen_size()`. MTKView's
+                    // `drawableSize` and our cached screen size can
+                    // both transition to the new size one frame before
+                    // `currentDrawable`'s texture is recreated; reading
+                    // the attachment directly avoids the gap.
+                    let descriptor: ObjcId =
+                        msg_send_![self.view, currentRenderPassDescriptor];
+                    let color_attachments: ObjcId = msg_send_![descriptor, colorAttachments];
+                    let attachment: ObjcId =
+                        msg_send_![color_attachments, objectAtIndexedSubscript: 0];
+                    let texture: ObjcId = msg_send_![attachment, texture];
+                    let width: u64 = msg_send![texture, width];
+                    let height: u64 = msg_send![texture, height];
+                    (descriptor, width as u32, height as u32)
                 }
                 Some(pass) => {
                     let pass = &self.passes[pass.0];
@@ -1224,12 +1320,14 @@ impl RenderingBackend for MetalContext {
 
                     (
                         pass.render_pass_desc,
-                        self.textures.get(texture).params.width as f64,
-                        self.textures.get(texture).params.height as f64,
+                        self.textures.get(texture).params.width,
+                        self.textures.get(texture).params.height,
                     )
                 }
             };
             assert!(!descriptor.is_null());
+            self.current_pass_width = width_px;
+            self.current_pass_height = height_px;
 
             let color_attachments = msg_send_![descriptor, colorAttachments];
             let color_attachment = msg_send_![color_attachments, objectAtIndexedSubscript: 0];

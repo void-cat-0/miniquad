@@ -461,9 +461,11 @@ impl MainThreadState {
             }
             Message::SurfaceChanged { width, height } => {
                 {
+                    let density = unsafe { query_display_density() };
                     let mut d = crate::native_display().lock().unwrap();
                     d.screen_width = width as _;
                     d.screen_height = height as _;
+                    d.dpi_scale = density;
                 }
                 #[cfg(feature = "vulkan")]
                 if self.egl.is_none() {
@@ -734,6 +736,56 @@ pub unsafe fn attach_jni_env() -> *mut ndk_sys::JNIEnv {
     env
 }
 
+/// `Resources.getDisplayMetrics().density` — 1.0 = mdpi, 2.0 = xhdpi,
+/// etc. Returns 1.0 on any JNI hiccup.
+unsafe fn query_display_density() -> f32 {
+    if VM.is_null() || ACTIVITY.is_null() {
+        return 1.0;
+    }
+    let env = attach_jni_env();
+    if env.is_null() {
+        return 1.0;
+    }
+
+    let resources = ndk_utils::call_object_method!(
+        env,
+        ACTIVITY,
+        "getResources",
+        "()Landroid/content/res/Resources;"
+    );
+    if resources.is_null() {
+        return 1.0;
+    }
+
+    let metrics = ndk_utils::call_object_method!(
+        env,
+        resources,
+        "getDisplayMetrics",
+        "()Landroid/util/DisplayMetrics;"
+    );
+    if metrics.is_null() {
+        return 1.0;
+    }
+
+    let get_object_class = (**env).GetObjectClass.unwrap();
+    let get_field_id = (**env).GetFieldID.unwrap();
+    let get_float_field = (**env).GetFloatField.unwrap();
+
+    let metrics_class = get_object_class(env, metrics);
+    let density_field = get_field_id(
+        env,
+        metrics_class,
+        b"density\0".as_ptr() as _,
+        b"F\0".as_ptr() as _,
+    );
+    if density_field.is_null() {
+        return 1.0;
+    }
+
+    let density = get_float_field(env, metrics, density_field);
+    if density > 0.0 { density } else { 1.0 }
+}
+
 pub struct AndroidClipboard {}
 impl AndroidClipboard {
     pub fn new() -> AndroidClipboard {
@@ -918,9 +970,11 @@ where
         let tx_fn = Box::new(move |req| {
             let _ = tx.send(Message::Request(req));
         });
+        let density = query_display_density();
         crate::set_or_replace_display(NativeDisplayData {
             high_dpi: conf.high_dpi,
             blocking_event_loop: conf.platform.blocking_event_loop,
+            dpi_scale: density,
             rendering_backend: if vulkan {
                 crate::conf::RenderingBackend::Vulkan
             } else {
