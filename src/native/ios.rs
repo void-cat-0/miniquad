@@ -20,7 +20,6 @@ use {
         cell::RefCell,
         os::raw::c_void,
         sync::{mpsc, Arc, Mutex},
-        thread::{self},
     },
 };
 
@@ -30,7 +29,6 @@ struct MainThreadState {
     update_requested: bool,
     view: *mut Object,
     keymods: KeyMods,
-    cur_msg: Message,
 }
 
 struct IosDisplay {
@@ -47,6 +45,9 @@ struct IosDisplay {
     _gles2: bool,
     f: Option<Box<dyn 'static + FnOnce() -> Box<dyn EventHandler>>>,
     state: Arc<Mutex<MainThreadState>>,
+    requests_rx: mpsc::Receiver<crate::native::Request>,
+    messages_rx: mpsc::Receiver<Message>,
+    blocking_event_loop: bool,
 }
 
 impl IosDisplay {
@@ -109,10 +110,11 @@ fn dispatch_message(payload: &mut IosDisplay, msg: Message) {
             touch_id,
             x,
             y,
+            time,
         } => {
             payload.state.lock().unwrap().update_requested = true;
             if let Some(ref mut event_handler) = payload.event_handler {
-                event_handler.touch_event(phase, touch_id, x, y);
+                event_handler.touch_event(phase, touch_id, x, y, time);
             }
         }
         Message::Character { character } => {
@@ -207,6 +209,7 @@ enum Message {
         touch_id: u64,
         x: f32,
         y: f32,
+        time: f64,
     },
     Character {
         character: u32,
@@ -347,11 +350,13 @@ pub fn define_glk_or_mtk_view(superclass: &Class) -> *const Class {
                     ios_pos.y *= content_scale_factor;
                 }
 
+                let time: f64 = msg_send![ios_touch, timestamp];
                 send_message(Message::Touch {
                     phase,
                     touch_id,
                     x: ios_pos.x as f32,
                     y: ios_pos.y as f32,
+                    time,
                 });
             }
         }
@@ -372,80 +377,6 @@ pub fn define_glk_or_mtk_view(superclass: &Class) -> *const Class {
         on_touch(this, event, TouchPhase::Cancelled);
     }
 
-    extern "C" fn process_message(this: &Object, _: Sel, _: ObjcId) {
-        let payload = get_window_payload(this);
-        if payload.event_handler.is_none() {
-            payload.init_event_handler();
-        }
-        let msg = {
-            let state = payload.state.lock().unwrap();
-            state.cur_msg
-        };
-        match msg {
-            Message::Pause => {
-                let mut state = payload.state.lock().unwrap();
-                state.paused = true;
-            }
-            Message::Resume => {
-                let mut state = payload.state.lock().unwrap();
-                state.paused = false;
-            }
-            Message::Destroy => {
-                let mut state = payload.state.lock().unwrap();
-                state.quit = true;
-            }
-            Message::Touch {
-                phase,
-                touch_id,
-                x,
-                y,
-            } => {
-                if let Some(ref mut event_handler) = payload.event_handler {
-                    let timestamp: f64 = msg_send![ios_touch, timestamp];
-                    event_handler.touch_event(phase, touch_id, x, y, timestamp);
-                }
-            }
-            Message::Character { character } => {
-                if let Some(character) = char::from_u32(character) {
-                    if let Some(ref mut event_handler) = payload.event_handler {
-                        event_handler.char_event(character, Default::default(), false);
-                    }
-                }
-            }
-            Message::KeyDown { keycode } => {
-                let mut state = payload.state.lock().unwrap();
-                match keycode {
-                    KeyCode::LeftShift | KeyCode::RightShift => state.keymods.shift = true,
-                    KeyCode::LeftControl | KeyCode::RightControl => state.keymods.ctrl = true,
-                    KeyCode::LeftAlt | KeyCode::RightAlt => state.keymods.alt = true,
-                    KeyCode::LeftSuper | KeyCode::RightSuper => state.keymods.logo = true,
-                    _ => {}
-                }
-                if let Some(ref mut event_handler) = payload.event_handler {
-                    event_handler.key_down_event(keycode, state.keymods, false);
-                }
-            }
-            Message::KeyUp { keycode } => {
-                let mut state = payload.state.lock().unwrap();
-                match keycode {
-                    KeyCode::LeftShift | KeyCode::RightShift => state.keymods.shift = false,
-                    KeyCode::LeftControl | KeyCode::RightControl => state.keymods.ctrl = false,
-                    KeyCode::LeftAlt | KeyCode::RightAlt => state.keymods.alt = false,
-                    KeyCode::LeftSuper | KeyCode::RightSuper => state.keymods.logo = false,
-                    _ => {}
-                }
-                if let Some(ref mut event_handler) = payload.event_handler {
-                    event_handler.key_up_event(keycode, state.keymods);
-                }
-            }
-            Message::Resize { width, height } => {
-                if let Some(ref mut event_handler) = payload.event_handler {
-                    event_handler.resize_event(width as _, height as _);
-                }
-            }
-        }
-    }
-
     unsafe {
         decl.add_method(sel!(isOpaque), yes as extern "C" fn(&Object, Sel) -> BOOL);
         decl.add_method(
@@ -463,10 +394,6 @@ pub fn define_glk_or_mtk_view(superclass: &Class) -> *const Class {
         decl.add_method(
             sel!(touchesCanceled: withEvent:),
             touches_canceled as extern "C" fn(&Object, Sel, ObjcId, ObjcId),
-        );
-        decl.add_method(
-            sel!(processMessage:),
-            process_message as extern "C" fn(&Object, Sel, ObjcId),
         );
     }
 
@@ -925,7 +852,7 @@ pub fn define_app_delegate() -> *const Class {
     }
 
     extern "C" fn did_finish_launching_with_options(
-        _: &Object,
+        delegate_self: &Object,
         _: Sel,
         _: ObjcId,
         _: ObjcId,
@@ -943,9 +870,6 @@ pub fn define_app_delegate() -> *const Class {
             };
             let screen_width = (screen_rect.size.width * scale) as i32;
             let screen_height = (screen_rect.size.height * scale) as i32;
-
-            let window_obj: ObjcId = msg_send![class!(UIWindow), alloc];
-            let window_obj: ObjcId = msg_send![window_obj, initWithFrame: screen_rect];
 
             let view = match conf.platform.apple_gfx_api {
                 AppleGfxApi::OpenGl => {
@@ -1021,7 +945,7 @@ pub fn define_app_delegate() -> *const Class {
                 (textview_dlg, textview)
             };
 
-            let (tx, rx) = std::sync::mpsc::channel();
+            let (tx, messages_rx) = std::sync::mpsc::channel();
 
             MESSAGES_TX.with(move |messages_tx| *messages_tx.borrow_mut() = Some(tx));
 
@@ -1047,7 +971,6 @@ pub fn define_app_delegate() -> *const Class {
                     alt: false,
                     logo: false,
                 },
-                cur_msg: Message::Resume,
             }));
 
             let payload = Box::new(IosDisplay {
@@ -1064,6 +987,9 @@ pub fn define_app_delegate() -> *const Class {
                 event_handler: None,
                 _gles2: view._gles2,
                 state: state_original.clone(),
+                requests_rx,
+                messages_rx,
+                blocking_event_loop: conf.platform.blocking_event_loop,
             });
             let payload_ptr = Box::into_raw(payload) as *mut std::ffi::c_void;
 
