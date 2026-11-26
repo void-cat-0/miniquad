@@ -135,6 +135,7 @@ impl TextInputState {
 static SESSION: std::sync::Mutex<Option<TextInputConfig>> = std::sync::Mutex::new(None);
 
 /// The active session, readable from backends without the display lock.
+#[allow(dead_code)]
 pub(crate) fn session() -> Option<TextInputConfig> {
     *SESSION.lock().unwrap()
 }

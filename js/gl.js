@@ -622,116 +622,179 @@ function mouse_relative_position(clientX, clientY) {
 
 var emscripten_shaders_hack = false;
 
+// Text input: a hidden <input>/<textarea> mirrors the focused field. The
+// browser and its input methods edit the mirror; every change is reported
+// to Rust as a whole editing state (see miniquad's text_input module).
 var html_input_element = null;
-var html_input_is_multiline = false;
-var html_input_is_password = false;
-var html_input_element_id = 0;
+var html_input_config = null;
+var html_input_active = false;
 var html_input_is_composing = false;
 var html_input_composition_text = "";
 var html_input_composition_start = -1;
 var html_input_syncing = false;
+// Focus requested outside a user gesture (iOS Safari keeps the keyboard
+// hidden then); retried on the next touch.
+var html_input_focus_pending = false;
+var html_input_keyboard = { visible: false, top: 0, height: 0 };
 
-function get_or_create_html_input(is_multiline, is_password) {
-    var tag = is_multiline ? "textarea" : "input";
-    if (html_input_element) {
-        if (html_input_element.tagName.toLowerCase() !== tag || html_input_is_password !== is_password) {
-            html_input_element.remove();
-            html_input_element = null;
+// TextInputKind, TextInputAction, TextInputCapitalization codes.
+var TEXT_INPUT_INPUTMODE = ["text", "text", "numeric", "decimal", "tel", "email", "url", "search", "text"];
+var TEXT_INPUT_ENTERKEYHINT = ["", "done", "go", "next", "previous", "search", "send", "enter"];
+var TEXT_INPUT_AUTOCAPITALIZE = ["off", "characters", "words", "sentences"];
+
+function html_input_send_state() {
+    if (html_input_syncing || !html_input_active || !html_input_element || !wasm_exports.on_ime_state_changed) return;
+    var elem = html_input_element;
+    var text = elem.value;
+    var sel_start = elem.selectionStart || 0;
+    var sel_end = elem.selectionEnd || 0;
+    if (elem.selectionDirection === "backward") {
+        var tmp = sel_start;
+        sel_start = sel_end;
+        sel_end = tmp;
+    }
+    var comp_start = -1;
+    var comp_end = -1;
+    if (html_input_is_composing && html_input_composition_text.length > 0) {
+        if (html_input_composition_start < 0) {
+            html_input_composition_start = Math.max(0, (elem.selectionStart || 0) - html_input_composition_text.length);
         }
+        comp_start = html_input_composition_start;
+        comp_end = Math.min(text.length, html_input_composition_start + html_input_composition_text.length);
+    }
+    var text_bytes = (new TextEncoder()).encode(text);
+    var ptr = wasm_exports.allocate_vec_u8(text_bytes.length);
+    new Uint8Array(wasm_memory.buffer, ptr, text_bytes.length).set(text_bytes);
+    wasm_exports.on_ime_state_changed(ptr, text_bytes.length, sel_start, sel_end, comp_start, comp_end, 1);
+}
+
+// Keys the application handles itself while the mirror has focus.
+function html_input_forward_key(e, down) {
+    var code = into_sapp_keycode(e.code);
+    var modifiers = 0;
+    if (e.ctrlKey) modifiers |= SAPP_MODIFIER_CTRL;
+    if (e.shiftKey) modifiers |= SAPP_MODIFIER_SHIFT;
+    if (e.altKey) modifiers |= SAPP_MODIFIER_ALT;
+    if (e.metaKey) modifiers |= SAPP_MODIFIER_SUPER;
+    if (down) {
+        wasm_exports.key_down(code, modifiers, e.repeat);
+    } else {
+        wasm_exports.key_up(code, modifiers);
+    }
+}
+
+function html_input_create(config) {
+    var multiline = config.kind == 8;
+    var tag = multiline ? "textarea" : "input";
+    if (html_input_element && html_input_element.tagName.toLowerCase() !== tag) {
+        html_input_element.remove();
+        html_input_element = null;
     }
     if (!html_input_element) {
-        html_input_element = document.createElement(tag);
-        html_input_element.id = "miniquad-text-input";
-        if (!is_multiline) {
-            html_input_element.type = is_password ? "password" : "text";
-        }
-        html_input_element.setAttribute("autocomplete", "on");
-        html_input_element.setAttribute("autocapitalize", "off");
-        html_input_element.setAttribute("spellcheck", "false");
-        html_input_element.style.cssText =
+        var elem = document.createElement(tag);
+        elem.id = "miniquad-text-input";
+        elem.style.cssText =
             "position:fixed;left:0;top:0;width:1px;height:20px;opacity:0.001;" +
             "pointer-events:none;z-index:-1;border:none;outline:none;background:transparent;" +
+            "color:transparent;caret-color:transparent;resize:none;overflow:hidden;" +
+            // 16px avoids the iOS zoom-on-focus.
             "padding:0;margin:0;font-size:16px;";
-        document.body.appendChild(html_input_element);
+        document.body.appendChild(elem);
+        html_input_element = elem;
 
-        html_input_is_multiline = is_multiline;
-        html_input_is_password = is_password;
-
-        function notify_rust_state() {
-            if (html_input_syncing || !wasm_exports.on_ime_state_changed) return;
-            var text = html_input_element.value;
-            var sel_start = html_input_element.selectionStart || 0;
-            var sel_end = html_input_element.selectionEnd || 0;
-            if (html_input_element.selectionDirection === "backward") {
-                var tmp = sel_start;
-                sel_start = sel_end;
-                sel_end = tmp;
-            }
-            var comp_start = -1;
-            var comp_end = -1;
-            if (html_input_is_composing && html_input_composition_text.length > 0) {
-                if (html_input_composition_start < 0) {
-                    var s_pos = html_input_element.selectionStart || 0;
-                    html_input_composition_start = Math.max(0, s_pos - html_input_composition_text.length);
-                }
-                comp_start = html_input_composition_start;
-                comp_end = html_input_composition_start + html_input_composition_text.length;
-            }
-            var text_bytes = (new TextEncoder()).encode(text);
-            var ptr = wasm_exports.allocate_vec_u8(text_bytes.length);
-            var heap = new Uint8Array(wasm_memory.buffer, ptr, text_bytes.length);
-            heap.set(text_bytes);
-            wasm_exports.on_ime_state_changed(ptr, text_bytes.length, sel_start, sel_end, comp_start, comp_end, html_input_element_id);
-        }
-
-        html_input_element.addEventListener("compositionstart", function (e) {
+        elem.addEventListener("compositionstart", function (e) {
             html_input_is_composing = true;
-            html_input_composition_start = html_input_element.selectionStart || 0;
+            html_input_composition_text = "";
+            html_input_composition_start = Math.min(elem.selectionStart || 0, elem.selectionEnd || 0);
         });
-
-        html_input_element.addEventListener("compositionupdate", function (e) {
+        elem.addEventListener("compositionupdate", function (e) {
             html_input_is_composing = true;
             html_input_composition_text = e.data || "";
-            if (html_input_composition_start < 0) {
-                var s_pos = html_input_element.selectionStart || 0;
-                html_input_composition_start = Math.max(0, s_pos - html_input_composition_text.length);
-            }
-            if (wasm_exports.on_ime_preedit) {
-                var bytes = (new TextEncoder()).encode(html_input_composition_text);
-                var ptr = wasm_exports.allocate_vec_u8(bytes.length);
-                new Uint8Array(wasm_memory.buffer, ptr, bytes.length).set(bytes);
-                wasm_exports.on_ime_preedit(ptr, bytes.length);
-            }
-            notify_rust_state();
+            html_input_send_state();
         });
-
-        html_input_element.addEventListener("compositionend", function (e) {
+        elem.addEventListener("compositionend", function (e) {
             html_input_is_composing = false;
-            var text = e.data || "";
             html_input_composition_text = "";
             html_input_composition_start = -1;
-            if (wasm_exports.on_ime_commit) {
-                var bytes = (new TextEncoder()).encode(text);
-                var ptr = wasm_exports.allocate_vec_u8(bytes.length);
-                new Uint8Array(wasm_memory.buffer, ptr, bytes.length).set(bytes);
-                wasm_exports.on_ime_commit(ptr, bytes.length);
+            html_input_send_state();
+        });
+        elem.addEventListener("input", function (e) {
+            html_input_send_state();
+        });
+        document.addEventListener("selectionchange", function (e) {
+            if (document.activeElement === elem) html_input_send_state();
+        });
+        elem.addEventListener("keydown", function (e) {
+            if (e.isComposing || e.keyCode === 229) return;
+            var multiline = html_input_config && html_input_config.kind == 8;
+            if (e.key === "Enter" && !multiline) {
+                e.preventDefault();
+                if (wasm_exports.on_text_input_action) {
+                    wasm_exports.on_text_input_action(html_input_config ? html_input_config.action : 0);
+                }
+                return;
             }
-            notify_rust_state();
+            // Focus traversal, Escape, and undo belong to the application.
+            var undo = (e.ctrlKey || e.metaKey) && (e.key === "z" || e.key === "Z" || e.key === "y" || e.key === "Y");
+            if (e.key === "Tab" || e.key === "Escape" || undo) {
+                e.preventDefault();
+                html_input_forward_key(e, true);
+            }
         });
-
-        html_input_element.addEventListener("input", function (e) {
-            notify_rust_state();
-        });
-
-        html_input_element.addEventListener("selectionchange", function (e) {
-            notify_rust_state();
-        });
-
-        html_input_element.addEventListener("keyup", function (e) {
-            notify_rust_state();
+        elem.addEventListener("keyup", function (e) {
+            var undo = (e.ctrlKey || e.metaKey) && (e.key === "z" || e.key === "Z" || e.key === "y" || e.key === "Y");
+            if (e.key === "Tab" || e.key === "Escape" || undo) {
+                html_input_forward_key(e, false);
+            }
+            html_input_send_state();
         });
     }
-    return html_input_element;
+    var elem = html_input_element;
+    if (!multiline) {
+        elem.type = config.kind == 1 ? "password" : "text";
+    }
+    elem.setAttribute("inputmode", TEXT_INPUT_INPUTMODE[config.kind] || "text");
+    var hint = TEXT_INPUT_ENTERKEYHINT[config.action] || "";
+    if (hint) elem.setAttribute("enterkeyhint", hint); else elem.removeAttribute("enterkeyhint");
+    elem.setAttribute("autocapitalize", TEXT_INPUT_AUTOCAPITALIZE[config.capitalization] || "off");
+    elem.setAttribute("autocorrect", config.autocorrect ? "on" : "off");
+    elem.setAttribute("spellcheck", config.autocorrect ? "true" : "false");
+    elem.setAttribute("autocomplete", config.kind == 1 ? "current-password" : "off");
+    elem.readOnly = !!config.read_only;
+    return elem;
+}
+
+function html_input_focus() {
+    if (!html_input_element) return;
+    html_input_element.focus({ preventScroll: true });
+    html_input_focus_pending = document.activeElement !== html_input_element;
+}
+
+// Report the soft keyboard from the visual viewport (mobile browsers keep
+// the layout viewport and overlay the keyboard).
+function html_input_watch_keyboard() {
+    if (!window.visualViewport) return;
+    var update = function () {
+        var vv = window.visualViewport;
+        var covered = window.innerHeight - (vv.offsetTop + vv.height);
+        var visible = html_input_active && covered > 80;
+        var rect = canvas.getBoundingClientRect();
+        var scale = dpi_scale();
+        var top = (vv.offsetTop + vv.height - rect.top) * scale;
+        var height = visible ? covered * scale : 0;
+        if (visible !== html_input_keyboard.visible || top !== html_input_keyboard.top || height !== html_input_keyboard.height) {
+            html_input_keyboard = { visible: visible, top: top, height: height };
+            if (wasm_exports.on_soft_keyboard) {
+                if (visible) {
+                    wasm_exports.on_soft_keyboard(1, 0, top, rect.width * scale, height);
+                } else {
+                    wasm_exports.on_soft_keyboard(0, 0, 0, 0, 0);
+                }
+            }
+        }
+    };
+    window.visualViewport.addEventListener("resize", update);
+    window.visualViewport.addEventListener("scroll", update);
 }
 
 var importObject = {
@@ -1395,6 +1458,13 @@ var importObject = {
                 }
             };
 
+            canvas.addEventListener("touchend", function (event) {
+                if (html_input_active && html_input_focus_pending) {
+                    html_input_focus();
+                }
+            });
+            html_input_watch_keyboard();
+
             canvas.addEventListener("touchstart", function (event) {
                 event.preventDefault();
 
@@ -1432,15 +1502,15 @@ var importObject = {
                 resize(canvas, wasm_exports.resize);
             };
             window.addEventListener("copy", function (e) {
-                if (clipboard != null) {
-                    event.clipboardData.setData('text/plain', clipboard);
-                    event.preventDefault();
+                if (clipboard != null && document.activeElement !== html_input_element) {
+                    e.clipboardData.setData('text/plain', clipboard);
+                    e.preventDefault();
                 }
             });
             window.addEventListener("cut", function (e) {
-                if (clipboard != null) {
-                    event.clipboardData.setData('text/plain', clipboard);
-                    event.preventDefault();
+                if (clipboard != null && document.activeElement !== html_input_element) {
+                    e.clipboardData.setData('text/plain', clipboard);
+                    e.preventDefault();
                 }
             });
 
@@ -1583,45 +1653,61 @@ var importObject = {
         },
         sapp_show_keyboard: function (show) {
             if (show) {
-                var elem = get_or_create_html_input(html_input_is_multiline, html_input_is_password);
-                elem.focus({ preventScroll: true });
+                if (html_input_element) html_input_focus();
             } else {
-                if (html_input_element) {
-                    html_input_element.blur();
-                }
+                if (html_input_element) html_input_element.blur();
                 canvas.focus();
             }
         },
-        sapp_update_text_input_state: function (text_ptr, text_len, sel_start, sel_end, is_password, is_multiline, element_id, max_length) {
+        sapp_start_text_input: function (kind, action, autocorrect, capitalization, read_only) {
+            html_input_config = {
+                kind: kind,
+                action: action,
+                autocorrect: !!autocorrect,
+                capitalization: capitalization,
+                read_only: !!read_only
+            };
+            html_input_active = true;
+            html_input_create(html_input_config);
+            html_input_focus();
+        },
+        sapp_stop_text_input: function () {
+            html_input_active = false;
+            html_input_focus_pending = false;
+            html_input_is_composing = false;
+            html_input_composition_text = "";
+            html_input_composition_start = -1;
+            if (html_input_element) html_input_element.blur();
+            canvas.focus();
+        },
+        sapp_set_text_input_state: function (text_ptr, text_len, sel_start, sel_end, comp_start, comp_end) {
+            if (!html_input_element || !html_input_active) return;
+            var elem = html_input_element;
             var text = UTF8ToString(text_ptr, text_len);
-            html_input_element_id = element_id;
-            var elem = get_or_create_html_input(!!is_multiline, !!is_password);
+            // Writing the value would cancel an input method composition the
+            // application has not ended.
+            if (html_input_is_composing && comp_start >= 0) return;
             html_input_syncing = true;
-            elem.value = text;
-            if (max_length > 0) {
-                elem.setAttribute("maxlength", max_length);
-            } else {
-                elem.removeAttribute("maxlength");
-            }
             try {
-                var s_min = Math.min(sel_start, sel_end);
-                var s_max = Math.max(sel_start, sel_end);
+                if (elem.value !== text) elem.value = text;
+                var s_min = Math.min(sel_start, sel_end, text.length);
+                var s_max = Math.min(Math.max(sel_start, sel_end), text.length);
                 var dir = sel_start > sel_end ? "backward" : "forward";
-                elem.setSelectionRange(Math.min(s_min, text.length), Math.min(s_max, text.length), dir);
-            } catch (e) {}
-            html_input_syncing = false;
+                elem.setSelectionRange(s_min, s_max, dir);
+            } catch (e) {
+            } finally {
+                html_input_syncing = false;
+            }
         },
-        sapp_set_ime_position: function (x, y) {
+        sapp_set_text_input_rect: function (x, y, w, h) {
             if (!html_input_element) return;
+            // Keep the mirror at the caret so the browser scrolls and places
+            // candidate windows next to it.
             var scale = dpi_scale();
-            var css_x = x / scale;
-            var css_y = y / scale;
-            var canvas_rect = canvas.getBoundingClientRect();
-            html_input_element.style.left = (canvas_rect.left + css_x) + "px";
-            html_input_element.style.top = (canvas_rect.top + css_y) + "px";
-        },
-        sapp_set_ime_enabled: function (enabled) {
-            // Can toggle IME behavior if needed
+            var rect = canvas.getBoundingClientRect();
+            html_input_element.style.left = (rect.left + x / scale) + "px";
+            html_input_element.style.top = (rect.top + y / scale) + "px";
+            html_input_element.style.height = Math.max(1, h / scale) + "px";
         },
         init_webgl
     }

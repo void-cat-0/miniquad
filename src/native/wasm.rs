@@ -140,18 +140,23 @@ extern "C" {
     pub fn now() -> f64;
 
     pub fn sapp_show_keyboard(show: bool);
-    pub fn sapp_update_text_input_state(
+    pub fn sapp_start_text_input(
+        kind: u32,
+        action: u32,
+        autocorrect: bool,
+        capitalization: u32,
+        read_only: bool,
+    );
+    pub fn sapp_stop_text_input();
+    pub fn sapp_set_text_input_state(
         text_ptr: *const u8,
         text_len: usize,
-        sel_start: usize,
-        sel_end: usize,
-        is_password: bool,
-        is_multiline: bool,
-        element_id: u64,
-        max_length: usize,
+        sel_start: i32,
+        sel_end: i32,
+        comp_start: i32,
+        comp_end: i32,
     );
-    pub fn sapp_set_ime_position(x: i32, y: i32);
-    pub fn sapp_set_ime_enabled(enabled: bool);
+    pub fn sapp_set_text_input_rect(x: f32, y: f32, w: f32, h: f32);
 }
 
 unsafe fn show_mouse(shown: bool) {
@@ -248,35 +253,28 @@ pub extern "C" fn frame() {
                 Request::ShowKeyboard(show) => unsafe {
                     sapp_show_keyboard(show);
                 },
-                request @ (Request::SetTextInputState(_) | Request::StopTextInput) => unsafe {
-                #[allow(unused_variables)]
-                let crate::native::LegacyTextInput {
-                    text,
-                    selection_start,
-                    selection_end,
-                    is_password,
-                    is_multiline,
-                    element_id,
-                    max_length,
-                } = crate::native::LegacyTextInput::from_request(&request);
-
-                    sapp_update_text_input_state(
-                        text.as_ptr(),
-                        text.len(),
-                        selection_start,
-                        selection_end,
-                        is_password,
-                        is_multiline,
-                        element_id,
-                        max_length,
+                Request::StartTextInput(config) => unsafe {
+                    sapp_start_text_input(
+                        config.kind as u32,
+                        config.action as u32,
+                        config.autocorrect,
+                        config.capitalization as u32,
+                        config.read_only,
                     );
                 },
-                Request::SetTextInputRect { x, y, .. } => unsafe {
-                    let (x, y) = (x as i32, y as i32);
-                    sapp_set_ime_position(x, y);
+                Request::StopTextInput => unsafe { sapp_stop_text_input() },
+                Request::SetTextInputState(state) => unsafe {
+                    sapp_set_text_input_state(
+                        state.text.as_ptr(),
+                        state.text.len(),
+                        state.selection_start,
+                        state.selection_end,
+                        state.composing_start,
+                        state.composing_end,
+                    );
                 },
-                Request::StartTextInput(_) => unsafe {
-                    sapp_set_ime_enabled(true);
+                Request::SetTextInputRect { x, y, w, h } => unsafe {
+                    sapp_set_text_input_rect(x, y, w, h);
                 },
                 _ => {}
             }
@@ -311,6 +309,27 @@ pub extern "C" fn on_ime_state_changed(
             element_id,
         );
     });
+}
+
+#[no_mangle]
+pub extern "C" fn on_text_input_action(action: u32) {
+    use crate::TextInputAction as A;
+    let action = match action {
+        1 => A::Done,
+        2 => A::Go,
+        3 => A::Next,
+        4 => A::Previous,
+        5 => A::Search,
+        6 => A::Send,
+        7 => A::Newline,
+        _ => crate::text_input::session().map_or(A::Done, |config| config.resolved_action()),
+    };
+    tl_event_handler(|event_handler| event_handler.text_input_action_event(action));
+}
+
+#[no_mangle]
+pub extern "C" fn on_soft_keyboard(visible: u32, x: f32, y: f32, w: f32, h: f32) {
+    tl_event_handler(|event_handler| event_handler.soft_keyboard_event(visible != 0, x, y, w, h));
 }
 
 #[no_mangle]
