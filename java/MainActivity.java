@@ -78,8 +78,12 @@ class HiddenEditText extends EditText {
         setOnEditorActionListener(new TextView.OnEditorActionListener() {
             @Override
             public boolean onEditorAction(TextView v, int actionId, KeyEvent event) {
+                if (MainActivity.sTextInputIsMultiline && actionId == EditorInfo.IME_NULL) {
+                    // Enter in a multiline field inserts a newline.
+                    return false;
+                }
                 QuadNative.surfaceOnImeAction(actionId);
-                return false;
+                return true;
             }
         });
 
@@ -131,17 +135,34 @@ class HiddenEditText extends EditText {
         mIgnoreUpdates = ignore;
     }
 
-    public void updateStateFromRust(String text, int selectionStart, int selectionEnd) {
+    public void applyStateFromRust(String text, int selectionStart, int selectionEnd, int composingStart, int composingEnd) {
+        Editable editable = getText();
+        if (editable == null) return;
         mIgnoreUpdates = true;
         try {
-            String currentText = getText() != null ? getText().toString() : "";
-            if (!currentText.equals(text)) {
-                setText(text);
+            int currentComposingStart = android.view.inputmethod.BaseInputConnection.getComposingSpanStart(editable);
+            int currentComposingEnd = android.view.inputmethod.BaseInputConnection.getComposingSpanEnd(editable);
+            boolean textChanged = !editable.toString().equals(text);
+            boolean composingEnded = composingStart < 0 && currentComposingStart >= 0;
+            if (textChanged || composingEnded) {
+                android.view.inputmethod.BaseInputConnection.removeComposingSpans(editable);
             }
-            int len = getText().length();
+            if (textChanged) {
+                editable.replace(0, editable.length(), text);
+            }
+            int len = editable.length();
             int start = Math.max(0, Math.min(len, selectionStart));
             int end = Math.max(0, Math.min(len, selectionEnd));
-            setSelection(start, end);
+            Selection.setSelection(editable, start, end);
+            InputMethodManager imm = (InputMethodManager) getContext().getSystemService(Context.INPUT_METHOD_SERVICE);
+            if (imm != null) {
+                if (textChanged || composingEnded) {
+                    imm.restartInput(this);
+                } else {
+                    imm.updateSelection(this, Math.min(start, end), Math.max(start, end),
+                        currentComposingStart, currentComposingEnd);
+                }
+            }
         } finally {
             mIgnoreUpdates = false;
         }
@@ -248,7 +269,7 @@ class QuadSurface
                 getHandler().removeCallbacks(mLongPressRunnable);
                 getHandler().postDelayed(mLongPressRunnable, 500);
             }
-            QuadNative.surfaceOnTouch(id, 0, x, y);
+            QuadNative.surfaceOnTouch(id, 0, x, y, event.getEventTime());
 
             break;
         }
@@ -260,7 +281,7 @@ class QuadSurface
                 if (Math.hypot(x - mDownX, y - mDownY) > 25 && getHandler() != null) {
                     getHandler().removeCallbacks(mLongPressRunnable);
                 }
-                QuadNative.surfaceOnTouch(id, 1, x, y);
+                QuadNative.surfaceOnTouch(id, 1, x, y, event.getEventTime());
             }
             break;
         }
@@ -280,7 +301,7 @@ class QuadSurface
                 }
             }
             int phase = mIsLongPress ? 3 : 2;
-            QuadNative.surfaceOnTouch(id, phase, x, y);
+            QuadNative.surfaceOnTouch(id, phase, x, y, event.getEventTime());
             break;
         }
         case MotionEvent.ACTION_CANCEL: {
@@ -291,7 +312,7 @@ class QuadSurface
                 final int id = event.getPointerId(i);
                 final float x = event.getX(i);
                 final float y = event.getY(i);
-                QuadNative.surfaceOnTouch(id, 3, x, y);
+                QuadNative.surfaceOnTouch(id, 3, x, y, event.getEventTime());
             }
             break;
         }
@@ -362,23 +383,45 @@ class ResizingLayout
         //% RESIZING_LAYOUT_CONSTRUCTOR
     }
 
+    private boolean mKeyboardVisible = false;
+    private int mKeyboardHeight = 0;
+
     @Override
+    @SuppressWarnings("deprecation")
     public WindowInsets onApplyWindowInsets(View v, WindowInsets insets) {
+        int left, top, right, bottom, keyboard;
         if (Build.VERSION.SDK_INT >= 30) {
             Insets imeInsets = insets.getInsets(WindowInsets.Type.ime());
             Insets sysInsets = insets.getInsets(WindowInsets.Type.systemBars());
+            left = sysInsets.left;
+            top = sysInsets.top;
+            right = sysInsets.right;
+            keyboard = imeInsets.bottom > sysInsets.bottom ? imeInsets.bottom : 0;
+            bottom = keyboard > 0 ? keyboard : sysInsets.bottom;
+        } else {
+            // Before API 30 the bottom system inset includes the keyboard;
+            // anything taller than a navigation bar is taken as a keyboard.
+            left = insets.getSystemWindowInsetLeft();
+            top = insets.getSystemWindowInsetTop();
+            right = insets.getSystemWindowInsetRight();
+            bottom = insets.getSystemWindowInsetBottom();
+            keyboard = bottom > v.getHeight() / 6 ? bottom : 0;
+        }
+        v.setPadding(left, top, right, bottom);
 
-            int bottomPadding = sysInsets.bottom;
-            if (imeInsets.bottom > 0) {
-                bottomPadding = imeInsets.bottom;
+        // The surface ends at the keyboard's top edge, so in surface
+        // coordinates the keyboard lies just below the surface.
+        boolean visible = keyboard > 0;
+        if (visible != mKeyboardVisible || keyboard != mKeyboardHeight) {
+            mKeyboardVisible = visible;
+            mKeyboardHeight = keyboard;
+            int surfaceWidth = Math.max(0, v.getWidth() - left - right);
+            int surfaceHeight = Math.max(0, v.getHeight() - top - bottom);
+            if (visible) {
+                QuadNative.surfaceOnKeyboard(true, 0, surfaceHeight, surfaceWidth, keyboard);
+            } else {
+                QuadNative.surfaceOnKeyboard(false, 0, 0, 0, 0);
             }
-
-            v.setPadding(
-                sysInsets.left,
-                sysInsets.top,
-                sysInsets.right,
-                bottomPadding
-            );
         }
         return insets;
     }
@@ -411,84 +454,103 @@ public class MainActivity extends Activity {
         }
     }
 
-    public void updateTextInputState(final String text, final int selectionStart, final int selectionEnd, final boolean isPassword, final boolean isMultiline, final long elementId, final int maxLength) {
+    // Text input session: kind, action, and capitalization codes follow
+    // miniquad's TextInputKind, TextInputAction, and TextInputCapitalization.
+    public void startTextInput(final int kind, final int action, final boolean autocorrect, final int capitalization, final boolean readOnly) {
         runOnUiThread(new Runnable() {
             @Override
             public void run() {
                 if (sHiddenEditText == null) return;
-
+                int inputType;
+                switch (kind) {
+                    case 1: inputType = InputType.TYPE_CLASS_TEXT | InputType.TYPE_TEXT_VARIATION_PASSWORD; break;
+                    case 2: inputType = InputType.TYPE_CLASS_NUMBER; break;
+                    case 3: inputType = InputType.TYPE_CLASS_NUMBER | InputType.TYPE_NUMBER_FLAG_DECIMAL | InputType.TYPE_NUMBER_FLAG_SIGNED; break;
+                    case 4: inputType = InputType.TYPE_CLASS_PHONE; break;
+                    case 5: inputType = InputType.TYPE_CLASS_TEXT | InputType.TYPE_TEXT_VARIATION_EMAIL_ADDRESS; break;
+                    case 6: inputType = InputType.TYPE_CLASS_TEXT | InputType.TYPE_TEXT_VARIATION_URI; break;
+                    case 8: inputType = InputType.TYPE_CLASS_TEXT | InputType.TYPE_TEXT_FLAG_MULTI_LINE; break;
+                    default: inputType = InputType.TYPE_CLASS_TEXT; break;
+                }
+                if ((inputType & InputType.TYPE_MASK_CLASS) == InputType.TYPE_CLASS_TEXT && kind != 1) {
+                    inputType |= autocorrect ? InputType.TYPE_TEXT_FLAG_AUTO_CORRECT : InputType.TYPE_TEXT_FLAG_NO_SUGGESTIONS;
+                    switch (capitalization) {
+                        case 1: inputType |= InputType.TYPE_TEXT_FLAG_CAP_CHARACTERS; break;
+                        case 2: inputType |= InputType.TYPE_TEXT_FLAG_CAP_WORDS; break;
+                        case 3: inputType |= InputType.TYPE_TEXT_FLAG_CAP_SENTENCES; break;
+                        default: break;
+                    }
+                }
+                int imeAction;
+                switch (action) {
+                    case 1: imeAction = EditorInfo.IME_ACTION_DONE; break;
+                    case 2: imeAction = EditorInfo.IME_ACTION_GO; break;
+                    case 3: imeAction = EditorInfo.IME_ACTION_NEXT; break;
+                    case 4: imeAction = EditorInfo.IME_ACTION_PREVIOUS; break;
+                    case 5: imeAction = EditorInfo.IME_ACTION_SEARCH; break;
+                    case 6: imeAction = EditorInfo.IME_ACTION_SEND; break;
+                    case 7: imeAction = EditorInfo.IME_ACTION_NONE; break;
+                    default:
+                        imeAction = kind == 8 ? EditorInfo.IME_ACTION_NONE
+                            : kind == 7 ? EditorInfo.IME_ACTION_SEARCH : EditorInfo.IME_ACTION_DONE;
+                        break;
+                }
+                int imeOptions = imeAction | EditorInfo.IME_FLAG_NO_FULLSCREEN;
+                if (kind == 1 && Build.VERSION.SDK_INT >= 26) {
+                    imeOptions |= EditorInfo.IME_FLAG_NO_PERSONALIZED_LEARNING;
+                }
+                sTextInputIsPassword = kind == 1;
+                sTextInputIsMultiline = kind == 8;
+                sFocusedElementId = 1;
                 sHiddenEditText.setIgnoreUpdates(true);
                 try {
-                    boolean focusChanged = (sFocusedElementId != elementId);
-                    boolean paramsChanged = (sTextInputIsPassword != isPassword) || (sTextInputIsMultiline != isMultiline);
-
-                    sTextInputText = text != null ? text : "";
-                    sTextInputSelectionStart = selectionStart;
-                    sTextInputSelectionEnd = selectionEnd;
-                    sTextInputIsPassword = isPassword;
-                    sTextInputIsMultiline = isMultiline;
-                    sFocusedElementId = elementId;
-
-                    if (maxLength > 0) {
-                        sHiddenEditText.setFilters(new android.text.InputFilter[] { new android.text.InputFilter.LengthFilter(maxLength) });
-                    } else {
-                        sHiddenEditText.setFilters(new android.text.InputFilter[0]);
-                    }
-
-                    int inputType = EditorInfo.TYPE_CLASS_TEXT;
-                    int imeOptions = EditorInfo.IME_FLAG_NO_FULLSCREEN;
-                    if (isPassword) {
-                        inputType |= EditorInfo.TYPE_TEXT_VARIATION_PASSWORD;
-                        imeOptions |= EditorInfo.IME_ACTION_DONE;
-                    } else if (isMultiline) {
-                        inputType |= EditorInfo.TYPE_TEXT_FLAG_MULTI_LINE;
-                        imeOptions |= EditorInfo.IME_ACTION_NONE;
-                    } else {
-                        imeOptions |= EditorInfo.IME_ACTION_DONE;
-                    }
-
                     sHiddenEditText.setInputType(inputType);
                     sHiddenEditText.setImeOptions(imeOptions);
-
-                    Editable editable = sHiddenEditText.getText();
-                    String currentText = editable != null ? editable.toString() : "";
-                    boolean textChanged = !currentText.equals(sTextInputText);
-                    if (textChanged) {
-                        if (editable != null) {
-                            int compStart = android.view.inputmethod.BaseInputConnection.getComposingSpanStart(editable);
-                            int compEnd = android.view.inputmethod.BaseInputConnection.getComposingSpanEnd(editable);
-                            if (compStart != -1 || compEnd != -1) {
-                                android.view.inputmethod.BaseInputConnection.removeComposingSpans(editable);
-                            }
-                        }
-                        sHiddenEditText.setText(sTextInputText);
-                    }
-
-                    int len = sHiddenEditText.getText().length();
-                    int start = Math.max(0, Math.min(len, sTextInputSelectionStart));
-                    int end = Math.max(0, Math.min(len, sTextInputSelectionEnd));
-
-                    sHiddenEditText.setSelection(start, end);
-
-                    InputMethodManager imm = (InputMethodManager) getSystemService(Context.INPUT_METHOD_SERVICE);
-                    if (elementId != 0 && elementId != -1) {
-                        sHiddenEditText.requestFocus();
-                        if (imm != null) {
-                            if (focusChanged || paramsChanged) {
-                                imm.restartInput(sHiddenEditText);
-                            }
-                            imm.showSoftInput(sHiddenEditText, InputMethodManager.SHOW_IMPLICIT);
-                            imm.updateSelection(sHiddenEditText, start, end, -1, -1);
-                        }
-                    } else {
-                        sHiddenEditText.clearFocus();
-                        if (imm != null) {
-                            imm.hideSoftInputFromWindow(sHiddenEditText.getWindowToken(), 0);
-                        }
-                    }
+                    sHiddenEditText.setFilters(new android.text.InputFilter[0]);
                 } finally {
                     sHiddenEditText.setIgnoreUpdates(false);
                 }
+                InputMethodManager imm = (InputMethodManager) getSystemService(Context.INPUT_METHOD_SERVICE);
+                sHiddenEditText.requestFocus();
+                if (imm != null) {
+                    imm.restartInput(sHiddenEditText);
+                    if (readOnly) {
+                        imm.hideSoftInputFromWindow(sHiddenEditText.getWindowToken(), 0);
+                    } else {
+                        imm.showSoftInput(sHiddenEditText, InputMethodManager.SHOW_IMPLICIT);
+                    }
+                }
+            }
+        });
+    }
+
+    public void stopTextInput() {
+        runOnUiThread(new Runnable() {
+            @Override
+            public void run() {
+                sFocusedElementId = 0;
+                if (sHiddenEditText == null) return;
+                Editable editable = sHiddenEditText.getText();
+                if (editable != null) {
+                    android.view.inputmethod.BaseInputConnection.removeComposingSpans(editable);
+                }
+                sHiddenEditText.clearFocus();
+                view.requestFocus();
+                InputMethodManager imm = (InputMethodManager) getSystemService(Context.INPUT_METHOD_SERVICE);
+                if (imm != null) {
+                    imm.hideSoftInputFromWindow(sHiddenEditText.getWindowToken(), 0);
+                }
+            }
+        });
+    }
+
+    public void setTextInputState(final String text, final int selectionStart, final int selectionEnd, final int composingStart, final int composingEnd) {
+        runOnUiThread(new Runnable() {
+            @Override
+            public void run() {
+                if (sHiddenEditText == null || sFocusedElementId != 1) return;
+                sTextInputText = text != null ? text : "";
+                sHiddenEditText.applyStateFromRust(sTextInputText, selectionStart, selectionEnd, composingStart, composingEnd);
             }
         });
     }
