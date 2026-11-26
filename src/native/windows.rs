@@ -43,20 +43,79 @@ const WM_INPUTLANGCHANGEREQUEST: UINT = 0x0050;
 const WM_SETFOCUS: UINT = 0x0007;
 const WM_KILLFOCUS: UINT = 0x0008;
 
-/// Global flag tracking whether IME has been explicitly disabled by the user.
-/// This is controlled via `show_keyboard(bool)` API calls.
-use std::sync::atomic::AtomicBool;
-static IME_USER_DISABLED: AtomicBool = AtomicBool::new(false);
+/// Text input session state shared with the window procedure. The input
+/// method is associated with the window only during a session (and never for
+/// password fields), so game keys are not intercepted by an IME elsewhere.
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+static IME_SESSION: AtomicBool = AtomicBool::new(false);
+/// Caret rectangle of the session in client pixels: left, top, right, bottom.
+static IME_RECT: std::sync::Mutex<Option<(i32, i32, i32, i32)>> = std::sync::Mutex::new(None);
+/// A high surrogate from WM_CHAR waiting for its low half.
+static PENDING_SURROGATE: AtomicU32 = AtomicU32::new(0);
 
 // IME composition form constants
 const CFS_POINT: DWORD = 0x0002;
-const CFS_CANDIDATEPOS: DWORD = 0x0040;
+const CFS_EXCLUDE: DWORD = 0x0080;
 
 // ImmAssociateContextEx flags
 const IACE_DEFAULT: DWORD = 0x0010;
+const IACE_CHILDREN: DWORD = 0x0001;
 
-// Offset for candidate window below composition position
-const CANDIDATE_WINDOW_Y_OFFSET: i32 = 5;
+// ImmNotifyIME: cancel the composition string.
+const NI_COMPOSITIONSTR: DWORD = 0x0015;
+const CPS_CANCEL: DWORD = 0x0004;
+
+// WM_IME_SETCONTEXT: the IME's own composition window, which is replaced by
+// the application's inline preedit during a session.
+const ISC_SHOWUICOMPOSITIONWINDOW: LPARAM = 0x80000000u32 as LPARAM;
+
+unsafe fn ime_apply_rect(hwnd: HWND) {
+    let Some((left, top, right, bottom)) = *IME_RECT.lock().unwrap() else {
+        return;
+    };
+    let himc = ImmGetContext(hwnd);
+    if himc.is_null() {
+        return;
+    }
+    let comp_form = COMPOSITIONFORM {
+        dwStyle: CFS_POINT,
+        ptCurrentPos: POINT { x: left, y: top },
+        rcArea: std::mem::zeroed(),
+    };
+    ImmSetCompositionWindow(himc, &comp_form);
+    // Open the candidate list next to the caret without covering it.
+    let cand_form = CANDIDATEFORM {
+        dwIndex: 0,
+        dwStyle: CFS_EXCLUDE,
+        ptCurrentPos: POINT { x: left, y: bottom },
+        rcArea: RECT {
+            left,
+            top,
+            right,
+            bottom,
+        },
+    };
+    ImmSetCandidateWindow(himc, &cand_form);
+    ImmReleaseContext(hwnd, himc);
+}
+
+unsafe fn ime_cancel_composition(hwnd: HWND) {
+    let himc = ImmGetContext(hwnd);
+    if !himc.is_null() {
+        ImmNotifyIME(himc, NI_COMPOSITIONSTR, CPS_CANCEL, 0);
+        ImmReleaseContext(hwnd, himc);
+    }
+}
+
+unsafe fn composition_string(himc: HIMC, kind: DWORD) -> Option<String> {
+    let len = ImmGetCompositionStringW(himc, kind, std::ptr::null_mut(), 0);
+    if len <= 0 {
+        return None;
+    }
+    let mut buffer: Vec<u16> = vec![0; len as usize / 2];
+    ImmGetCompositionStringW(himc, kind, buffer.as_mut_ptr() as *mut _, len as u32);
+    Some(String::from_utf16_lossy(&buffer))
+}
 
 const WHEEL_DELTA: f32 = 120.0;
 
@@ -84,16 +143,10 @@ struct CANDIDATEFORM {
 extern "system" {
     fn ImmGetCompositionStringW(himc: HIMC, index: DWORD, buf: *mut std::ffi::c_void, len: DWORD) -> i32;
     fn ImmAssociateContextEx(hwnd: HWND, himc: HIMC, flags: DWORD) -> i32;
-    fn ImmAssociateContext(hwnd: HWND, himc: HIMC) -> HIMC;
-    fn ImmCreateContext() -> HIMC;
     fn ImmSetCompositionWindow(himc: HIMC, lpCompForm: *const COMPOSITIONFORM) -> i32;
     fn ImmSetCandidateWindow(himc: HIMC, lpCandidate: *const CANDIDATEFORM) -> i32;
-    fn ImmGetOpenStatus(himc: HIMC) -> i32;
-    fn ImmSetOpenStatus(himc: HIMC, fOpen: i32) -> i32;
+    fn ImmNotifyIME(himc: HIMC, action: DWORD, index: DWORD, value: DWORD) -> i32;
 }
-
-// IME Association flags
-const IACE_CHILDREN: DWORD = 0x0001;
 
 mod clipboard;
 mod keycodes;
@@ -122,7 +175,6 @@ pub(crate) struct WindowsDisplay {
     event_handler: Option<Box<dyn EventHandler>>,
     modal_resizing_timer: usize,
     update_requested: bool,
-    ime_position: Option<(i32, i32)>,
 }
 
 impl WindowsDisplay {
@@ -142,54 +194,46 @@ impl WindowsDisplay {
             unsafe { ShowCursor(shown.into()) };
         }
     }
-    /// Set IME candidate window position in client coordinates
-    fn set_ime_position(&mut self, x: i32, y: i32) {
-        // Save user-set position for use in WM_IME_STARTCOMPOSITION
-        self.ime_position = Some((x, y));
-        
+    fn start_text_input(&mut self, config: crate::TextInputConfig) {
+        // Password fields take keys directly: no composition, no candidates.
+        let ime = !config.is_secure() && !config.read_only;
+        let was = IME_SESSION.swap(ime, Ordering::Relaxed);
         unsafe {
-            let himc = ImmGetContext(self.wnd);
-            if himc.is_null() {
-                return;
-            }
-
-            // Set composition window position (where the composing text appears)
-            let comp_form = COMPOSITIONFORM {
-                dwStyle: CFS_POINT,
-                ptCurrentPos: POINT { x, y },
-                rcArea: std::mem::zeroed(),
-            };
-            ImmSetCompositionWindow(himc, &comp_form);
-
-            // Set candidate window position (the popup with character choices)
-            let cand_form = CANDIDATEFORM {
-                dwIndex: 0,
-                dwStyle: CFS_CANDIDATEPOS,
-                ptCurrentPos: POINT { x: x, y: y + CANDIDATE_WINDOW_Y_OFFSET },
-                rcArea: std::mem::zeroed(),
-            };
-            ImmSetCandidateWindow(himc, &cand_form);
-
-            ImmReleaseContext(self.wnd, himc);
-        }
-    }
-    
-    /// Enable or disable IME for the window.
-    /// When disabled, the IME will not process keyboard input, useful for game controls.
-    fn set_ime_enabled(&mut self, enabled: bool) {
-        unsafe {
-            if enabled {
-                IME_USER_DISABLED.store(false, std::sync::atomic::Ordering::Relaxed);
-                // Re-associate IME context with the window
+            if ime {
                 ImmAssociateContextEx(self.wnd, std::ptr::null_mut(), IACE_DEFAULT);
-            } else {
-                IME_USER_DISABLED.store(true, std::sync::atomic::Ordering::Relaxed);
-                // Disassociate IME context from the window
+                ime_apply_rect(self.wnd);
+            } else if was {
+                ime_cancel_composition(self.wnd);
                 ImmAssociateContextEx(self.wnd, std::ptr::null_mut(), 0);
             }
         }
     }
-    
+
+    fn stop_text_input(&mut self) {
+        IME_SESSION.store(false, Ordering::Relaxed);
+        *IME_RECT.lock().unwrap() = None;
+        unsafe {
+            ime_cancel_composition(self.wnd);
+            ImmAssociateContextEx(self.wnd, std::ptr::null_mut(), 0);
+        }
+        if let Some(handler) = self.event_handler.as_mut() {
+            handler.on_ime_preedit("", 0);
+        }
+    }
+
+    fn set_text_input_rect(&mut self, x: f32, y: f32, w: f32, h: f32) {
+        let rect = (
+            x.round() as i32,
+            y.round() as i32,
+            (x + w).round() as i32,
+            (y + h.max(1.)).round() as i32,
+        );
+        *IME_RECT.lock().unwrap() = Some(rect);
+        if IME_SESSION.load(Ordering::Relaxed) {
+            unsafe { ime_apply_rect(self.wnd) };
+        }
+    }
+
     fn set_mouse_cursor(&mut self, cursor_icon: CursorIcon) {
         let cursor_name = match cursor_icon {
             CursorIcon::Default => IDC_ARROW,
@@ -672,13 +716,26 @@ unsafe extern "system" fn win32_wndproc(
             event_handler.mouse_wheel_event(0.0, (HIWORD(wparam as _) as i16) as f32 / WHEEL_DELTA);
         }
         WM_CHAR => {
-            let chr = wparam as u32;
+            let unit = wparam as u32;
             let repeat = !!(lparam & 0x40000000) != 0;
             let mods = key_mods();
-            if chr > 0 {
-                if let Some(chr) = char::from_u32(chr) {
-                    event_handler.char_event(chr, mods, repeat);
+            // Characters outside the BMP (emoji) arrive as two UTF-16 halves.
+            let chr = match unit {
+                0xD800..=0xDBFF => {
+                    PENDING_SURROGATE.store(unit, Ordering::Relaxed);
+                    None
                 }
+                0xDC00..=0xDFFF => {
+                    let high = PENDING_SURROGATE.swap(0, Ordering::Relaxed);
+                    char::decode_utf16([high as u16, unit as u16])
+                        .next()
+                        .and_then(Result::ok)
+                }
+                0 => None,
+                _ => char::from_u32(unit),
+            };
+            if let Some(chr) = chr {
+                event_handler.char_event(chr, mods, repeat);
             }
             return 0;
         }
@@ -692,114 +749,55 @@ unsafe extern "system" fn win32_wndproc(
         WM_IME_COMPOSITION => {
             let flags = lparam as u32;
             let himc = ImmGetContext(hwnd);
-            
             if !himc.is_null() {
-                let mut should_notify_end = false;
-                
-                // Composition String
-                if (flags & GCS_COMPSTR) != 0 || (flags & GCS_CURSORPOS) != 0 {
-                    let compstr_len = ImmGetCompositionStringW(himc, GCS_COMPSTR, std::ptr::null_mut(), 0);
-                    if compstr_len > 0 {
-                        let cursor_pos_len = ImmGetCompositionStringW(himc, GCS_CURSORPOS, std::ptr::null_mut(), 0);
-                        let mut buffer: Vec<u16> = vec![0; (compstr_len as usize / 2) + 1];
-                        ImmGetCompositionStringW(himc, GCS_COMPSTR, buffer.as_mut_ptr() as *mut _, compstr_len as u32);
-                        let char_count = compstr_len as usize / 2;
-                        let preedit_str = String::from_utf16_lossy(&buffer[..char_count]);
-                        
-                        event_handler.on_ime_preedit(&preedit_str, cursor_pos_len as usize);
-                    } else {
-                        should_notify_end = true;
-                    }
-                }
-                
-                // Result String
+                // A message can carry a result and the start of the next
+                // composition; the result comes first.
                 if (flags & GCS_RESULTSTR) != 0 {
-                    let len = ImmGetCompositionStringW(himc, GCS_RESULTSTR, std::ptr::null_mut(), 0);
-                    if len > 0 {
-                        let mut buffer: Vec<u16> = vec![0; (len as usize / 2) + 1];
-                        ImmGetCompositionStringW(himc, GCS_RESULTSTR, buffer.as_mut_ptr() as *mut _, len as u32);
-                        let char_count = len as usize / 2;
-                        let result_str = String::from_utf16_lossy(&buffer[..char_count]);
-                        event_handler.on_ime_commit(Some(&result_str));
-                        should_notify_end = false;
-                    } else {
-                        should_notify_end = true;
+                    if let Some(result) = composition_string(himc, GCS_RESULTSTR) {
+                        event_handler.on_ime_commit(Some(&result));
                     }
                 }
-                
-                if should_notify_end {
-                    event_handler.on_ime_preedit("", 0);
-                    event_handler.on_ime_commit(None);
+                if (flags & (GCS_COMPSTR | GCS_CURSORPOS)) != 0 {
+                    match composition_string(himc, GCS_COMPSTR) {
+                        Some(preedit) => {
+                            let cursor = ImmGetCompositionStringW(
+                                himc,
+                                GCS_CURSORPOS,
+                                std::ptr::null_mut(),
+                                0,
+                            );
+                            let cursor = if cursor >= 0 {
+                                cursor as usize
+                            } else {
+                                preedit.encode_utf16().count()
+                            };
+                            event_handler.on_ime_preedit(&preedit, cursor);
+                        }
+                        None => event_handler.on_ime_preedit("", 0),
+                    }
                 }
                 ImmReleaseContext(hwnd, himc);
             }
-            
             return 0;
         }
         WM_IME_SETCONTEXT => {
+            // During a session the application draws the composition inline.
+            let lparam = if IME_SESSION.load(Ordering::Relaxed) {
+                lparam & !ISC_SHOWUICOMPOSITIONWINDOW
+            } else {
+                lparam
+            };
             return DefWindowProcW(hwnd, umsg, wparam, lparam);
-            // return 0;
-            // let user_disabled = IME_USER_DISABLED.load(std::sync::atomic::Ordering::Relaxed);
-            // if user_disabled {
-            //     return 0;
-            // } else {
-            //     return 1;
-            // }
         }
         WM_IME_STARTCOMPOSITION => {
-            // Set candidate window position when IME starts composition
-            let himc = ImmGetContext(hwnd);
-            if !himc.is_null() {
-                // Use user-set position if available, otherwise fall back to caret position
-                let pt = if let Some((x, y)) = payload.ime_position {
-                    POINT { x, y }
-                } else {
-                    let mut pt: POINT = std::mem::zeroed();
-                    GetCaretPos(&mut pt);
-                    pt
-                };
-                
-                let comp_form = COMPOSITIONFORM {
-                    dwStyle: CFS_POINT,
-                    ptCurrentPos: pt,
-                    rcArea: RECT { left: 0, top: 0, right: 0, bottom: 0 },
-                };
-                ImmSetCompositionWindow(himc, &comp_form);
-                
-                // Set candidate window position (most IMEs only use index 0)
-                let cand_form = CANDIDATEFORM {
-                    dwIndex: 0,
-                    dwStyle: CFS_CANDIDATEPOS,
-                    ptCurrentPos: POINT { x: pt.x, y: pt.y + CANDIDATE_WINDOW_Y_OFFSET },
-                    rcArea: RECT { left: 0, top: 0, right: 0, bottom: 0 },
-                };
-                ImmSetCandidateWindow(himc, &cand_form);
-                
-                ImmReleaseContext(hwnd, himc);
-            }
+            ime_apply_rect(hwnd);
+            // Not passed on: the default handler opens the IME's own
+            // composition window.
             return 0;
         }
         WM_IME_ENDCOMPOSITION => {
             event_handler.on_ime_preedit("", 0);
             return 0;
-        }
-        WM_IME_NOTIFY => {
-            const IMN_SETOPENSTATUS: WPARAM = 0x0008;
-            
-            // Re-enable IME if it was unexpectedly closed (unless user disabled it)
-            if wparam == IMN_SETOPENSTATUS {
-                let himc = ImmGetContext(hwnd);
-                if !himc.is_null() {
-                    let open_status = ImmGetOpenStatus(himc);
-                    let user_disabled = IME_USER_DISABLED.load(std::sync::atomic::Ordering::Relaxed);
-                    if open_status == 0 && !user_disabled {
-                        ImmSetOpenStatus(himc, 1);
-                    }
-                    ImmReleaseContext(hwnd, himc);
-                }
-            }
-            
-            return DefWindowProcW(hwnd, umsg, wparam, lparam);
         }
         WM_INPUTLANGCHANGEREQUEST | WM_INPUTLANGCHANGE => {
             event_handler.on_ime_commit(None);
@@ -885,35 +883,20 @@ unsafe extern "system" fn win32_wndproc(
             }
         }
         WM_SETFOCUS => {
-            let user_disabled = IME_USER_DISABLED.load(std::sync::atomic::Ordering::Relaxed);
-            
-            // Ensure IME context is available when window gains focus
-            if !user_disabled {
-                let himc = ImmGetContext(hwnd);
-                
-                if himc.is_null() {
-                    // Create new IME context if none exists
-                    let new_himc = ImmCreateContext();
-                    if !new_himc.is_null() {
-                        let prev_himc = ImmAssociateContext(hwnd, new_himc);
-                        if ImmSetOpenStatus(new_himc, 1) == 0 && prev_himc.is_null() {
-                            // If SetOpenStatus fails and no previous context, release the new one
-                            ImmReleaseContext(hwnd, new_himc);
-                        }
-                    }
-                } else {
-                    // Ensure IME is open
-                    let open_status = ImmGetOpenStatus(himc);
-                    if open_status == 0 {
-                        ImmSetOpenStatus(himc, 1);
-                    }
-                    ImmReleaseContext(hwnd, himc);
-                }
+            // Keep the association in step with the session after focus moves.
+            let session = IME_SESSION.load(Ordering::Relaxed);
+            ImmAssociateContextEx(
+                hwnd,
+                std::ptr::null_mut(),
+                if session { IACE_DEFAULT } else { 0 },
+            );
+            if session {
+                ime_apply_rect(hwnd);
             }
-            
             return DefWindowProcW(hwnd, umsg, wparam, lparam);
         }
         WM_KILLFOCUS => {
+            event_handler.on_ime_preedit("", 0);
             event_handler.on_ime_commit(None);
             
             return DefWindowProcW(hwnd, umsg, wparam, lparam);
@@ -1252,21 +1235,15 @@ impl WindowsDisplay {
             } => self.set_window_size(new_width as _, new_height as _),
             SetWindowPosition { new_x, new_y } => self.set_window_position(new_x, new_y),
             SetFullscreen(fullscreen) => self.set_fullscreen(fullscreen),
-            ShowKeyboard(show) => {
-                // On Windows, ShowKeyboard controls IME state
-                if show {
-                    IME_USER_DISABLED.store(false, std::sync::atomic::Ordering::Relaxed);
-                } else {
-                    IME_USER_DISABLED.store(true, std::sync::atomic::Ordering::Relaxed);
-                }
-            }
-            SetImePosition { x, y } => {
-                self.set_ime_position(x, y);
-            }
-            SetImeEnabled(enabled) => {
-                self.set_ime_enabled(enabled);
-            }
-            UpdateTextInputState { .. } => {}
+            // No touch keyboard integration; the session enables the IME.
+            ShowKeyboard(_) => {}
+            StartTextInput(config) => self.start_text_input(config),
+            StopTextInput => self.stop_text_input(),
+            // IMM32 has no surrounding-text channel.
+            SetTextInputState(_) => {}
+            SetTextInputRect { x, y, w, h } => self.set_text_input_rect(x, y, w, h),
+            // Desktop platforms have no haptics.
+            HapticFeedback(_) => {}
         }
     }
 }
@@ -1313,7 +1290,6 @@ where
             event_handler: None,
             modal_resizing_timer: 0,
             update_requested: true,
-            ime_position: None,
         };
         display.init_dpi(conf.high_dpi);
 

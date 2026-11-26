@@ -20,7 +20,6 @@ use {
         cell::RefCell,
         os::raw::c_void,
         sync::{mpsc, Arc, Mutex},
-        thread::{self},
     },
 };
 
@@ -30,7 +29,6 @@ struct MainThreadState {
     update_requested: bool,
     view: *mut Object,
     keymods: KeyMods,
-    cur_msg: Message,
 }
 
 struct IosDisplay {
@@ -40,16 +38,70 @@ struct IosDisplay {
     display_link: ObjcId,
     _textfield_dlg: ObjcId,
     textfield: ObjcId,
+    /// 1 during a text input session, 0 otherwise (reported as element id).
     current_element_id: u64,
+    text_input: Option<crate::TextInputConfig>,
+    /// Set while the application writes the mirror, so the change is not
+    /// reported back as an input-method edit.
+    ignore_sync: bool,
     gfx_api: conf::AppleGfxApi,
 
     event_handler: Option<Box<dyn EventHandler>>,
     _gles2: bool,
     f: Option<Box<dyn 'static + FnOnce() -> Box<dyn EventHandler>>>,
     state: Arc<Mutex<MainThreadState>>,
+    requests_rx: mpsc::Receiver<crate::native::Request>,
+    messages_rx: mpsc::Receiver<Message>,
+    blocking_event_loop: bool,
 }
 
 impl IosDisplay {
+    /// Keyboard type, return key, correction, capitalization, and secure
+    /// entry of the hidden text view (UIKit constant values).
+    unsafe fn configure_textview(&mut self, config: &crate::TextInputConfig) {
+        use crate::{TextInputAction as A, TextInputCapitalization as C, TextInputKind as K};
+        let keyboard_type: i64 = match config.kind {
+            K::Number => 4,  // UIKeyboardTypeNumberPad
+            K::Decimal => 8, // UIKeyboardTypeDecimalPad
+            K::Phone => 5,   // UIKeyboardTypePhonePad
+            K::Email => 7,   // UIKeyboardTypeEmailAddress
+            K::Url => 3,     // UIKeyboardTypeURL
+            K::Search => 10, // UIKeyboardTypeWebSearch
+            K::Text | K::Password | K::Multiline => 0,
+        };
+        let return_key: i64 = match config.resolved_action() {
+            A::Go => 1,
+            A::Next => 4,
+            A::Search => 6,
+            A::Send => 7,
+            A::Done => 9,
+            A::Unspecified | A::Previous | A::Newline => 0,
+        };
+        let capitalization: i64 = match config.capitalization {
+            C::None => 0,
+            C::Words => 1,
+            C::Sentences => 2,
+            C::Characters => 3,
+        };
+        let secure = config.is_secure();
+        // UITextAutocorrectionType / UITextSpellCheckingType: 1 = no, 2 = yes.
+        let correction: i64 = if config.autocorrect && !secure { 2 } else { 1 };
+        self.ignore_sync = true;
+        msg_send_![self.textfield, setKeyboardType: keyboard_type];
+        msg_send_![self.textfield, setReturnKeyType: return_key];
+        msg_send_![self.textfield, setAutocapitalizationType: capitalization];
+        msg_send_![self.textfield, setAutocorrectionType: correction];
+        msg_send_![self.textfield, setSpellCheckingType: correction];
+        msg_send_![self.textfield, setSecureTextEntry: if secure { YES } else { NO }];
+        msg_send_![self.textfield, setEditable: if config.read_only { NO } else { YES }];
+        let first_responder: BOOL = msg_send![self.textfield, isFirstResponder];
+        if first_responder != NO {
+            // Apply the new traits to the keyboard that is already showing.
+            msg_send_![self.textfield, reloadInputViews];
+        }
+        self.ignore_sync = false;
+    }
+
     fn show_keyboard(&mut self, show: bool) {
         unsafe {
             if show {
@@ -109,10 +161,11 @@ fn dispatch_message(payload: &mut IosDisplay, msg: Message) {
             touch_id,
             x,
             y,
+            time,
         } => {
             payload.state.lock().unwrap().update_requested = true;
             if let Some(ref mut event_handler) = payload.event_handler {
-                event_handler.touch_event(phase, touch_id, x, y);
+                event_handler.touch_event(phase, touch_id, x, y, time);
             }
         }
         Message::Character { character } => {
@@ -193,6 +246,17 @@ fn dispatch_message(payload: &mut IosDisplay, msg: Message) {
                 );
             }
         }
+        Message::TextInputAction(action) => {
+            if let Some(ref mut event_handler) = payload.event_handler {
+                event_handler.text_input_action_event(action);
+            }
+        }
+        Message::Keyboard { visible, x, y, w, h } => {
+            payload.state.lock().unwrap().update_requested = true;
+            if let Some(ref mut event_handler) = payload.event_handler {
+                event_handler.soft_keyboard_event(visible, x, y, w, h);
+            }
+        }
     }
 }
 
@@ -207,6 +271,7 @@ enum Message {
         touch_id: u64,
         x: f32,
         y: f32,
+        time: f64,
     },
     Character {
         character: u32,
@@ -230,6 +295,15 @@ enum Message {
         composing_end: Option<usize>,
         element_id: u64,
     },
+    TextInputAction(crate::TextInputAction),
+    /// Soft keyboard frame in view pixels.
+    Keyboard {
+        visible: bool,
+        x: f32,
+        y: f32,
+        w: f32,
+        h: f32,
+    },
 }
 unsafe impl Send for Message {}
 
@@ -248,64 +322,93 @@ impl IosDisplay {
             ShowKeyboard(show) => {
                 self.show_keyboard(show);
             }
-            UpdateTextInputState {
-                text,
-                selection_start,
-                selection_end,
-                is_password,
-                is_multiline: _,
-                element_id,
-                max_length: _,
-            } => unsafe {
-                self.current_element_id = element_id;
-
-                if element_id == 0 {
+            StartTextInput(config) => unsafe {
+                self.text_input = Some(config);
+                self.current_element_id = 1;
+                self.configure_textview(&config);
+                if config.read_only {
                     self.show_keyboard(false);
+                } else {
+                    self.show_keyboard(true);
+                }
+            },
+            StopTextInput => unsafe {
+                self.text_input = None;
+                self.current_element_id = 0;
+                self.ignore_sync = true;
+                msg_send_![self.textfield, unmarkText];
+                self.ignore_sync = false;
+                self.show_keyboard(false);
+            },
+            SetTextInputState(state) => unsafe {
+                if self.current_element_id == 0 {
                     return;
                 }
-                self.show_keyboard(true);
-
-                let current_secure: BOOL = msg_send![self.textfield, isSecureTextEntry];
-                let want_secure = if is_password { YES } else { NO };
-                if current_secure != want_secure {
-                    msg_send_![self.textfield, setSecureTextEntry: want_secure];
-                }
-
-                let ns_text = apple_util::str_to_nsstring(&text);
-                let current_ns_text: ObjcId = msg_send![self.textfield, text];
-                let is_same_text = if !current_ns_text.is_null() {
-                    let is_equal: BOOL = msg_send![current_ns_text, isEqualToString: ns_text];
-                    is_equal != NO
-                } else {
-                    false
+                self.ignore_sync = true;
+                let ns_text = apple_util::str_to_nsstring(&state.text);
+                let current: ObjcId = msg_send![self.textfield, text];
+                let same = !current.is_null() && {
+                    let equal: BOOL = msg_send![current, isEqualToString: ns_text];
+                    equal != NO
                 };
-
-                if !is_same_text {
+                if !same {
                     msg_send_![self.textfield, setText: ns_text];
                 }
-                
                 let beginning: ObjcId = msg_send![self.textfield, beginningOfDocument];
-                if !beginning.is_null() {
-                    let start_pos: ObjcId = msg_send![self.textfield, positionFromPosition: beginning offset: selection_start as i64];
-                    let end_pos: ObjcId = msg_send![self.textfield, positionFromPosition: beginning offset: selection_end as i64];
-                    if !start_pos.is_null() && !end_pos.is_null() {
-                        let range: ObjcId = msg_send![self.textfield, textRangeFromPosition: start_pos toPosition: end_pos];
-                        if !range.is_null() {
-                            let current_range: ObjcId = msg_send![self.textfield, selectedTextRange];
-                            let is_same_range: BOOL = if !current_range.is_null() {
-                                msg_send![current_range, isEqual: range]
-                            } else {
-                                NO
-                            };
-                            if is_same_range == NO {
-                                msg_send_![self.textfield, setSelectedTextRange: range];
-                            }
-                        }
+                let (start, end) = (
+                    state.selection_start.min(state.selection_end).max(0) as i64,
+                    state.selection_start.max(state.selection_end).max(0) as i64,
+                );
+                let start_pos: ObjcId =
+                    msg_send![self.textfield, positionFromPosition: beginning offset: start];
+                let end_pos: ObjcId =
+                    msg_send![self.textfield, positionFromPosition: beginning offset: end];
+                if !start_pos.is_null() && !end_pos.is_null() {
+                    let range: ObjcId =
+                        msg_send![self.textfield, textRangeFromPosition: start_pos toPosition: end_pos];
+                    if !range.is_null() {
+                        msg_send_![self.textfield, setSelectedTextRange: range];
+                    }
+                }
+                self.ignore_sync = false;
+            },
+            SetTextInputRect { .. } => {}
+            HapticFeedback(kind) => unsafe {
+                use crate::HapticFeedback as H;
+                match kind {
+                    H::Light | H::Medium | H::Heavy => {
+                        // UIImpactFeedbackStyle: light 0, medium 1, heavy 2.
+                        let style: i64 = match kind {
+                            H::Light => 0,
+                            H::Medium => 1,
+                            _ => 2,
+                        };
+                        let generator: ObjcId =
+                            msg_send![class!(UIImpactFeedbackGenerator), alloc];
+                        let generator: ObjcId = msg_send![generator, initWithStyle: style];
+                        msg_send_![generator, impactOccurred];
+                        msg_send_![generator, release];
+                    }
+                    H::Selection => {
+                        let generator: ObjcId =
+                            msg_send![class!(UISelectionFeedbackGenerator), new];
+                        msg_send_![generator, selectionChanged];
+                        msg_send_![generator, release];
+                    }
+                    H::Success | H::Warning | H::Error => {
+                        // UINotificationFeedbackType: success 0, warning 1, error 2.
+                        let feedback: i64 = match kind {
+                            H::Success => 0,
+                            H::Warning => 1,
+                            _ => 2,
+                        };
+                        let generator: ObjcId =
+                            msg_send![class!(UINotificationFeedbackGenerator), new];
+                        msg_send_![generator, notificationOccurred: feedback];
+                        msg_send_![generator, release];
                     }
                 }
             },
-            SetImePosition { .. } => {}
-            SetImeEnabled(..) => {}
             _ => {}
         }
     }
@@ -345,11 +448,13 @@ pub fn define_glk_or_mtk_view(superclass: &Class) -> *const Class {
                     ios_pos.y *= content_scale_factor;
                 }
 
+                let time: f64 = msg_send![ios_touch, timestamp];
                 send_message(Message::Touch {
                     phase,
                     touch_id,
                     x: ios_pos.x as f32,
                     y: ios_pos.y as f32,
+                    time,
                 });
             }
         }
@@ -370,80 +475,6 @@ pub fn define_glk_or_mtk_view(superclass: &Class) -> *const Class {
         on_touch(this, event, TouchPhase::Cancelled);
     }
 
-    extern "C" fn process_message(this: &Object, _: Sel, _: ObjcId) {
-        let payload = get_window_payload(this);
-        if payload.event_handler.is_none() {
-            payload.init_event_handler();
-        }
-        let msg = {
-            let state = payload.state.lock().unwrap();
-            state.cur_msg
-        };
-        match msg {
-            Message::Pause => {
-                let mut state = payload.state.lock().unwrap();
-                state.paused = true;
-            }
-            Message::Resume => {
-                let mut state = payload.state.lock().unwrap();
-                state.paused = false;
-            }
-            Message::Destroy => {
-                let mut state = payload.state.lock().unwrap();
-                state.quit = true;
-            }
-            Message::Touch {
-                phase,
-                touch_id,
-                x,
-                y,
-            } => {
-                if let Some(ref mut event_handler) = payload.event_handler {
-                    let timestamp: f64 = msg_send![ios_touch, timestamp];
-                    event_handler.touch_event(phase, touch_id, x, y, timestamp);
-                }
-            }
-            Message::Character { character } => {
-                if let Some(character) = char::from_u32(character) {
-                    if let Some(ref mut event_handler) = payload.event_handler {
-                        event_handler.char_event(character, Default::default(), false);
-                    }
-                }
-            }
-            Message::KeyDown { keycode } => {
-                let mut state = payload.state.lock().unwrap();
-                match keycode {
-                    KeyCode::LeftShift | KeyCode::RightShift => state.keymods.shift = true,
-                    KeyCode::LeftControl | KeyCode::RightControl => state.keymods.ctrl = true,
-                    KeyCode::LeftAlt | KeyCode::RightAlt => state.keymods.alt = true,
-                    KeyCode::LeftSuper | KeyCode::RightSuper => state.keymods.logo = true,
-                    _ => {}
-                }
-                if let Some(ref mut event_handler) = payload.event_handler {
-                    event_handler.key_down_event(keycode, state.keymods, false);
-                }
-            }
-            Message::KeyUp { keycode } => {
-                let mut state = payload.state.lock().unwrap();
-                match keycode {
-                    KeyCode::LeftShift | KeyCode::RightShift => state.keymods.shift = false,
-                    KeyCode::LeftControl | KeyCode::RightControl => state.keymods.ctrl = false,
-                    KeyCode::LeftAlt | KeyCode::RightAlt => state.keymods.alt = false,
-                    KeyCode::LeftSuper | KeyCode::RightSuper => state.keymods.logo = false,
-                    _ => {}
-                }
-                if let Some(ref mut event_handler) = payload.event_handler {
-                    event_handler.key_up_event(keycode, state.keymods);
-                }
-            }
-            Message::Resize { width, height } => {
-                if let Some(ref mut event_handler) = payload.event_handler {
-                    event_handler.resize_event(width as _, height as _);
-                }
-            }
-        }
-    }
-
     unsafe {
         decl.add_method(sel!(isOpaque), yes as extern "C" fn(&Object, Sel) -> BOOL);
         decl.add_method(
@@ -461,10 +492,6 @@ pub fn define_glk_or_mtk_view(superclass: &Class) -> *const Class {
         decl.add_method(
             sel!(touchesCanceled: withEvent:),
             touches_canceled as extern "C" fn(&Object, Sel, ObjcId, ObjcId),
-        );
-        decl.add_method(
-            sel!(processMessage:),
-            process_message as extern "C" fn(&Object, Sel, ObjcId),
         );
     }
 
@@ -923,7 +950,7 @@ pub fn define_app_delegate() -> *const Class {
     }
 
     extern "C" fn did_finish_launching_with_options(
-        _: &Object,
+        delegate_self: &Object,
         _: Sel,
         _: ObjcId,
         _: ObjcId,
@@ -941,9 +968,6 @@ pub fn define_app_delegate() -> *const Class {
             };
             let screen_width = (screen_rect.size.width * scale) as i32;
             let screen_height = (screen_rect.size.height * scale) as i32;
-
-            let window_obj: ObjcId = msg_send![class!(UIWindow), alloc];
-            let window_obj: ObjcId = msg_send![window_obj, initWithFrame: screen_rect];
 
             let view = match conf.platform.apple_gfx_api {
                 AppleGfxApi::OpenGl => {
@@ -1019,7 +1043,7 @@ pub fn define_app_delegate() -> *const Class {
                 (textview_dlg, textview)
             };
 
-            let (tx, rx) = std::sync::mpsc::channel();
+            let (tx, messages_rx) = std::sync::mpsc::channel();
 
             MESSAGES_TX.with(move |messages_tx| *messages_tx.borrow_mut() = Some(tx));
 
@@ -1045,7 +1069,6 @@ pub fn define_app_delegate() -> *const Class {
                     alt: false,
                     logo: false,
                 },
-                cur_msg: Message::Resume,
             }));
 
             let payload = Box::new(IosDisplay {
@@ -1056,12 +1079,17 @@ pub fn define_app_delegate() -> *const Class {
                 textfield,
                 _textfield_dlg: textfield_dlg,
                 current_element_id: 0,
+                text_input: None,
+                ignore_sync: false,
                 gfx_api: conf.platform.apple_gfx_api,
 
                 f: Some(Box::new(f)),
                 event_handler: None,
                 _gles2: view._gles2,
                 state: state_original.clone(),
+                requests_rx,
+                messages_rx,
+                blocking_event_loop: conf.platform.blocking_event_loop,
             });
             let payload_ptr = Box::into_raw(payload) as *mut std::ffi::c_void;
 
@@ -1155,6 +1183,16 @@ fn sync_textview_state(this: &Object, textview: ObjcId) {
         if textview.is_null() {
             return;
         }
+        {
+            let ptr: *mut c_void = *this.get_ivar("display_ptr");
+            if ptr.is_null() {
+                return;
+            }
+            let payload = &mut *(ptr as *mut IosDisplay);
+            if payload.ignore_sync || payload.current_element_id == 0 {
+                return;
+            }
+        }
         let ns_text: ObjcId = msg_send![textview, text];
         let text = if ns_text.is_null() {
             String::new()
@@ -1201,15 +1239,16 @@ fn sync_textview_state(this: &Object, textview: ObjcId) {
 
         let element_id = {
             let ptr: *mut c_void = *this.get_ivar("display_ptr");
-            if !ptr.is_null() {
-                let payload = &mut *(ptr as *mut IosDisplay);
-                payload.current_element_id
-            } else {
-                0
+            if ptr.is_null() {
+                return;
             }
+            let payload = &mut *(ptr as *mut IosDisplay);
+            if payload.ignore_sync || payload.current_element_id == 0 {
+                return;
+            }
+            payload.current_element_id
         };
-
-        send_message(Message::ImePreedit(preedit_str));
+        let _ = preedit_str;
 
         send_message(Message::ImeStateChanged {
             text,
@@ -1232,6 +1271,7 @@ fn define_textview_dlg() -> *const Class {
         } else {
             get_keyboard_height_from_notif(notif)
         };
+        let changed = get_keyboard_height() != height;
         set_keyboard_height(height);
         let ptr: *mut c_void = unsafe { *this.get_ivar("display_ptr") };
         if !ptr.is_null() {
@@ -1240,6 +1280,27 @@ fn define_textview_dlg() -> *const Class {
                 let view: ObjcId = msg_send![payload.view_ctrl, view];
                 let _: () = msg_send![view, setNeedsLayout];
                 let _: () = msg_send![view, layoutIfNeeded];
+                if changed {
+                    let scale: f64 = msg_send![payload.view, contentScaleFactor];
+                    let bounds: NSRect = msg_send![payload.view, bounds];
+                    send_message(if height > 0. {
+                        Message::Keyboard {
+                            visible: true,
+                            x: 0.,
+                            y: (bounds.size.height * scale) as f32,
+                            w: (bounds.size.width * scale) as f32,
+                            h: (height * scale) as f32,
+                        }
+                    } else {
+                        Message::Keyboard {
+                            visible: false,
+                            x: 0.,
+                            y: 0.,
+                            w: 0.,
+                            h: 0.,
+                        }
+                    });
+                }
             }
         }
     }
@@ -1277,13 +1338,30 @@ fn define_textview_dlg() -> *const Class {
     }
 
     extern "C" fn should_change_text_in_range(
-        _: &Object,
+        this: &Object,
         _: Sel,
         _textview: ObjcId,
         _range: NSRange,
-        _text: ObjcId,
+        text: ObjcId,
     ) -> BOOL {
-        YES
+        unsafe {
+            if text.is_null() {
+                return YES;
+            }
+            let ptr: *mut c_void = *this.get_ivar("display_ptr");
+            if ptr.is_null() {
+                return YES;
+            }
+            let payload = &mut *(ptr as *mut IosDisplay);
+            let Some(config) = payload.text_input else {
+                return YES;
+            };
+            if config.is_multiline() || apple_util::nsstring_to_string(text) != "\n" {
+                return YES;
+            }
+            send_message(Message::TextInputAction(config.resolved_action()));
+            NO
+        }
     }
 
     extern "C" fn handle_long_press(this: &Object, _: Sel, recognizer: ObjcId) {

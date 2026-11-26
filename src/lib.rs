@@ -19,6 +19,25 @@ use std::ops::{Index, IndexMut};
 pub mod log;
 
 pub use event::*;
+pub mod text_input;
+pub use text_input::{
+    TextInputAction, TextInputCapitalization, TextInputConfig, TextInputKind, TextInputState,
+};
+
+/// A haptic feedback pattern for [`window::haptic_feedback`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum HapticFeedback {
+    /// A light tap, such as a key press or a small toggle.
+    Light,
+    Medium,
+    /// A strong tap, such as a long press.
+    Heavy,
+    /// A selection moving through discrete values (pickers, sliders).
+    Selection,
+    Success,
+    Warning,
+    Error,
+}
 
 pub use graphics::*;
 
@@ -375,25 +394,114 @@ pub mod window {
         d.dropped_files.paths.get(index).cloned()
     }
 
-    /// Show/hide onscreen keyboard.
-    /// Only works on Android right now.
-    pub fn show_keyboard(show: bool) {
-        let d = native_display().lock().unwrap();
+    fn send_request(d: &native::NativeDisplayData, request: native::Request) {
         #[cfg(target_os = "android")]
         {
-            (d.native_requests)(native::Request::ShowKeyboard(show));
+            (d.native_requests)(request);
         }
 
         #[cfg(not(target_os = "android"))]
         {
-            d.native_requests
-                .send(native::Request::ShowKeyboard(show))
-                .unwrap();
+            let _ = d.native_requests.send(request);
         }
     }
 
-    /// Update text input state (text content, selection start/end).
-    /// Only works on Android right now.
+    /// Show or hide the soft keyboard without changing the text input
+    /// session. Prefer [`start_text_input`], which also configures it.
+    pub fn show_keyboard(show: bool) {
+        let d = native_display().lock().unwrap();
+        send_request(&d, native::Request::ShowKeyboard(show));
+    }
+
+    /// Begin a text input session for a focused field: enable the input
+    /// method (desktop) or show the configured soft keyboard (mobile, web).
+    /// Starting again replaces the configuration. See [`crate::text_input`].
+    pub fn start_text_input(config: crate::TextInputConfig) {
+        let mut d = native_display().lock().unwrap();
+        d.text_input = Some(config);
+        crate::text_input::set_session(Some(config));
+        send_request(&d, native::Request::StartTextInput(config));
+    }
+
+    /// End the text input session: disable the input method, cancel any
+    /// composition, and hide the soft keyboard.
+    pub fn stop_text_input() {
+        let mut d = native_display().lock().unwrap();
+        d.text_input = None;
+        crate::text_input::set_session(None);
+        send_request(&d, native::Request::StopTextInput);
+    }
+
+    /// The active session's configuration.
+    pub fn text_input() -> Option<crate::TextInputConfig> {
+        native_display().lock().unwrap().text_input
+    }
+
+    /// Send the field's editing state after a local edit or selection change.
+    /// Offsets are UTF-16 code units. Platforms that mirror the text (Android,
+    /// iOS, web) update the mirror without echoing the change back.
+    pub fn set_text_input_state(state: &crate::TextInputState) {
+        let d = native_display().lock().unwrap();
+        send_request(&d, native::Request::SetTextInputState(state.clone()));
+    }
+
+    /// The caret (or composition) rectangle in physical window pixels, for
+    /// candidate windows and soft-keyboard positioning.
+    pub fn set_text_input_rect(x: f32, y: f32, width: f32, height: f32) {
+        let d = native_display().lock().unwrap();
+        send_request(
+            &d,
+            native::Request::SetTextInputRect {
+                x,
+                y,
+                w: width,
+                h: height,
+            },
+        );
+    }
+
+    /// Play a haptic feedback pattern: Android `performHapticFeedback`, iOS
+    /// feedback generators, and `navigator.vibrate` on the web. Does nothing
+    /// on desktop platforms or where the user disabled haptics.
+    pub fn haptic_feedback(kind: crate::HapticFeedback) {
+        let d = native_display().lock().unwrap();
+        send_request(&d, native::Request::HapticFeedback(kind));
+    }
+
+    /// Whether the platform keeps its own copy of the text and reports whole
+    /// editing states (`on_ime_state_changed`) instead of composition and
+    /// commit events.
+    pub fn text_input_mirrors_state() -> bool {
+        cfg!(any(
+            target_os = "android",
+            target_os = "ios",
+            target_arch = "wasm32"
+        ))
+    }
+
+    /// Legacy name for a caret-rectangle update at one point.
+    #[deprecated(note = "use set_text_input_rect")]
+    pub fn set_ime_position(x: i32, y: i32) {
+        set_text_input_rect(x as f32, y as f32, 0., 0.);
+    }
+
+    /// Legacy toggle for a default text input session.
+    #[deprecated(note = "use start_text_input / stop_text_input")]
+    pub fn set_ime_enabled(enabled: bool) {
+        if enabled {
+            start_text_input(Default::default());
+        } else {
+            stop_text_input();
+        }
+    }
+
+    /// Whether a text input session is active.
+    pub fn is_ime_enabled() -> bool {
+        native_display().lock().unwrap().text_input.is_some()
+    }
+
+    /// Legacy combined session start and state update; `element_id` 0 stops.
+    #[deprecated(note = "use start_text_input and set_text_input_state")]
     pub fn update_text_input_state(
         text: String,
         selection_start: usize,
@@ -401,83 +509,32 @@ pub mod window {
         is_password: bool,
         is_multiline: bool,
         element_id: u64,
-        max_length: usize,
+        _max_length: usize,
     ) {
-        let d = native_display().lock().unwrap();
-        #[cfg(target_os = "android")]
-        {
-            (d.native_requests)(native::Request::UpdateTextInputState {
-                text,
-                selection_start,
-                selection_end,
-                is_password,
-                is_multiline,
-                element_id,
-                max_length,
+        if element_id == 0 {
+            stop_text_input();
+            return;
+        }
+        let kind = if is_password {
+            crate::TextInputKind::Password
+        } else if is_multiline {
+            crate::TextInputKind::Multiline
+        } else {
+            crate::TextInputKind::Text
+        };
+        if text_input().map(|config| config.kind) != Some(kind) {
+            start_text_input(crate::TextInputConfig {
+                kind,
+                ..Default::default()
             });
         }
-
-        #[cfg(not(target_os = "android"))]
-        {
-            let _ = d.native_requests
-                .send(native::Request::UpdateTextInputState {
-                    text,
-                    selection_start,
-                    selection_end,
-                    is_password,
-                    is_multiline,
-                    element_id,
-                    max_length,
-                });
-        }
-    }
-
-    /// Set the position of the IME candidate window.
-    /// The position is in window client coordinates (pixels).
-    /// This should be called when the text cursor moves to keep the IME
-    /// candidate window near the insertion point.
-    pub fn set_ime_position(x: i32, y: i32) {
-        let d = native_display().lock().unwrap();
-        #[cfg(target_os = "android")]
-        {
-            let _ = (x, y); // IME position not applicable on Android
-        }
-
-        #[cfg(not(target_os = "android"))]
-        {
-            d.native_requests
-                .send(native::Request::SetImePosition { x, y })
-                .unwrap();
-        }
-    }
-
-    /// Enable or disable IME (Input Method Editor) for the window.
-    /// When enabled, the IME will process keyboard input for CJK text input.
-    /// When disabled, keyboard events are sent directly to the application,
-    /// which is useful for game controls (e.g., WASD movement).
-    ///
-    /// # Arguments
-    /// * `enabled` - `true` to enable IME (for text input), `false` to disable (for game controls)
-    pub fn set_ime_enabled(enabled: bool) {
-        let mut d = native_display().lock().unwrap();
-        d.ime_enabled = enabled;
-        
-        #[cfg(target_os = "android")]
-        {
-            let _ = enabled; // IME control not applicable on Android
-        }
-
-        #[cfg(not(target_os = "android"))]
-        {
-            d.native_requests
-                .send(native::Request::SetImeEnabled(enabled))
-                .unwrap();
-        }
-    }
-    
-    pub fn is_ime_enabled() -> bool {
-        let d = native_display().lock().unwrap();
-        d.ime_enabled
+        set_text_input_state(&crate::TextInputState {
+            text,
+            selection_start: selection_start as i32,
+            selection_end: selection_end as i32,
+            composing_start: -1,
+            composing_end: -1,
+        });
     }
 
     #[cfg(target_vendor = "apple")]

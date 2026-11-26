@@ -52,7 +52,13 @@ struct WaylandPayload {
     xkb_compose_table: *mut xkb_compose_table,
     xkb_compose_state: *mut xkb_compose_state,
     compose_preediting: bool,
-    external_ime_active: bool,
+    /// An input method composition is showing; keys go to it, not to chars.
+    ime_preediting: bool,
+    /// text-input-v3 events are double-buffered until `done`.
+    ime_pending_preedit: Option<(String, i32, i32)>,
+    ime_pending_commit: Option<String>,
+    /// Caret rectangle in physical window pixels.
+    ime_rect: (f32, f32, f32, f32),
     keymap: XkbKeymap,
 
     egl_window: *mut wl_egl_window,
@@ -107,7 +113,7 @@ impl WaylandPayload {
         let keycode = keycodes::translate_keysym(keysym_raw);
         self.events.push(WaylandEvent::KeyDown(keycode, keymods, repeat));
 
-        if self.external_ime_active {
+        if self.ime_preediting {
             return;
         }
 
@@ -1065,39 +1071,41 @@ unsafe extern "C" fn touch_handle_cancel(data: *mut std::ffi::c_void, _touch: *m
 }
 
 unsafe extern "C" fn text_input_handle_enter(
-    _data: *mut core::ffi::c_void,
+    data: *mut core::ffi::c_void,
     _text_input: *mut extensions::text_input::zwp_text_input_v3,
     _surface: *mut wl_surface,
 ) {
-    // IME focus entered
+    // The compositor forgets the state when focus leaves; send it again.
+    let display: &mut WaylandPayload = &mut *(data as *mut _);
+    text_input_sync(display);
 }
 
 unsafe extern "C" fn text_input_handle_leave(
-    _data: *mut core::ffi::c_void,
+    data: *mut core::ffi::c_void,
     _text_input: *mut extensions::text_input::zwp_text_input_v3,
     _surface: *mut wl_surface,
 ) {
-    // IME focus left
+    let display: &mut WaylandPayload = &mut *(data as *mut _);
+    if display.ime_preediting {
+        display.ime_preediting = false;
+        display.events.push(WaylandEvent::ImePreedit(String::new(), 0));
+    }
 }
 
 unsafe extern "C" fn text_input_handle_preedit_string(
     data: *mut core::ffi::c_void,
     _text_input: *mut extensions::text_input::zwp_text_input_v3,
     text: *const core::ffi::c_char,
-    _cursor_begin: core::ffi::c_int,
+    cursor_begin: core::ffi::c_int,
     cursor_end: core::ffi::c_int,
 ) {
     let display: &mut WaylandPayload = &mut *(data as *mut _);
-    display.external_ime_active = true;
     let preedit = if text.is_null() {
         String::new()
     } else {
-        core::ffi::CStr::from_ptr(text)
-            .to_str()
-            .unwrap_or("")
-            .to_string()
+        core::ffi::CStr::from_ptr(text).to_string_lossy().into_owned()
     };
-    display.events.push(WaylandEvent::ImePreedit(preedit, cursor_end as usize));
+    display.ime_pending_preedit = Some((preedit, cursor_begin, cursor_end));
 }
 
 unsafe extern "C" fn text_input_handle_commit_string(
@@ -1106,17 +1114,10 @@ unsafe extern "C" fn text_input_handle_commit_string(
     text: *const core::ffi::c_char,
 ) {
     let display: &mut WaylandPayload = &mut *(data as *mut _);
-    display.external_ime_active = true;
-    let commit = if text.is_null() {
-        None
-    } else {
-        let s = core::ffi::CStr::from_ptr(text)
-            .to_str()
-            .unwrap_or("")
-            .to_string();
-        if s.is_empty() { None } else { Some(s) }
-    };
-    display.events.push(WaylandEvent::ImeCommit(commit));
+    if !text.is_null() {
+        display.ime_pending_commit =
+            Some(core::ffi::CStr::from_ptr(text).to_string_lossy().into_owned());
+    }
 }
 
 unsafe extern "C" fn text_input_handle_delete_surrounding_text(
@@ -1125,7 +1126,7 @@ unsafe extern "C" fn text_input_handle_delete_surrounding_text(
     _before_length: core::ffi::c_uint,
     _after_length: core::ffi::c_uint,
 ) {
-    // We don't track surrounding text
+    // Surrounding text is not sent, so input methods have nothing to delete.
 }
 
 unsafe extern "C" fn text_input_handle_done(
@@ -1133,14 +1134,97 @@ unsafe extern "C" fn text_input_handle_done(
     _text_input: *mut extensions::text_input::zwp_text_input_v3,
     _serial: core::ffi::c_uint,
 ) {
+    // Apply the batch in protocol order: commit, then the new preedit. A
+    // batch without preedit_string clears the preedit.
     let display: &mut WaylandPayload = &mut *(data as *mut _);
-    if !display.text_input.is_null() {
-        wl_request!(
-            display.client,
-            display.text_input,
-            extensions::text_input::zwp_text_input_v3::commit
-        );
+    if let Some(commit) = display.ime_pending_commit.take() {
+        display.events.push(WaylandEvent::ImeCommit(Some(commit)));
     }
+    let (preedit, begin, end) = display
+        .ime_pending_preedit
+        .take()
+        .unwrap_or_else(|| (String::new(), -1, -1));
+    // Byte offsets; -1 hides the caret, so put it at the end.
+    let caret = if begin < 0 || end < 0 {
+        preedit.len()
+    } else {
+        end as usize
+    };
+    let caret = crate::text_input::byte_to_utf16(&preedit, caret);
+    if !preedit.is_empty() || display.ime_preediting {
+        display.ime_preediting = !preedit.is_empty();
+        display.events.push(WaylandEvent::ImePreedit(preedit, caret));
+    }
+}
+
+/// Send the session's enable state, content type, and caret rectangle.
+unsafe fn text_input_sync(display: &mut WaylandPayload) {
+    use extensions::text_input::zwp_text_input_v3 as ti;
+    if display.text_input.is_null() {
+        return;
+    }
+    let config = crate::text_input::session().filter(|config| !config.read_only);
+    match config {
+        Some(config) => {
+            let (hint, purpose) = content_type(&config);
+            wl_request!(display.client, display.text_input, ti::enable);
+            wl_request!(display.client, display.text_input, ti::set_content_type, hint, purpose);
+            let scale = crate::native_display().lock().unwrap().dpi_scale.max(1.);
+            let (x, y, w, h) = display.ime_rect;
+            wl_request!(
+                display.client,
+                display.text_input,
+                ti::set_cursor_rectangle,
+                (x / scale).round() as i32,
+                (y / scale).round() as i32,
+                (w / scale).round().max(1.) as i32,
+                (h / scale).round().max(1.) as i32
+            );
+        }
+        None => {
+            wl_request!(display.client, display.text_input, ti::disable);
+        }
+    }
+    wl_request!(display.client, display.text_input, ti::commit);
+}
+
+/// zwp_text_input_v3 content hint flags and purpose for a session.
+fn content_type(config: &crate::TextInputConfig) -> (u32, u32) {
+    use crate::{TextInputCapitalization as C, TextInputKind as K};
+    const COMPLETION: u32 = 0x1;
+    const SPELLCHECK: u32 = 0x2;
+    const AUTO_CAPITALIZATION: u32 = 0x4;
+    const UPPERCASE: u32 = 0x10;
+    const TITLECASE: u32 = 0x20;
+    const HIDDEN_TEXT: u32 = 0x40;
+    const SENSITIVE_DATA: u32 = 0x80;
+    const MULTILINE: u32 = 0x200;
+    let mut hint = match config.capitalization {
+        C::None => 0,
+        C::Characters => UPPERCASE,
+        C::Words => TITLECASE,
+        C::Sentences => AUTO_CAPITALIZATION,
+    };
+    if config.autocorrect {
+        hint |= COMPLETION | SPELLCHECK;
+    }
+    let purpose = match config.kind {
+        K::Text | K::Search => 0,
+        K::Multiline => {
+            hint |= MULTILINE;
+            0
+        }
+        K::Number => 2,
+        K::Decimal => 3,
+        K::Phone => 4,
+        K::Url => 5,
+        K::Email => 6,
+        K::Password => {
+            hint = HIDDEN_TEXT | SENSITIVE_DATA;
+            8
+        }
+    };
+    (hint, purpose)
 }
 
 unsafe extern "C" fn registry_add_object(
@@ -1394,7 +1478,10 @@ where
             xkb_compose_table,
             xkb_compose_state,
             compose_preediting: false,
-            external_ime_active: false,
+            ime_preediting: false,
+            ime_pending_preedit: None,
+            ime_pending_commit: None,
+            ime_rect: (0., 0., 0., 0.),
             egl_window: std::ptr::null_mut(),
             keyboard: std::ptr::null_mut(),
             touch: std::ptr::null_mut(),
@@ -1553,47 +1640,20 @@ where
                             .pointer_context
                             .set_cursor(&mut display.client, cursor_visible.then_some(cursor_icon));
                     }
-                    Request::SetImeEnabled(enabled) => {
-                        if !enabled {
-                            display.external_ime_active = false;
-                        }
-                        if !display.text_input.is_null() {
-                            if enabled {
-                                wl_request!(
-                                    display.client,
-                                    display.text_input,
-                                    extensions::text_input::zwp_text_input_v3::enable
-                                );
-                            } else {
-                                wl_request!(
-                                    display.client,
-                                    display.text_input,
-                                    extensions::text_input::zwp_text_input_v3::disable
-                                );
-                            }
-                            wl_request!(
-                                display.client,
-                                display.text_input,
-                                extensions::text_input::zwp_text_input_v3::commit
-                            );
+                    Request::StartTextInput(_) | Request::StopTextInput => {
+                        // The session itself is read from crate::text_input.
+                        text_input_sync(&mut display);
+                        if crate::text_input::session().is_none() && display.ime_preediting {
+                            display.ime_preediting = false;
+                            display.events.push(WaylandEvent::ImePreedit(String::new(), 0));
                         }
                     }
-                    Request::SetImePosition { x, y } => {
-                        if !display.text_input.is_null() {
-                            wl_request!(
-                                display.client,
-                                display.text_input,
-                                extensions::text_input::zwp_text_input_v3::set_cursor_rectangle,
-                                x,
-                                y,
-                                0,
-                                0
-                            );
-                            wl_request!(
-                                display.client,
-                                display.text_input,
-                                extensions::text_input::zwp_text_input_v3::commit
-                            );
+                    Request::SetTextInputRect { x, y, w, h } => {
+                        if display.ime_rect != (x, y, w, h) {
+                            display.ime_rect = (x, y, w, h);
+                            if crate::text_input::session().is_some() {
+                                text_input_sync(&mut display);
+                            }
                         }
                     }
                     // TODO: implement the other events

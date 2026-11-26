@@ -16,7 +16,7 @@ public class QuadNative {
     // belongs to QuadSurface class
     public native static void surfaceOnSurfaceCreated(Surface surface);
     public native static void surfaceOnSurfaceDestroyed(Surface surface);
-    public native static void surfaceOnTouch(int id, int phase, float x, float y);
+    public native static void surfaceOnTouch(int id, int phase, float x, float y, long time);
     public native static void surfaceOnSurfaceChanged(Surface surface, int width, int height);
     public native static void surfaceOnKeyDown(int keycode);
     public native static void surfaceOnKeyUp(int keycode);
@@ -25,4 +25,6 @@ public class QuadNative {
     public native static void surfaceOnImeCommit(String text);
     public native static void surfaceOnImeStateChanged(String text, int selectionStart, int selectionEnd, int composingStart, int composingEnd, long elementId);
     public native static void surfaceOnImeAction(int actionCode);
+    // Soft keyboard frame in surface pixels; empty when hidden.
+    public native static void surfaceOnKeyboard(boolean visible, int x, int y, int width, int height);
 }

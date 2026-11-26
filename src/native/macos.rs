@@ -45,12 +45,37 @@ pub struct MacosDisplay {
     native_requests: Receiver<Request>,
     update_requested: bool,
     last_paint_start_time: Instant,
-    ime_enabled: bool,
-    ime_position: (i32, i32),
+    /// The active text input session, if any.
+    text_input: Option<crate::TextInputConfig>,
+    /// Caret rectangle in physical view pixels (top-left origin).
+    ime_rect: (f32, f32, f32, f32),
     marked_text: String,
+    /// Selection inside the marked text, from `setMarkedText`.
+    marked_selection: NSRange,
 }
 
 impl MacosDisplay {
+    unsafe fn input_context(&self) -> ObjcId {
+        if self.view == nil {
+            return nil;
+        }
+        let input_context: ObjcId = msg_send![self.view, inputContext];
+        if input_context != nil {
+            input_context
+        } else {
+            msg_send![class!(NSTextInputContext), currentInputContext]
+        }
+    }
+
+    fn clear_marked_text(&mut self) {
+        if !self.marked_text.is_empty() {
+            self.marked_text.clear();
+            if let Some(event_handler) = self.context() {
+                event_handler.on_ime_preedit("", 0);
+            }
+        }
+    }
+
     fn set_cursor_grab(&mut self, window: *mut Object, grab: bool) {
         if grab == self.cursor_grabbed {
             return;
@@ -271,44 +296,51 @@ impl MacosDisplay {
             ShowKeyboard(..) => {
                 // Not applicable on macOS desktop
             }
-            SetImePosition { x, y } => {
-                self.ime_position = (x, y);
+            SetTextInputRect { x, y, w, h } => {
+                self.ime_rect = (x, y, w, h);
                 unsafe {
-                    let input_context: ObjcId = msg_send![self.view, inputContext];
-                    let current_context: ObjcId = msg_send![class!(NSTextInputContext), currentInputContext];
-                    let ctx = if input_context != nil { input_context } else { current_context };
+                    let ctx = self.input_context();
                     if ctx != nil {
                         let _: () = msg_send![ctx, invalidateCharacterCoordinates];
                     }
                 }
             }
-            SetImeEnabled(enabled) => {
-                self.ime_enabled = enabled;
+            StartTextInput(config) => {
+                self.text_input = Some(config);
+                // Password and read-only fields take keys without composition.
+                let ime = !config.is_secure() && !config.read_only;
                 unsafe {
-                    if enabled && self.window != nil && self.view != nil {
+                    if self.window != nil && self.view != nil {
                         let _: () = msg_send![self.window, makeFirstResponder: self.view];
                     }
-                    let input_context: ObjcId = msg_send![self.view, inputContext];
-                    let current_context: ObjcId = msg_send![class!(NSTextInputContext), currentInputContext];
-                    let ctx = if input_context != nil { input_context } else { current_context };
+                    let ctx = self.input_context();
                     if ctx != nil {
-                        if enabled {
+                        if ime {
                             let _: () = msg_send![ctx, activate];
                             let _: () = msg_send![ctx, invalidateCharacterCoordinates];
                         } else {
-                            let _: () = msg_send![ctx, deactivate];
                             let _: () = msg_send![ctx, discardMarkedText];
+                            let _: () = msg_send![ctx, deactivate];
                         }
                     }
                 }
-                if !enabled && !self.marked_text.is_empty() {
-                    self.marked_text.clear();
-                    if let Some(event_handler) = self.context() {
-                        event_handler.on_ime_preedit("", 0);
-                    }
+                if !ime {
+                    self.clear_marked_text();
                 }
             }
-            UpdateTextInputState { .. } => {}
+            StopTextInput => {
+                self.text_input = None;
+                unsafe {
+                    let ctx = self.input_context();
+                    if ctx != nil {
+                        let _: () = msg_send![ctx, discardMarkedText];
+                    }
+                }
+                self.clear_marked_text();
+            }
+            SetTextInputState(_) => {}
+            // Desktop platforms have no haptics.
+            HapticFeedback(_) => {}
         }
     }
 }
@@ -744,11 +776,26 @@ unsafe fn view_base_decl(decl: &mut ClassDecl) {
         }
     }
 
-    extern "C" fn selected_range(_this: &Object, _sel: Sel) -> NSRange {
-        NSRange {
-            location: 0,
-            length: 0,
+    extern "C" fn selected_range(this: &Object, _sel: Sel) -> NSRange {
+        // Only the marked text is exposed, so the selection lives inside it.
+        let payload = get_window_payload(this);
+        if payload.marked_text.is_empty() {
+            NSRange {
+                location: 0,
+                length: 0,
+            }
+        } else {
+            payload.marked_selection
         }
+    }
+
+    extern "C" fn do_command_by_selector(_this: &Object, _sel: Sel, _command: Sel) {
+        // Editing keys already reached the application as key_down events;
+        // the default implementation would beep.
+    }
+
+    extern "C" fn character_index_for_point(_this: &Object, _sel: Sel, _point: NSPoint) -> u64 {
+        u64::MAX // NSNotFound
     }
 
     extern "C" fn set_marked_text(
@@ -769,6 +816,7 @@ unsafe fn view_base_decl(decl: &mut ClassDecl) {
             };
 
             payload.marked_text = text.clone();
+            payload.marked_selection = selected_range;
             if let Some(event_handler) = payload.context() {
                 let cursor_pos = selected_range.location as usize;
                 event_handler.on_ime_preedit(&text, cursor_pos);
@@ -869,14 +917,16 @@ unsafe fn view_base_decl(decl: &mut ClassDecl) {
             if !actual_range.is_null() {
                 *(actual_range as *mut NSRange) = range;
             }
-            let (ime_x, ime_y) = payload.ime_position;
+            let (x, y, w, h) = payload.ime_rect;
 
             let scale = native_display().lock().unwrap().dpi_scale;
             let view_bounds: NSRect = msg_send![this, bounds];
+            let height = (h.max(1.) / scale) as f64;
 
+            // The view is not flipped: convert the top-left caret rectangle.
             let point_in_view = NSPoint {
-                x: (ime_x as f32 / scale) as f64,
-                y: view_bounds.size.height - (ime_y as f32 / scale) as f64,
+                x: (x / scale) as f64,
+                y: view_bounds.size.height - (y / scale) as f64 - height,
             };
 
             let window: ObjcId = {
@@ -901,8 +951,8 @@ unsafe fn view_base_decl(decl: &mut ClassDecl) {
             let rect_in_window = NSRect {
                 origin: point_in_window,
                 size: NSSize {
-                    width: 0.0,
-                    height: 20.0,
+                    width: (w / scale) as f64,
+                    height,
                 },
             };
 
@@ -1203,6 +1253,14 @@ unsafe fn view_base_decl(decl: &mut ClassDecl) {
         sel!(firstRectForCharacterRange:actualRange:),
         first_rect_for_character_range
             as extern "C" fn(&Object, Sel, NSRange, *mut c_void) -> NSRect,
+    );
+    decl.add_method(
+        sel!(doCommandBySelector:),
+        do_command_by_selector as extern "C" fn(&Object, Sel, Sel),
+    );
+    decl.add_method(
+        sel!(characterIndexForPoint:),
+        character_index_for_point as extern "C" fn(&Object, Sel, NSPoint) -> u64,
     );
     decl.add_method(
         sel!(firstRectForCharacterRange:),
@@ -1679,9 +1737,13 @@ where
         modifiers: Modifiers::default(),
         update_requested: true,
         last_paint_start_time: Instant::now(),
-        ime_enabled: false,
-        ime_position: (0, 0),
+        text_input: None,
+        ime_rect: (0., 0., 0., 0.),
         marked_text: String::new(),
+        marked_selection: NSRange {
+            location: 0,
+            length: 0,
+        },
     };
 
     let app_delegate_class = define_app_delegate();

@@ -80,6 +80,14 @@ enum Message {
         element_id: u64,
     },
     ImeAction(i32),
+    /// Soft keyboard frame in surface pixels.
+    Keyboard {
+        visible: bool,
+        x: i32,
+        y: i32,
+        w: i32,
+        h: i32,
+    },
     Request(crate::native::Request),
 }
 unsafe impl Send for Message {}
@@ -254,9 +262,24 @@ impl MainThreadState {
             Message::ImeStateChanged { text, selection_start, selection_end, composing_start, composing_end, element_id } => {
                 self.event_handler.on_ime_state_changed(&text, selection_start, selection_end, composing_start, composing_end, element_id);
             }
-            Message::ImeAction(_action_code) => {
-                self.event_handler.key_down_event(KeyCode::Enter, self.keymods, false);
-                self.event_handler.key_up_event(KeyCode::Enter, self.keymods);
+            Message::ImeAction(code) => {
+                // android.view.inputmethod.EditorInfo action codes.
+                use crate::TextInputAction as A;
+                let action = match code {
+                    2 => A::Go,
+                    3 => A::Search,
+                    4 => A::Send,
+                    5 => A::Next,
+                    6 => A::Done,
+                    7 => A::Previous,
+                    _ => crate::text_input::session()
+                        .map_or(A::Done, |config| config.resolved_action()),
+                };
+                self.event_handler.text_input_action_event(action);
+            }
+            Message::Keyboard { visible, x, y, w, h } => {
+                self.event_handler
+                    .soft_keyboard_event(visible, x as f32, y as f32, w as f32, h as f32);
             }
             Message::Pause => self.event_handler.window_minimized_event(),
             Message::Resume => {
@@ -308,39 +331,45 @@ impl MainThreadState {
                 let env = attach_jni_env();
                 ndk_utils::call_void_method!(env, ACTIVITY, "showKeyboard", "(Z)V", show as i32);
             },
-            UpdateTextInputState {
-                text,
-                selection_start,
-                selection_end,
-                is_password,
-                is_multiline,
-                element_id,
-                max_length,
-            } => unsafe {
+            StartTextInput(config) => unsafe {
                 let env = attach_jni_env();
-                let c_text = std::ffi::CString::new(text).unwrap_or_default();
-                let text_jstring = (**env).NewStringUTF.unwrap()(env, c_text.as_ptr());
                 ndk_utils::call_void_method!(
                     env,
                     ACTIVITY,
-                    "updateTextInputState",
-                    "(Ljava/lang/String;IIZZJI)V",
-                    text_jstring,
-                    selection_start as i32,
-                    selection_end as i32,
-                    is_password as i32,
-                    is_multiline as i32,
-                    element_id as i64,
-                    max_length as i32
+                    "startTextInput",
+                    "(IIZIZ)V",
+                    config.kind as i32,
+                    config.action as i32,
+                    config.autocorrect as i32,
+                    config.capitalization as i32,
+                    config.read_only as i32
                 );
-                (**env).DeleteLocalRef.unwrap()(env, text_jstring);
             },
-            SetImePosition { .. } => {
-                // IME position control not applicable on Android
-            }
-            SetImeEnabled(..) => {
-                // IME enable/disable not applicable on Android
-            }
+            StopTextInput => unsafe {
+                let env = attach_jni_env();
+                ndk_utils::call_void_method!(env, ACTIVITY, "stopTextInput", "()V");
+            },
+            SetTextInputState(state) => unsafe {
+                let env = attach_jni_env();
+                let text = new_jstring(env, &state.text);
+                ndk_utils::call_void_method!(
+                    env,
+                    ACTIVITY,
+                    "setTextInputState",
+                    "(Ljava/lang/String;IIII)V",
+                    text,
+                    state.selection_start,
+                    state.selection_end,
+                    state.composing_start,
+                    state.composing_end
+                );
+                (**env).DeleteLocalRef.unwrap()(env, text);
+            },
+            SetTextInputRect { .. } => {}
+            HapticFeedback(kind) => unsafe {
+                let env = attach_jni_env();
+                ndk_utils::call_void_method!(env, ACTIVITY, "hapticFeedback", "(I)V", kind as i32);
+            },
             _ => {}
         }
     }
@@ -398,18 +427,16 @@ impl crate::native::Clipboard for AndroidClipboard {
                 return None;
             }
 
-            let text = ndk_utils::get_utf_str!(env, text);
-            Some(text)
+            let result = jstring_to_string(env, text);
+            (**env).DeleteLocalRef.unwrap()(env, text);
+            result
         }
     }
 
     fn set(&mut self, data: &str) {
-        let data = std::ffi::CString::new(data).unwrap();
         unsafe {
             let env = attach_jni_env();
-
-            let new_string_utf = (**env).NewStringUTF.unwrap();
-            let jtext = new_string_utf(env, data.as_ptr());
+            let jtext = new_jstring(env, data);
 
             ndk_utils::call_void_method!(
                 env,
@@ -418,6 +445,7 @@ impl crate::native::Clipboard for AndroidClipboard {
                 "(Ljava/lang/String;)V",
                 jtext
             );
+            (**env).DeleteLocalRef.unwrap()(env, jtext);
         }
     }
 }
@@ -561,6 +589,16 @@ where
 
             if !conf.platform.blocking_event_loop || s.update_requested {
                 s.frame();
+            }
+
+            // order_quit() closes the activity; Destroy then ends this loop.
+            let quit_ordered = {
+                let mut d = crate::native_display().lock().unwrap();
+                std::mem::replace(&mut d.quit_ordered, false)
+            };
+            if quit_ordered {
+                let env = attach_jni_env();
+                ndk_utils::call_void_method!(env, ACTIVITY, "quitApp", "()V");
             }
 
             thread::yield_now();
@@ -803,6 +841,25 @@ pub unsafe extern "C" fn Java_quad_1native_QuadNative_surfaceOnImeStateChanged(
 }
 
 #[no_mangle]
+pub unsafe extern "C" fn Java_quad_1native_QuadNative_surfaceOnKeyboard(
+    _: *mut ndk_sys::JNIEnv,
+    _: ndk_sys::jclass,
+    visible: ndk_sys::jboolean,
+    x: ndk_sys::jint,
+    y: ndk_sys::jint,
+    w: ndk_sys::jint,
+    h: ndk_sys::jint,
+) {
+    send_message(Message::Keyboard {
+        visible: visible != 0,
+        x,
+        y,
+        w,
+        h,
+    });
+}
+
+#[no_mangle]
 pub unsafe extern "C" fn Java_quad_1native_QuadNative_surfaceOnImeAction(
     _: *mut ndk_sys::JNIEnv,
     _: ndk_sys::jclass,
@@ -815,18 +872,21 @@ unsafe fn jstring_to_string(env: *mut ndk_sys::JNIEnv, jstr: ndk_sys::jstring) -
     if jstr.is_null() {
         return None;
     }
-    let get_string_utf_chars = (**env).GetStringUTFChars.unwrap();
-    let release_string_utf_chars = (**env).ReleaseStringUTFChars.unwrap();
-    let chars = get_string_utf_chars(env, jstr, std::ptr::null_mut());
+    let len = (**env).GetStringLength.unwrap()(env, jstr);
+    let chars = (**env).GetStringChars.unwrap()(env, jstr, std::ptr::null_mut());
     if chars.is_null() {
         return None;
     }
-    let s = std::ffi::CStr::from_ptr(chars)
-        .to_str()
-        .ok()
-        .map(|s| s.to_string());
-    release_string_utf_chars(env, jstr, chars);
-    s
+    let units = std::slice::from_raw_parts(chars, len.max(0) as usize);
+    let s = String::from_utf16_lossy(units);
+    (**env).ReleaseStringChars.unwrap()(env, jstr, chars);
+    Some(s)
+}
+
+/// A new local reference to a Java string with `text`'s contents.
+pub(crate) unsafe fn new_jstring(env: *mut ndk_sys::JNIEnv, text: &str) -> ndk_sys::jstring {
+    let units: Vec<u16> = text.encode_utf16().collect();
+    (**env).NewString.unwrap()(env, units.as_ptr(), units.len() as ndk_sys::jsize)
 }
 
 unsafe fn set_full_screen(env: *mut ndk_sys::JNIEnv, fullscreen: bool) {

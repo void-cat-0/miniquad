@@ -410,7 +410,8 @@ impl MainThreadState {
                     self.hide_keyboard();
                 }
             }
-            SetImeEnabled(enabled) => {
+            request @ (StartTextInput(_) | StopTextInput) => {
+                let enabled = matches!(request, StartTextInput(_));
                 self.set_ime_enabled(enabled);
             }
             _ => {}
