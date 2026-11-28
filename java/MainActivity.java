@@ -19,6 +19,7 @@ import android.view.SurfaceView;
 import android.view.SurfaceHolder;
 import android.view.MotionEvent;
 import android.view.KeyEvent;
+import android.view.WindowInsetsController;
 import android.view.inputmethod.InputMethodManager;
 
 import android.content.Context;
@@ -387,42 +388,45 @@ class ResizingLayout
         //% RESIZING_LAYOUT_CONSTRUCTOR
     }
 
-    private boolean mKeyboardVisible = false;
-    private int mKeyboardHeight = 0;
+    private int mKeyboardHeight = -1;
 
+    // The surface keeps its size while the soft keyboard is open: only the
+    // system bars pad it. The keyboard is reported as a rectangle covering
+    // the bottom of the surface, and the application scrolls the focused
+    // field into view. Resizing the surface instead would change the
+    // application's layout (and anything that scales with the window) every
+    // time the keyboard opens, which is most visible in landscape.
     @Override
     @SuppressWarnings("deprecation")
     public WindowInsets onApplyWindowInsets(View v, WindowInsets insets) {
-        int left, top, right, bottom, keyboard;
+        int left, top, right, bottom, ime;
         if (Build.VERSION.SDK_INT >= 30) {
-            Insets imeInsets = insets.getInsets(WindowInsets.Type.ime());
-            Insets sysInsets = insets.getInsets(WindowInsets.Type.systemBars());
-            left = sysInsets.left;
-            top = sysInsets.top;
-            right = sysInsets.right;
-            keyboard = imeInsets.bottom > sysInsets.bottom ? imeInsets.bottom : 0;
-            bottom = keyboard > 0 ? keyboard : sysInsets.bottom;
+            Insets bars = insets.getInsets(WindowInsets.Type.systemBars() | WindowInsets.Type.displayCutout());
+            left = bars.left;
+            top = bars.top;
+            right = bars.right;
+            bottom = bars.bottom;
+            ime = insets.getInsets(WindowInsets.Type.ime()).bottom;
         } else {
-            // Before API 30 the bottom system inset includes the keyboard;
-            // anything taller than a navigation bar is taken as a keyboard.
+            // Before API 30 the bottom window inset includes the keyboard; the
+            // stable inset is the navigation bar alone.
             left = insets.getSystemWindowInsetLeft();
             top = insets.getSystemWindowInsetTop();
             right = insets.getSystemWindowInsetRight();
-            bottom = insets.getSystemWindowInsetBottom();
-            keyboard = bottom > v.getHeight() / 6 ? bottom : 0;
+            int all = insets.getSystemWindowInsetBottom();
+            bottom = Math.min(all, insets.getStableInsetBottom());
+            ime = all > bottom ? all : 0;
         }
         v.setPadding(left, top, right, bottom);
 
-        // The surface ends at the keyboard's top edge, so in surface
-        // coordinates the keyboard lies just below the surface.
-        boolean visible = keyboard > 0;
-        if (visible != mKeyboardVisible || keyboard != mKeyboardHeight) {
-            mKeyboardVisible = visible;
+        // Surface coordinates: the part of the keyboard above the navigation bar.
+        int keyboard = Math.max(0, ime - bottom);
+        if (keyboard != mKeyboardHeight) {
             mKeyboardHeight = keyboard;
             int surfaceWidth = Math.max(0, v.getWidth() - left - right);
             int surfaceHeight = Math.max(0, v.getHeight() - top - bottom);
-            if (visible) {
-                QuadNative.surfaceOnKeyboard(true, 0, surfaceHeight, surfaceWidth, keyboard);
+            if (keyboard > 0) {
+                QuadNative.surfaceOnKeyboard(true, 0, surfaceHeight - keyboard, surfaceWidth, keyboard);
             } else {
                 QuadNative.surfaceOnKeyboard(false, 0, 0, 0, 0);
             }
@@ -577,6 +581,7 @@ public class MainActivity extends Activity {
         layout.addView(view);
         layout.addView(sHiddenEditText);
         setContentView(layout);
+        applyWindowMode(false);
 
         QuadNative.activityOnCreate(this);
 
@@ -661,32 +666,47 @@ public class MainActivity extends Activity {
 
     public void setFullScreen(final boolean fullscreen) {
         runOnUiThread(new Runnable() {
-                @Override
-                public void run() {
-                    View decorView = getWindow().getDecorView();
+            @Override
+            public void run() {
+                applyWindowMode(fullscreen);
+            }
+        });
+    }
 
-                    if (fullscreen) {
-                        getWindow().setFlags(LayoutParams.FLAG_LAYOUT_NO_LIMITS, LayoutParams.FLAG_LAYOUT_NO_LIMITS);
-                        if (Build.VERSION.SDK_INT >= 28) {
-                            getWindow().getAttributes().layoutInDisplayCutoutMode = LayoutParams.LAYOUT_IN_DISPLAY_CUTOUT_MODE_SHORT_EDGES;
-                        }
-                        if (Build.VERSION.SDK_INT >= 30) {
-                            getWindow().setDecorFitsSystemWindows(false);
-                        } else {
-                            int uiOptions = View.SYSTEM_UI_FLAG_HIDE_NAVIGATION | View.SYSTEM_UI_FLAG_FULLSCREEN | View.SYSTEM_UI_FLAG_IMMERSIVE_STICKY;
-                            decorView.setSystemUiVisibility(uiOptions);
-                        }
-                    }
-                    else {
-                        if (Build.VERSION.SDK_INT >= 30) {
-                            getWindow().setDecorFitsSystemWindows(true);
-                        } else {
-                          decorView.setSystemUiVisibility(0);
-                        }
-
-                    }
+    // The content always lays out behind the system bars and the keyboard
+    // (ResizingLayout pads for the bars itself), so the window never resizes
+    // when the keyboard opens. Full screen additionally hides the bars.
+    @SuppressWarnings("deprecation")
+    private void applyWindowMode(boolean fullscreen) {
+        Window window = getWindow();
+        window.setSoftInputMode(LayoutParams.SOFT_INPUT_ADJUST_RESIZE | LayoutParams.SOFT_INPUT_STATE_UNSPECIFIED);
+        if (Build.VERSION.SDK_INT >= 28) {
+            window.getAttributes().layoutInDisplayCutoutMode = fullscreen
+                ? LayoutParams.LAYOUT_IN_DISPLAY_CUTOUT_MODE_SHORT_EDGES
+                : LayoutParams.LAYOUT_IN_DISPLAY_CUTOUT_MODE_DEFAULT;
+        }
+        if (Build.VERSION.SDK_INT >= 30) {
+            window.setDecorFitsSystemWindows(false);
+            WindowInsetsController controller = window.getInsetsController();
+            if (controller != null) {
+                if (fullscreen) {
+                    controller.setSystemBarsBehavior(WindowInsetsController.BEHAVIOR_SHOW_TRANSIENT_BARS_BY_SWIPE);
+                    controller.hide(WindowInsets.Type.systemBars());
+                } else {
+                    controller.show(WindowInsets.Type.systemBars());
                 }
-            });
+            }
+        } else {
+            int flags = View.SYSTEM_UI_FLAG_LAYOUT_STABLE
+                | View.SYSTEM_UI_FLAG_LAYOUT_FULLSCREEN
+                | View.SYSTEM_UI_FLAG_LAYOUT_HIDE_NAVIGATION;
+            if (fullscreen) {
+                flags |= View.SYSTEM_UI_FLAG_HIDE_NAVIGATION
+                    | View.SYSTEM_UI_FLAG_FULLSCREEN
+                    | View.SYSTEM_UI_FLAG_IMMERSIVE_STICKY;
+            }
+            window.getDecorView().setSystemUiVisibility(flags);
+        }
     }
 
     public void showKeyboard(final boolean show) {
