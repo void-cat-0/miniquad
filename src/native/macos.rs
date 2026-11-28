@@ -341,6 +341,8 @@ impl MacosDisplay {
             SetTextInputState(_) => {}
             // Desktop platforms have no haptics.
             HapticFeedback(_) => {}
+            // Desktop text fields use their own context menus.
+            ShowTextMenu { .. } | HideTextMenu => {}
         }
     }
 }

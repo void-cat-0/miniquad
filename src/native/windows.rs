@@ -1243,6 +1243,8 @@ impl WindowsDisplay {
             SetTextInputRect { x, y, w, h } => self.set_text_input_rect(x, y, w, h),
             // Desktop platforms have no haptics.
             HapticFeedback(_) => {}
+            // Desktop text fields use their own context menus.
+            ShowTextMenu { .. } | HideTextMenu => {}
         }
     }
 }

@@ -19,6 +19,9 @@ import android.view.SurfaceView;
 import android.view.SurfaceHolder;
 import android.view.MotionEvent;
 import android.view.KeyEvent;
+import android.view.ActionMode;
+import android.view.Menu;
+import android.view.MenuItem;
 import android.view.WindowInsetsController;
 import android.view.inputmethod.InputMethodManager;
 
@@ -226,33 +229,6 @@ class QuadSurface
         QuadNative.surfaceOnSurfaceChanged(getNativeSurface(), width, height);
     }
 
-    private float mDownX = 0;
-    private float mDownY = 0;
-    private boolean mIsLongPress = false;
-    private Runnable mLongPressRunnable = new Runnable() {
-        @Override
-        public void run() {
-            if (MainActivity.sFocusedElementId != 0 && MainActivity.sFocusedElementId != -1 && MainActivity.sHiddenEditText != null) {
-                mIsLongPress = true;
-                final float x = mDownX;
-                final float y = mDownY;
-                MainActivity.sHiddenEditText.post(new Runnable() {
-                    @Override
-                    public void run() {
-                        if (MainActivity.sHiddenEditText != null) {
-                            MainActivity.sHiddenEditText.requestFocus();
-                            if (android.os.Build.VERSION.SDK_INT >= 24) {
-                                MainActivity.sHiddenEditText.showContextMenu(x, y);
-                            } else {
-                                MainActivity.sHiddenEditText.showContextMenu();
-                            }
-                        }
-                    }
-                });
-            }
-        }
-    };
-
     @Override
     public boolean onTouch(View v, MotionEvent event) {
         int pointerCount = event.getPointerCount();
@@ -265,12 +241,10 @@ class QuadSurface
             int id = event.getPointerId(pointerIndex);
             final float x = event.getX(pointerIndex);
             final float y = event.getY(pointerIndex);
-            mDownX = x;
-            mDownY = y;
-            mIsLongPress = false;
-            if (getHandler() != null) {
-                getHandler().removeCallbacks(mLongPressRunnable);
-                getHandler().postDelayed(mLongPressRunnable, 500);
+            // Like native fields, a new touch dismisses the text toolbar;
+            // the application shows it again after a long press.
+            if (MainActivity.sInstance != null) {
+                MainActivity.sInstance.finishTextMenu();
             }
             QuadNative.surfaceOnTouch(id, 0, x, y, event.getEventTime());
 
@@ -281,36 +255,26 @@ class QuadSurface
                 final int id = event.getPointerId(i);
                 final float x = event.getX(i);
                 final float y = event.getY(i);
-                if (Math.hypot(x - mDownX, y - mDownY) > 25 && getHandler() != null) {
-                    getHandler().removeCallbacks(mLongPressRunnable);
-                }
                 QuadNative.surfaceOnTouch(id, 1, x, y, event.getEventTime());
             }
             break;
         }
         case MotionEvent.ACTION_UP:
         case MotionEvent.ACTION_POINTER_UP: {
-            if (getHandler() != null) {
-                getHandler().removeCallbacks(mLongPressRunnable);
-            }
             int pointerIndex = event.getActionIndex();
             int id = event.getPointerId(pointerIndex);
             final float x = event.getX(pointerIndex);
             final float y = event.getY(pointerIndex);
-            if (!mIsLongPress && MainActivity.sHiddenEditText != null && MainActivity.sFocusedElementId != 0 && MainActivity.sFocusedElementId != -1) {
+            if (MainActivity.sHiddenEditText != null && MainActivity.sFocusedElementId > 0) {
                 InputMethodManager imm = (InputMethodManager) getContext().getSystemService(Context.INPUT_METHOD_SERVICE);
                 if (imm != null) {
                     imm.viewClicked(MainActivity.sHiddenEditText);
                 }
             }
-            int phase = mIsLongPress ? 3 : 2;
-            QuadNative.surfaceOnTouch(id, phase, x, y, event.getEventTime());
+            QuadNative.surfaceOnTouch(id, 2, x, y, event.getEventTime());
             break;
         }
         case MotionEvent.ACTION_CANCEL: {
-            if (getHandler() != null) {
-                getHandler().removeCallbacks(mLongPressRunnable);
-            }
             for (int i = 0; i < pointerCount; i++) {
                 final int id = event.getPointerId(i);
                 final float x = event.getX(i);
@@ -333,7 +297,7 @@ class QuadSurface
         if (keyCode == KeyEvent.KEYCODE_BACK) {
             return false;
         }
-        if (MainActivity.sFocusedElementId != -1 && MainActivity.sFocusedElementId != 0) {
+        if (MainActivity.sFocusedElementId > 0) {
             return false;
         }
 
@@ -364,7 +328,7 @@ class QuadSurface
 
     @Override
     public InputConnection onCreateInputConnection(EditorInfo outAttrs) {
-        if (MainActivity.sHiddenEditText != null && MainActivity.sFocusedElementId != -1 && MainActivity.sFocusedElementId != 0) {
+        if (MainActivity.sHiddenEditText != null && MainActivity.sFocusedElementId > 0) {
             return MainActivity.sHiddenEditText.onCreateInputConnection(outAttrs);
         }
         return null;
@@ -449,6 +413,7 @@ public class MainActivity extends Activity {
     public static int sTextInputSelectionEnd = 0;
     public static boolean sTextInputIsPassword = false;
     public static boolean sTextInputIsMultiline = false;
+    public static boolean sTextInputReadOnly = false;
     // Id of the active text input session (from Rust), 0 when none. Every
     // state report carries it, so Rust drops reports of an earlier session.
     public static long sFocusedElementId = 0;
@@ -513,8 +478,10 @@ public class MainActivity extends Activity {
                 if (kind == 1 && Build.VERSION.SDK_INT >= 26) {
                     imeOptions |= EditorInfo.IME_FLAG_NO_PERSONALIZED_LEARNING;
                 }
+                finishTextMenu();
                 sTextInputIsPassword = kind == 1;
                 sTextInputIsMultiline = kind == 8;
+                sTextInputReadOnly = readOnly;
                 sFocusedElementId = session;
                 sAwaitingState = true;
                 sHiddenEditText.setIgnoreUpdates(true);
@@ -553,6 +520,7 @@ public class MainActivity extends Activity {
             public void run() {
                 sFocusedElementId = 0;
                 sAwaitingState = false;
+                finishTextMenu();
                 if (sHiddenEditText == null) return;
                 Editable editable = sHiddenEditText.getText();
                 if (editable != null) {
@@ -583,8 +551,123 @@ public class MainActivity extends Activity {
                 sTextInputText = text != null ? text : "";
                 sAwaitingState = false;
                 sHiddenEditText.applyStateFromRust(sTextInputText, selectionStart, selectionEnd, composingStart, composingEnd);
+                if (mTextMenu != null) {
+                    mTextMenu.invalidate();
+                }
             }
         });
+    }
+
+    // Floating text toolbar (Cut, Copy, Paste, Select all), the same
+    // ActionMode.TYPE_FLOATING toolbar that native text fields and Chrome
+    // show. Rust opens it with the selection's bounds in surface pixels.
+    private ActionMode mTextMenu = null;
+    private final android.graphics.Rect mTextMenuRect = new android.graphics.Rect();
+
+    public void showTextMenu(final int x, final int y, final int width, final int height) {
+        runOnUiThread(new Runnable() {
+            @Override
+            public void run() {
+                if (Build.VERSION.SDK_INT < 23 || view == null || sHiddenEditText == null || sFocusedElementId <= 0) return;
+                mTextMenuRect.set(x, y, x + width, y + height);
+                if (mTextMenu != null) {
+                    mTextMenu.invalidateContentRect();
+                    mTextMenu.invalidate();
+                    return;
+                }
+                mTextMenu = view.startActionMode(new TextMenuCallback(), ActionMode.TYPE_FLOATING);
+            }
+        });
+    }
+
+    public void hideTextMenu() {
+        runOnUiThread(new Runnable() {
+            @Override
+            public void run() {
+                finishTextMenu();
+            }
+        });
+    }
+
+    // UI thread only.
+    void finishTextMenu() {
+        if (mTextMenu != null) {
+            ActionMode mode = mTextMenu;
+            mTextMenu = null;
+            mode.finish();
+        }
+    }
+
+    private class TextMenuCallback extends ActionMode.Callback2 {
+        private void populate(Menu menu) {
+            menu.clear();
+            if (sHiddenEditText == null) return;
+            Editable editable = sHiddenEditText.getText();
+            int length = editable != null ? editable.length() : 0;
+            int start = editable != null ? Selection.getSelectionStart(editable) : 0;
+            int end = editable != null ? Selection.getSelectionEnd(editable) : 0;
+            boolean selected = start != end;
+            boolean editableText = !sTextInputReadOnly;
+            boolean secure = sTextInputIsPassword;
+            ClipboardManager clipboard = (ClipboardManager) getSystemService(Context.CLIPBOARD_SERVICE);
+            boolean canPaste = clipboard != null && clipboard.hasPrimaryClip();
+            int order = 0;
+            if (selected && editableText && !secure) {
+                menu.add(Menu.NONE, android.R.id.cut, order++, android.R.string.cut)
+                    .setShowAsAction(MenuItem.SHOW_AS_ACTION_ALWAYS);
+            }
+            if (selected && !secure) {
+                menu.add(Menu.NONE, android.R.id.copy, order++, android.R.string.copy)
+                    .setShowAsAction(MenuItem.SHOW_AS_ACTION_ALWAYS);
+            }
+            if (editableText && canPaste) {
+                menu.add(Menu.NONE, android.R.id.paste, order++, android.R.string.paste)
+                    .setShowAsAction(MenuItem.SHOW_AS_ACTION_ALWAYS);
+            }
+            if (length > 0 && Math.abs(end - start) < length) {
+                menu.add(Menu.NONE, android.R.id.selectAll, order++, android.R.string.selectAll)
+                    .setShowAsAction(MenuItem.SHOW_AS_ACTION_ALWAYS);
+            }
+        }
+
+        @Override
+        public boolean onCreateActionMode(ActionMode mode, Menu menu) {
+            populate(menu);
+            return menu.size() > 0;
+        }
+
+        @Override
+        public boolean onPrepareActionMode(ActionMode mode, Menu menu) {
+            populate(menu);
+            return true;
+        }
+
+        @Override
+        public boolean onActionItemClicked(ActionMode mode, MenuItem item) {
+            int id = item.getItemId();
+            if (sHiddenEditText == null || sFocusedElementId <= 0) return false;
+            // The hidden EditText mirrors the field's text and selection; its
+            // edits reach Rust as ordinary editing-state changes.
+            sHiddenEditText.onTextContextMenuItem(id);
+            if (id == android.R.id.selectAll) {
+                mode.invalidate();
+            } else {
+                finishTextMenu();
+            }
+            return true;
+        }
+
+        @Override
+        public void onDestroyActionMode(ActionMode mode) {
+            if (mTextMenu == mode) {
+                mTextMenu = null;
+            }
+        }
+
+        @Override
+        public void onGetContentRect(ActionMode mode, View v, android.graphics.Rect outRect) {
+            outRect.set(mTextMenuRect);
+        }
     }
 
     static {

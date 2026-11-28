@@ -377,6 +377,23 @@ impl MainThreadState {
                 (**env).DeleteLocalRef.unwrap()(env, text);
             },
             SetTextInputRect { .. } => {}
+            ShowTextMenu { x, y, w, h } => unsafe {
+                let env = attach_jni_env();
+                ndk_utils::call_void_method!(
+                    env,
+                    ACTIVITY,
+                    "showTextMenu",
+                    "(IIII)V",
+                    x.floor() as i32,
+                    y.floor() as i32,
+                    w.ceil().max(1.) as i32,
+                    h.ceil().max(1.) as i32
+                );
+            },
+            HideTextMenu => unsafe {
+                let env = attach_jni_env();
+                ndk_utils::call_void_method!(env, ACTIVITY, "hideTextMenu", "()V");
+            },
             HapticFeedback(kind) => unsafe {
                 let env = attach_jni_env();
                 ndk_utils::call_void_method!(env, ACTIVITY, "hapticFeedback", "(I)V", kind as i32);

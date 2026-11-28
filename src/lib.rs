@@ -461,6 +461,31 @@ pub mod window {
         );
     }
 
+    /// Show the platform's floating text toolbar (Cut, Copy, Paste, Select
+    /// all) above `x, y, width, height`, the selection's bounds in physical
+    /// window pixels. The actions apply to the active text input session's
+    /// selection and arrive as ordinary editing-state changes. Calling it
+    /// again moves the toolbar. Android only; other platforms ignore it.
+    pub fn show_text_menu(x: f32, y: f32, width: f32, height: f32) {
+        let d = native_display().lock().unwrap();
+        send_request(
+            &d,
+            native::Request::ShowTextMenu {
+                x,
+                y,
+                w: width,
+                h: height,
+            },
+        );
+    }
+
+    /// Hide the toolbar opened by [`show_text_menu`]. Stopping the text
+    /// input session hides it too.
+    pub fn hide_text_menu() {
+        let d = native_display().lock().unwrap();
+        send_request(&d, native::Request::HideTextMenu);
+    }
+
     /// Play a haptic feedback pattern: Android `performHapticFeedback`, iOS
     /// feedback generators, and `navigator.vibrate` on the web. Does nothing
     /// on desktop platforms or where the user disabled haptics.
