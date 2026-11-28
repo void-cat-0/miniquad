@@ -152,13 +152,12 @@ impl LibGlx {
     }
 
     pub unsafe fn get_procaddr(&self, procname: &str) -> Option<unsafe extern "C" fn() -> ()> {
-        if self.glxGetProcAddress.is_some() {
+        if let Some(get_proc_addr) = self.glxGetProcAddress {
             let name = std::ffi::CString::new(procname).unwrap();
-            self.glxGetProcAddress.expect("non-null function pointer")(name.as_ptr() as _)
-        } else if self.glxGetProcAddressARB.is_some() {
+            get_proc_addr(name.as_ptr() as _)
+        } else if let Some(get_proc_addr_arb) = self.glxGetProcAddressARB {
             let name = std::ffi::CString::new(procname).unwrap();
-            self.glxGetProcAddressARB
-                .expect("non-null function pointer")(name.as_ptr() as _)
+            get_proc_addr_arb(name.as_ptr() as _)
         } else {
             self.module.get_symbol(procname).ok()
         }
@@ -386,10 +385,10 @@ impl Glx {
     ) {
         self.libgl.glxMakeCurrent.unwrap()(display, window, ctx);
 
-        if self.extensions.glxSwapIntervalExt.is_some() {
-            self.extensions.glxSwapIntervalExt.unwrap()(display, window, interval);
-        } else if self.extensions.glxSwapIntervalMesa.is_some() {
-            self.extensions.glxSwapIntervalMesa.unwrap()(interval);
+        if let Some(swap_interval_ext) = self.extensions.glxSwapIntervalExt {
+            swap_interval_ext(display, window, interval);
+        } else if let Some(swap_interval_mesa) = self.extensions.glxSwapIntervalMesa {
+            swap_interval_mesa(interval);
         };
     }
 }

@@ -84,7 +84,9 @@ impl Decorations {
         let title = std::ffi::CString::new(conf.window_title.as_str()).unwrap();
         let app_id = std::ffi::CString::new(conf.platform.linux_wm_class).unwrap();
         match self {
-            Decorations::LibDecor { libdecor, frame, .. } => {
+            Decorations::LibDecor {
+                libdecor, frame, ..
+            } => {
                 // Libdecor can create its xdg_toplevel asynchronously. These
                 // frame setters also work before that protocol object exists.
                 (libdecor.libdecor_frame_set_title)(*frame, title.as_ptr());
@@ -121,7 +123,10 @@ impl Decorations {
     }
 
     pub(super) unsafe fn map_libdecor_frame(&self) -> bool {
-        if let Decorations::LibDecor { libdecor, frame, .. } = self {
+        if let Decorations::LibDecor {
+            libdecor, frame, ..
+        } = self
+        {
             (libdecor.libdecor_frame_map)(*frame);
             true
         } else {

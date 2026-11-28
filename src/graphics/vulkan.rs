@@ -495,7 +495,7 @@ impl VulkanContext {
                     vk::Result::ERROR_INITIALIZATION_FAILED,
                 )
             })?;
-            let app_name = CStr::from_bytes_with_nul_unchecked(b"miniquad\0");
+            let app_name = c"miniquad";
 
             // Validation needs the Khronos layer to be installed, so it is opt-in
             // rather than always requested: the loader is told about
@@ -504,7 +504,7 @@ impl VulkanContext {
             let validation = std::env::var_os("MINIQUAD_VULKAN_VALIDATION").is_some();
 
             let layer_names: Vec<*const c_char> = if validation {
-                [cstr(b"VK_LAYER_KHRONOS_validation\0")]
+                [c"VK_LAYER_KHRONOS_validation"]
                     .iter()
                     .map(|name| name.as_ptr())
                     .collect()
@@ -671,9 +671,9 @@ impl VulkanContext {
             let video_queue_supported = !cfg!(target_os = "android")
                 && (!needs_video_sync_extension
                     || has_extension(&available_extensions, Synchronization2::name()))
-                && has_extension(&available_extensions, cstr(b"VK_KHR_video_queue\0"))
-                && has_extension(&available_extensions, cstr(b"VK_KHR_video_encode_queue\0"))
-                && has_extension(&available_extensions, cstr(b"VK_KHR_video_encode_h264\0"));
+                && has_extension(&available_extensions, c"VK_KHR_video_queue")
+                && has_extension(&available_extensions, c"VK_KHR_video_encode_queue")
+                && has_extension(&available_extensions, c"VK_KHR_video_encode_h264");
             let video_queue_family = if video_queue_supported {
                 instance
                     .get_physical_device_queue_family_properties(physical_device)
@@ -695,9 +695,9 @@ impl VulkanContext {
                 if needs_video_sync_extension {
                     device_extension_names.push(Synchronization2::name().as_ptr());
                 }
-                device_extension_names.push(cstr(b"VK_KHR_video_queue\0").as_ptr());
-                device_extension_names.push(cstr(b"VK_KHR_video_encode_queue\0").as_ptr());
-                device_extension_names.push(cstr(b"VK_KHR_video_encode_h264\0").as_ptr());
+                device_extension_names.push(c"VK_KHR_video_queue".as_ptr());
+                device_extension_names.push(c"VK_KHR_video_encode_queue".as_ptr());
+                device_extension_names.push(c"VK_KHR_video_encode_h264".as_ptr());
             }
 
             let mut dynamic_rendering_13 = vk::PhysicalDeviceVulkan13Features::builder()
@@ -1828,10 +1828,6 @@ mod swapchain_tests {
     }
 }
 
-pub(crate) fn cstr(name: &[u8]) -> &CStr {
-    CStr::from_bytes_with_nul(name).expect("Vulkan name must be nul-terminated")
-}
-
 pub(super) fn env_enabled(name: &str) -> bool {
     std::env::var(name).map_or(true, |value| {
         !matches!(
@@ -1883,14 +1879,10 @@ pub(crate) fn find_memory_type_index(
     type_bits: u32,
     required: vk::MemoryPropertyFlags,
 ) -> Option<u32> {
-    for index in 0..properties.memory_type_count {
-        if type_bits & (1 << index) != 0
+    (0..properties.memory_type_count).find(|&index| {
+        type_bits & (1 << index) != 0
             && properties.memory_types[index as usize]
                 .property_flags
                 .contains(required)
-        {
-            return Some(index);
-        }
-    }
-    None
+    })
 }

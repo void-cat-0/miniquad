@@ -585,7 +585,10 @@ impl RenderingBackend for MetalContext {
         let texture = self.textures.get(texture);
         texture.access == TextureAccess::RenderTarget
             && texture.params.kind == TextureKind::Texture2D
-            && !matches!(texture.params.format, TextureFormat::Depth | TextureFormat::Depth32)
+            && !matches!(
+                texture.params.format,
+                TextureFormat::Depth | TextureFormat::Depth32
+            )
     }
     unsafe fn texture_raw_id(&self, texture: TextureId) -> RawId {
         let texture = self.textures.get(texture);
@@ -835,8 +838,7 @@ impl RenderingBackend for MetalContext {
                     // MTKView's presentable formats are all `BGRA*` /
                     // `RGBA16Float` so honoring `RGBA8` literally
                     // would break every offscreen color target.
-                    let view_pixel_format: MTLPixelFormat =
-                        msg_send![self.view, colorPixelFormat];
+                    let view_pixel_format: MTLPixelFormat = msg_send![self.view, colorPixelFormat];
                     msg_send_![descriptor, setPixelFormat: view_pixel_format];
                 }
                 msg_send_![descriptor, setStorageMode: MTLStorageMode::Private];
@@ -999,7 +1001,10 @@ impl RenderingBackend for MetalContext {
         let format = texture.params.format;
         // Metal's combined depth/stencil storage does not match Miniquad's
         // two-byte depth upload format.
-        assert!(format != TextureFormat::Depth, "Metal depth texture uploads are unsupported");
+        assert!(
+            format != TextureFormat::Depth,
+            "Metal depth texture uploads are unsupported"
+        );
         format.transfer_len(width as u32, height as u32, bytes.len());
         let stride = width as u64 * format.bytes_per_pixel() as u64;
         let region = MTLRegion {
@@ -1355,8 +1360,7 @@ impl RenderingBackend for MetalContext {
                     // both transition to the new size one frame before
                     // `currentDrawable`'s texture is recreated; reading
                     // the attachment directly avoids the gap.
-                    let descriptor: ObjcId =
-                        msg_send_![self.view, currentRenderPassDescriptor];
+                    let descriptor: ObjcId = msg_send_![self.view, currentRenderPassDescriptor];
                     let color_attachments: ObjcId = msg_send_![descriptor, colorAttachments];
                     let attachment: ObjcId =
                         msg_send_![color_attachments, objectAtIndexedSubscript: 0];

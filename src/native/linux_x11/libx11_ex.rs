@@ -15,13 +15,13 @@ impl LibX11 {
                 let mut type_ = std::ptr::null_mut();
                 if (self.XrmGetResource)(
                     db,
-                    b"Xft.dpi\x00".as_ptr() as _,
-                    b"Xft.Dpi\x00".as_ptr() as _,
+                    c"Xft.dpi".as_ptr() as _,
+                    c"Xft.Dpi".as_ptr() as _,
                     &mut type_,
                     &mut value,
                 ) != 0
                 {
-                    if !type_.is_null() && libc::strcmp(type_, b"String\x00".as_ptr() as _) == 0 {
+                    if !type_.is_null() && libc::strcmp(type_, c"String".as_ptr() as _) == 0 {
                         dpi_scale = libc::atof(value.addr as *const _) as f32 / 96.0;
                     }
                 }

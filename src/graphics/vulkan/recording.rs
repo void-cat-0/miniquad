@@ -340,7 +340,7 @@ impl RecordingFrame {
         let command_buffer = self.command_buffer(device);
         let formats = color;
         let mut rendering = vk::CommandBufferInheritanceRenderingInfo::builder()
-            .color_attachment_formats(&formats)
+            .color_attachment_formats(formats)
             .depth_attachment_format(depth.unwrap_or(vk::Format::UNDEFINED))
             .rasterization_samples(vk::SampleCountFlags::from_raw(samples));
         let inheritance = vk::CommandBufferInheritanceInfo::builder().push_next(&mut rendering);

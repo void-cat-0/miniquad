@@ -1118,7 +1118,10 @@ impl<'a> UniformsSource<'a> {
 
 #[derive(Debug)]
 pub enum ShaderSource<'a> {
-    Glsl { vertex: &'a str, fragment: &'a str },
+    Glsl {
+        vertex: &'a str,
+        fragment: &'a str,
+    },
     /// Precompiled Vulkan SPIR-V binaries, encoded as little-endian bytes.
     ///
     /// Both stages must have a `main` entry point. The shader must match
@@ -1140,7 +1143,9 @@ pub enum ShaderSource<'a> {
         )
     ))]
     SpirV(SpirVShader<'a>),
-    Msl { program: &'a str },
+    Msl {
+        program: &'a str,
+    },
 }
 
 /// Precompiled SPIR-V supplied through [`ShaderSource::spirv`].

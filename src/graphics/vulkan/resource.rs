@@ -9,7 +9,6 @@ use ash::{vk, Device};
 use crate::graphics::*;
 
 use super::backend::{IndexType, Texture};
-use super::cstr;
 use super::{
     find_memory_type_index, PassRendering, TextureUploadArena, VulkanContext, DEPTH_FORMAT,
     IMAGE_BINDING_BASE, TEXTURE_UPLOAD_ARENA_SIZE, UNIFORM_BINDING,
@@ -342,10 +341,12 @@ impl VulkanContext {
         let allocate_info = vk::MemoryAllocateInfo::builder()
             .allocation_size(requirements.size)
             .memory_type_index(memory_type_index);
-        let memory = self.device.allocate_memory(&allocate_info, None).map_err(|error| {
-            self.device.destroy_buffer(buffer, None);
-            error
-        })?;
+        let memory = self
+            .device
+            .allocate_memory(&allocate_info, None)
+            .inspect_err(|_| {
+                self.device.destroy_buffer(buffer, None);
+            })?;
         if let Err(error) = self.device.bind_buffer_memory(buffer, memory, 0) {
             self.device.destroy_buffer(buffer, None);
             self.device.free_memory(memory, None);
@@ -360,7 +361,8 @@ impl VulkanContext {
         size: vk::DeviceSize,
         usage: vk::BufferUsageFlags,
     ) -> (vk::Buffer, vk::DeviceMemory, *mut u8) {
-        self.try_create_mapped_buffer(size, usage).expect("Failed to map a Vulkan buffer")
+        self.try_create_mapped_buffer(size, usage)
+            .expect("Failed to map a Vulkan buffer")
     }
 
     pub(super) fn try_create_mapped_buffer(
@@ -374,11 +376,12 @@ impl VulkanContext {
                 usage,
                 vk::MemoryPropertyFlags::HOST_VISIBLE | vk::MemoryPropertyFlags::HOST_COHERENT,
             )?;
-            let mapped = self.device.map_memory(memory, 0, size, vk::MemoryMapFlags::empty())
-                .map_err(|error| {
+            let mapped = self
+                .device
+                .map_memory(memory, 0, size, vk::MemoryMapFlags::empty())
+                .inspect_err(|_| {
                     self.device.destroy_buffer(buffer, None);
                     self.device.free_memory(memory, None);
-                    error
                 })? as *mut u8;
             Ok((buffer, memory, mapped))
         }
@@ -723,7 +726,7 @@ impl VulkanContext {
         let shader = &self.shaders[module.shader];
         let inputs = &module.inputs;
         unsafe {
-            let entry_name = cstr(b"main\0");
+            let entry_name = c"main";
             let stages = [
                 vk::PipelineShaderStageCreateInfo {
                     stage: vk::ShaderStageFlags::VERTEX,
@@ -1248,7 +1251,11 @@ impl VulkanContext {
     pub(super) fn initialize_dummy_texture(&mut self) -> Result<(), vk::Result> {
         self.dummy_texture = self.try_allocate_texture(
             Some(&[0, 0, 0, 255]),
-            TextureParams { width: 1, height: 1, ..Default::default() },
+            TextureParams {
+                width: 1,
+                height: 1,
+                ..Default::default()
+            },
             TextureAccess::Static,
             TextureWrap::Clamp,
         )?;
@@ -1339,8 +1346,13 @@ impl VulkanContext {
             )?;
             allocation.views.push(view);
             let sample_view = if separate_sample_view {
-                let view =
-                    self.try_create_image_view(image, format, depth, mip_levels, Some(params.format))?;
+                let view = self.try_create_image_view(
+                    image,
+                    format,
+                    depth,
+                    mip_levels,
+                    Some(params.format),
+                )?;
                 allocation.views.push(view);
                 Some(view)
             } else {
@@ -1898,7 +1910,7 @@ impl VulkanContext {
             ptr::copy_nonoverlapping(self.readback_mapped, pixels.as_mut_ptr(), pixel_len);
         }
         if packed {
-            for (dst, src) in bytes.chunks_exact_mut(3).zip(rgba) {
+            for (dst, src) in bytes.as_chunks_mut::<3>().0.iter_mut().zip(rgba) {
                 dst.copy_from_slice(&src[..3]);
             }
         }
@@ -1922,7 +1934,8 @@ impl VulkanContext {
     }
 
     fn upload_texture(&mut self, index: usize, region: TextureUpdateRegion<'_>) {
-        self.try_upload_texture(index, region).expect("Failed to upload Vulkan texture");
+        self.try_upload_texture(index, region)
+            .expect("Failed to upload Vulkan texture");
     }
 
     fn try_upload_texture(
@@ -1940,7 +1953,9 @@ impl VulkanContext {
         let expanded;
         let bytes = if self.textures[index].source_format == TextureFormat::RGB8 {
             expanded = bytes
-                .chunks_exact(3)
+                .as_chunks::<3>()
+                .0
+                .iter()
                 .map(|pixel| [pixel[0], pixel[1], pixel[2], u8::MAX])
                 .collect::<Vec<_>>();
             expanded.as_flattened()
@@ -2003,7 +2018,8 @@ impl VulkanContext {
                 size as usize,
                 &copies,
                 regions.iter().map(|r| r.bytes),
-            ).expect("Failed to upload Vulkan texture regions");
+            )
+            .expect("Failed to upload Vulkan texture regions");
         }
     }
 

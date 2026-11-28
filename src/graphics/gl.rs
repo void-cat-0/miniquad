@@ -397,7 +397,7 @@ unsafe fn read_es_half_float(width: GLsizei, height: GLsizei, bytes: &mut [u8]) 
                 pixel_type,
                 floats.as_mut_ptr().cast(),
             );
-            for (value, out) in floats.into_iter().zip(bytes.chunks_exact_mut(2)) {
+            for (value, out) in floats.into_iter().zip(bytes.as_chunks_mut::<2>().0) {
                 out.copy_from_slice(&narrow_widened_half(value).to_ne_bytes());
             }
         }
@@ -1544,7 +1544,7 @@ impl RenderingBackend for GlContext {
             return color
                 .into_iter()
                 .find(|count| {
-                    *count <= requested && depth.as_ref().map_or(true, |d| d.contains(count))
+                    *count <= requested && depth.as_ref().is_none_or(|d| d.contains(count))
                 })
                 .unwrap_or(1);
         }
@@ -2150,7 +2150,7 @@ impl RenderingBackend for GlContext {
                 let vb = vertex_buffers[attribute.buffer_index];
                 let vb = self.buffers[vb.0];
 
-                if cached_attr.map_or(true, |cached_attr| {
+                if cached_attr.is_none_or(|cached_attr| {
                     attribute != cached_attr.attribute || cached_attr.gl_vbuf != vb.gl_buf
                 }) {
                     self.cache

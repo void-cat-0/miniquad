@@ -147,10 +147,10 @@ unsafe extern "C" fn preedit_caret_callback(
 
 impl X11Display {
     pub unsafe fn init_xim(&mut self, window: Window) {
-        libc::setlocale(libc::LC_ALL, b"\0".as_ptr() as _);
-        libc::setlocale(libc::LC_CTYPE, b"\0".as_ptr() as _);
+        libc::setlocale(libc::LC_ALL, c"".as_ptr() as _);
+        libc::setlocale(libc::LC_CTYPE, c"".as_ptr() as _);
 
-        let mod_res = (self.libx11.XSetLocaleModifiers)(b"\0".as_ptr() as _);
+        let mod_res = (self.libx11.XSetLocaleModifiers)(c"".as_ptr() as _);
         if mod_res.is_null() {
             eprintln!("WARNING: XSetLocaleModifiers returned NULL! XIM may not work properly with current $XMODIFIERS.");
         }
@@ -568,11 +568,11 @@ impl X11Display {
             17 => {}
 
             // GenericEvent
-            35 if Some(event.xcookie.extension) == self.libxi.xi_extension_opcode => {
-                if event.xcookie.evtype == xi_input::XI_RawMotion {
-                    let (dx, dy) = self.libxi.read_cookie(&mut event.xcookie, self.display);
-                    event_handler.raw_mouse_motion(dx as f32, dy as f32);
-                }
+            35 if Some(event.xcookie.extension) == self.libxi.xi_extension_opcode
+                && event.xcookie.evtype == xi_input::XI_RawMotion =>
+            {
+                let (dx, dy) = self.libxi.read_cookie(&mut event.xcookie, self.display);
+                event_handler.raw_mouse_motion(dx as f32, dy as f32);
             }
             _ => {}
         };
@@ -648,7 +648,7 @@ impl X11Display {
                 display: self.display,
                 format: 32,
                 data: ClientMessageData {
-                    l: std::mem::transmute(data),
+                    l: std::mem::transmute::<[isize; 5], [i64; 5]>(data),
                 },
             };
             (self.libx11.XSendEvent)(
