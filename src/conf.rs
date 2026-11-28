@@ -38,6 +38,11 @@
 //! dpi_scale   -> 1.0
 //! ```
 //!
+//! On Android `dpi_scale` is the display density (`DisplayMetrics.density`)
+//! when `high_dpi` is set, so a logical pixel is one density-independent
+//! pixel as in native Android UI; without it a logical pixel is a physical
+//! pixel.
+//!
 //! [`dpi_scale`]: super::window::dpi_scale
 //! [`screen_size`]: super::window::screen_size
 

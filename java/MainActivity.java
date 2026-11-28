@@ -737,6 +737,11 @@ public class MainActivity extends Activity {
         });
     }
 
+    // Physical pixels per density-independent pixel, times 1000.
+    public int getDisplayDensityMilli() {
+        return Math.round(getResources().getDisplayMetrics().density * 1000f);
+    }
+
     public void quitApp() {
         runOnUiThread(new Runnable() {
             @Override

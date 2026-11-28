@@ -565,8 +565,18 @@ where
 
         let clipboard = Box::new(AndroidClipboard::new());
         let tx_fn = Box::new(move |req| tx.send(Message::Request(req)).unwrap());
+        // With high_dpi, one logical pixel is one density-independent pixel
+        // (DisplayMetrics.density physical pixels), as in native Android UI.
+        let dpi_scale = if conf.high_dpi {
+            let env = attach_jni_env();
+            let milli = ndk_utils::call_int_method!(env, ACTIVITY, "getDisplayDensityMilli", "()I");
+            if milli > 0 { milli as f32 / 1000. } else { 1. }
+        } else {
+            1.
+        };
         crate::set_or_replace_display(NativeDisplayData {
             high_dpi: conf.high_dpi,
+            dpi_scale,
             blocking_event_loop: conf.platform.blocking_event_loop,
             ..NativeDisplayData::new(screen_width as _, screen_height as _, tx_fn, clipboard)
         });
