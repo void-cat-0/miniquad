@@ -24,7 +24,7 @@ public class QuadNative {
     public native static void surfaceOnImePreedit(String text);
     public native static void surfaceOnImeCommit(String text);
     public native static void surfaceOnImeStateChanged(String text, int selectionStart, int selectionEnd, int composingStart, int composingEnd, long elementId);
-    public native static void surfaceOnImeAction(int actionCode);
+    public native static void surfaceOnImeAction(int actionCode, long session);
     // Soft keyboard frame in surface pixels; empty when hidden.
     public native static void surfaceOnKeyboard(boolean visible, int x, int y, int width, int height);
 }

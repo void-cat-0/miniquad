@@ -251,8 +251,9 @@ pub trait EventHandler {
 
     /// The whole editing state of a platform text mirror (Android, iOS, web)
     /// after an input-method edit. Offsets are UTF-16 code units; the
-    /// selection is anchor (`start`) to extent (`end`). `element_id` is kept
-    /// for compatibility and is always 1 during a session.
+    /// selection is anchor (`start`) to extent (`end`). `element_id` is the
+    /// id of the text input session the state belongs to; reports from an
+    /// earlier session are dropped before they reach the handler.
     fn on_ime_state_changed(
         &mut self,
         _text: &str,

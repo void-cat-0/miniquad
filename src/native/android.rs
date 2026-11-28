@@ -79,7 +79,10 @@ enum Message {
         composing_end: Option<usize>,
         element_id: u64,
     },
-    ImeAction(i32),
+    ImeAction {
+        code: i32,
+        session: u64,
+    },
     /// Soft keyboard frame in surface pixels.
     Keyboard {
         visible: bool,
@@ -260,9 +263,16 @@ impl MainThreadState {
                 self.event_handler.on_ime_commit(text.as_deref());
             }
             Message::ImeStateChanged { text, selection_start, selection_end, composing_start, composing_end, element_id } => {
-                self.event_handler.on_ime_state_changed(&text, selection_start, selection_end, composing_start, composing_end, element_id);
+                // The UI thread may still report edits of the previous field
+                // after the application focused another one.
+                if element_id == crate::text_input::session_id() {
+                    self.event_handler.on_ime_state_changed(&text, selection_start, selection_end, composing_start, composing_end, element_id);
+                }
             }
-            Message::ImeAction(code) => {
+            Message::ImeAction { code, session } => {
+                if session != crate::text_input::session_id() {
+                    return;
+                }
                 // android.view.inputmethod.EditorInfo action codes.
                 use crate::TextInputAction as A;
                 let action = match code {
@@ -337,12 +347,13 @@ impl MainThreadState {
                     env,
                     ACTIVITY,
                     "startTextInput",
-                    "(IIZIZ)V",
+                    "(IIZIZJ)V",
                     config.kind as i32,
                     config.action as i32,
                     config.autocorrect as i32,
                     config.capitalization as i32,
-                    config.read_only as i32
+                    config.read_only as i32,
+                    crate::text_input::session_id() as ndk_sys::jlong
                 );
             },
             StopTextInput => unsafe {
@@ -865,8 +876,12 @@ pub unsafe extern "C" fn Java_quad_1native_QuadNative_surfaceOnImeAction(
     _: *mut ndk_sys::JNIEnv,
     _: ndk_sys::jclass,
     action_code: ndk_sys::jint,
+    session: ndk_sys::jlong,
 ) {
-    send_message(Message::ImeAction(action_code));
+    send_message(Message::ImeAction {
+        code: action_code,
+        session: session as u64,
+    });
 }
 
 unsafe fn jstring_to_string(env: *mut ndk_sys::JNIEnv, jstr: ndk_sys::jstring) -> Option<String> { unsafe {

@@ -132,16 +132,32 @@ impl TextInputState {
     }
 }
 
-static SESSION: std::sync::Mutex<Option<TextInputConfig>> = std::sync::Mutex::new(None);
+/// The active session and its id. Ids start at 1 and grow with every
+/// `start_text_input`, so a platform that reports edits asynchronously
+/// (Android's UI thread) can tag them and late reports from an earlier
+/// session are dropped instead of reaching the newly focused field.
+static SESSION: std::sync::Mutex<(u64, Option<TextInputConfig>)> =
+    std::sync::Mutex::new((0, None));
 
 /// The active session, readable from backends without the display lock.
 #[allow(dead_code)]
 pub(crate) fn session() -> Option<TextInputConfig> {
-    *SESSION.lock().unwrap()
+    SESSION.lock().unwrap().1
+}
+
+/// The id of the active session, or 0 when none is active.
+#[allow(dead_code)]
+pub(crate) fn session_id() -> u64 {
+    let session = SESSION.lock().unwrap();
+    if session.1.is_some() { session.0 } else { 0 }
 }
 
 pub(crate) fn set_session(config: Option<TextInputConfig>) {
-    *SESSION.lock().unwrap() = config;
+    let mut session = SESSION.lock().unwrap();
+    if config.is_some() {
+        session.0 += 1;
+    }
+    session.1 = config;
 }
 
 /// Convert a UTF-16 offset to a byte offset into `text` (clamped).

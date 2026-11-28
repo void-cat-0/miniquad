@@ -83,7 +83,7 @@ class HiddenEditText extends EditText {
                     // Enter in a multiline field inserts a newline.
                     return false;
                 }
-                QuadNative.surfaceOnImeAction(actionId);
+                QuadNative.surfaceOnImeAction(actionId, MainActivity.sFocusedElementId);
                 return true;
             }
         });
@@ -171,7 +171,9 @@ class HiddenEditText extends EditText {
 
     private void sendStateToRust() {
         if (!mInitialized || mIgnoreUpdates) return;
-        if (MainActivity.sFocusedElementId == -1 || MainActivity.sFocusedElementId == 0) return;
+        // No session, or a new session whose text has not arrived yet: the
+        // editable still holds an earlier field's text.
+        if (MainActivity.sFocusedElementId <= 0 || MainActivity.sAwaitingState) return;
 
         Editable editable = getText();
         if (editable == null) return;
@@ -447,7 +449,11 @@ public class MainActivity extends Activity {
     public static int sTextInputSelectionEnd = 0;
     public static boolean sTextInputIsPassword = false;
     public static boolean sTextInputIsMultiline = false;
-    public static long sFocusedElementId = -1;
+    // Id of the active text input session (from Rust), 0 when none. Every
+    // state report carries it, so Rust drops reports of an earlier session.
+    public static long sFocusedElementId = 0;
+    // A session started and its text has not arrived yet.
+    public static boolean sAwaitingState = false;
 
     public static String getClipboardTextStatic() {
         if (sInstance != null) {
@@ -464,7 +470,7 @@ public class MainActivity extends Activity {
 
     // Text input session: kind, action, and capitalization codes follow
     // miniquad's TextInputKind, TextInputAction, and TextInputCapitalization.
-    public void startTextInput(final int kind, final int action, final boolean autocorrect, final int capitalization, final boolean readOnly) {
+    public void startTextInput(final int kind, final int action, final boolean autocorrect, final int capitalization, final boolean readOnly, final long session) {
         runOnUiThread(new Runnable() {
             @Override
             public void run() {
@@ -509,9 +515,18 @@ public class MainActivity extends Activity {
                 }
                 sTextInputIsPassword = kind == 1;
                 sTextInputIsMultiline = kind == 8;
-                sFocusedElementId = 1;
+                sFocusedElementId = session;
+                sAwaitingState = true;
                 sHiddenEditText.setIgnoreUpdates(true);
                 try {
+                    // Forget the previous field's text before the input method
+                    // reconnects, so it cannot commit that text into this one.
+                    Editable editable = sHiddenEditText.getText();
+                    if (editable != null) {
+                        android.view.inputmethod.BaseInputConnection.removeComposingSpans(editable);
+                        editable.clear();
+                    }
+                    sTextInputText = "";
                     sHiddenEditText.setInputType(inputType);
                     sHiddenEditText.setImeOptions(imeOptions);
                     sHiddenEditText.setFilters(new android.text.InputFilter[0]);
@@ -537,11 +552,19 @@ public class MainActivity extends Activity {
             @Override
             public void run() {
                 sFocusedElementId = 0;
+                sAwaitingState = false;
                 if (sHiddenEditText == null) return;
                 Editable editable = sHiddenEditText.getText();
                 if (editable != null) {
-                    android.view.inputmethod.BaseInputConnection.removeComposingSpans(editable);
+                    sHiddenEditText.setIgnoreUpdates(true);
+                    try {
+                        android.view.inputmethod.BaseInputConnection.removeComposingSpans(editable);
+                        editable.clear();
+                    } finally {
+                        sHiddenEditText.setIgnoreUpdates(false);
+                    }
                 }
+                sTextInputText = "";
                 sHiddenEditText.clearFocus();
                 view.requestFocus();
                 InputMethodManager imm = (InputMethodManager) getSystemService(Context.INPUT_METHOD_SERVICE);
@@ -556,8 +579,9 @@ public class MainActivity extends Activity {
         runOnUiThread(new Runnable() {
             @Override
             public void run() {
-                if (sHiddenEditText == null || sFocusedElementId != 1) return;
+                if (sHiddenEditText == null || sFocusedElementId <= 0) return;
                 sTextInputText = text != null ? text : "";
+                sAwaitingState = false;
                 sHiddenEditText.applyStateFromRust(sTextInputText, selectionStart, selectionEnd, composingStart, composingEnd);
             }
         });
