@@ -7,7 +7,7 @@ use super::{Display, LibX11};
 use crate::event::{KeyCode, KeyMods, MouseButton};
 use crate::native::linux_x11::libx11::LibXkbCommon;
 
-pub unsafe fn translate_key(libx11: &mut LibX11, display: *mut Display, scancode: i32) -> KeyCode {
+pub unsafe fn translate_key(libx11: &mut LibX11, display: *mut Display, scancode: i32) -> KeyCode { unsafe {
     if scancode < 8 || scancode > 255 {
         return KeyCode::Unknown;
     }
@@ -142,7 +142,7 @@ pub unsafe fn translate_key(libx11: &mut LibX11, display: *mut Display, scancode
         60 => KeyCode::World1,
         _ => KeyCode::Unknown,
     }
-}
+}}
 
 pub unsafe fn translate_mod(x11_mods: i32) -> KeyMods {
     let mut mods = KeyMods::default();
@@ -173,6 +173,6 @@ pub unsafe fn translate_mouse_button(button: i32) -> MouseButton {
 pub unsafe extern "C" fn keysym_to_unicode(
     libxkbcommon: &mut LibXkbCommon,
     keysym: super::libx11::KeySym,
-) -> i32 {
+) -> i32 { unsafe {
     (libxkbcommon.xkb_keysym_to_utf32)(keysym as u32) as i32
-}
+}}

@@ -8,13 +8,13 @@ use std::ptr;
 
 struct ClipboardGuard;
 impl ClipboardGuard {
-    unsafe fn open() -> Option<Self> {
+    unsafe fn open() -> Option<Self> { unsafe {
         let result = OpenClipboard(ptr::null_mut());
         if result == false as _ {
             return None;
         }
         Some(ClipboardGuard)
-    }
+    }}
 }
 
 impl Drop for ClipboardGuard {
@@ -25,7 +25,7 @@ impl Drop for ClipboardGuard {
     }
 }
 
-unsafe fn get_raw_clipboard() -> Option<Vec<u16>> {
+unsafe fn get_raw_clipboard() -> Option<Vec<u16>> { unsafe {
     // https://docs.microsoft.com/en-us/windows/win32/dataxchg/about-the-clipboard
 
     let guard = ClipboardGuard::open();
@@ -56,9 +56,9 @@ unsafe fn get_raw_clipboard() -> Option<Vec<u16>> {
     ptr::copy_nonoverlapping(data_ptr, res.as_mut_ptr(), len);
 
     Some(res)
-}
+}}
 
-unsafe fn set_raw_clipboard(data: *const u8, len: usize) {
+unsafe fn set_raw_clipboard(data: *const u8, len: usize) { unsafe {
     let guard = ClipboardGuard::open();
 
     if guard.is_none() {
@@ -80,7 +80,7 @@ unsafe fn set_raw_clipboard(data: *const u8, len: usize) {
     EmptyClipboard();
 
     SetClipboardData(CF_UNICODETEXT, alloc_handle);
-}
+}}
 
 pub struct WindowsClipboard {}
 impl WindowsClipboard {

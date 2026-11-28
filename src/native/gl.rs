@@ -343,9 +343,9 @@ macro_rules! gl_loader {
 
         $(
             #[allow(clippy::too_many_arguments)]
-            pub unsafe fn $fn($($arg: $t),*) -> $res {
+            pub unsafe fn $fn($($arg: $t),*) -> $res { unsafe {
                 __pfns::$fn.unwrap()( $($arg),* )
-            }
+            }}
         )*
 
         pub fn load_gl_funcs<T: FnMut(&str) -> Option<unsafe extern "C" fn() -> ()>>(mut getprocaddr: T) {
@@ -678,7 +678,7 @@ gl_loader!(
 
 // note that glGetString only works after first glSwapBuffer,
 // not just after context creation
-pub unsafe fn is_gl2() -> bool {
+pub unsafe fn is_gl2() -> bool { unsafe {
     let version_string = glGetString(super::gl::GL_VERSION);
     let version_string = std::ffi::CStr::from_ptr(version_string as _)
         .to_str()
@@ -687,4 +687,4 @@ pub unsafe fn is_gl2() -> bool {
     version_string.is_empty()
         || version_string.starts_with("2")
         || version_string.starts_with("OpenGL ES 2")
-}
+}}

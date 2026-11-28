@@ -92,12 +92,12 @@ impl LibXkbCommon {
         &mut self,
         keymap: *mut xkb_keymap,
         keycode: xkb_keycode_t,
-    ) -> xkb_keysym_t {
+    ) -> xkb_keysym_t { unsafe {
         let xkb_state = (self.xkb_state_new)(keymap);
         let keysym = (self.xkb_state_key_get_one_sym)(xkb_state, keycode);
         (self.xkb_state_unref)(xkb_state);
         keysym
-    }
+    }}
 }
 
 pub mod libxkbcommon_ex {
@@ -127,7 +127,7 @@ pub mod libxkbcommon_ex {
     }
 
     impl XkbKeymap {
-        pub unsafe fn cache_mod_indices(&mut self, libxkb: &mut LibXkbCommon) {
+        pub unsafe fn cache_mod_indices(&mut self, libxkb: &mut LibXkbCommon) { unsafe {
             let shift = std::ffi::CString::new(XKB_MOD_NAME_SHIFT).unwrap();
             self.shift = (libxkb.xkb_keymap_mod_get_index)(self.xkb_keymap, shift.as_ptr());
             let ctrl = std::ffi::CString::new(XKB_MOD_NAME_CTRL).unwrap();
@@ -136,12 +136,12 @@ pub mod libxkbcommon_ex {
             self.alt = (libxkb.xkb_keymap_mod_get_index)(self.xkb_keymap, alt.as_ptr());
             let logo = std::ffi::CString::new(XKB_MOD_NAME_LOGO).unwrap();
             self.logo = (libxkb.xkb_keymap_mod_get_index)(self.xkb_keymap, logo.as_ptr());
-        }
+        }}
         pub unsafe fn get_keymods(
             &self,
             libxkb: &mut LibXkbCommon,
             xkb_state: *mut xkb_state,
-        ) -> KeyMods {
+        ) -> KeyMods { unsafe {
             let mut mods = KeyMods::default();
             let is_active = libxkb.xkb_state_mod_index_is_active;
             if (is_active)(xkb_state, self.shift, XKB_STATE_MODS_EFFECTIVE) == 1 {
@@ -157,7 +157,7 @@ pub mod libxkbcommon_ex {
                 mods.logo = true;
             }
             mods
-        }
+        }}
     }
 }
 

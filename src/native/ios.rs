@@ -499,12 +499,12 @@ pub fn define_glk_or_mtk_view(superclass: &Class) -> *const Class {
     decl.register()
 }
 
-unsafe fn get_proc_address(name: *const u8) -> Option<unsafe extern "C" fn()> {
+unsafe fn get_proc_address(name: *const u8) -> Option<unsafe extern "C" fn()> { unsafe {
     mod libc {
         use std::ffi::{c_char, c_int, c_void};
 
         pub const RTLD_LAZY: c_int = 1;
-        extern "C" {
+        unsafe extern "C" {
             pub fn dlopen(filename: *const c_char, flag: c_int) -> *mut c_void;
             pub fn dlsym(handle: *mut c_void, symbol: *const c_char) -> *mut c_void;
         }
@@ -525,7 +525,7 @@ unsafe fn get_proc_address(name: *const u8) -> Option<unsafe extern "C" fn()> {
         return None;
     }
     Some(unsafe { std::mem::transmute_copy(&symbol) })
-}
+}}
 
 pub fn define_glk_or_mtk_view_dlg(superclass: &Class) -> *const Class {
     let mut decl = ClassDecl::new("QuadViewDlg", superclass).unwrap();
@@ -956,7 +956,7 @@ pub fn define_app_delegate() -> *const Class {
         _: ObjcId,
     ) -> BOOL {
         unsafe {
-            let (f, conf) = RUN_ARGS.take().unwrap();
+            let (f, conf) = (*std::ptr::addr_of_mut!(RUN_ARGS)).take().unwrap();
 
             let main_screen: ObjcId = msg_send![class!(UIScreen), mainScreen];
             let screen_rect: NSRect = msg_send![main_screen, bounds];
@@ -1477,7 +1477,7 @@ static mut RUN_ARGS: Option<(Box<dyn FnOnce() -> Box<dyn EventHandler>>, Conf)> 
 pub unsafe fn run<F>(conf: Conf, f: F)
 where
     F: 'static + FnOnce() -> Box<dyn EventHandler>,
-{
+{ unsafe {
     RUN_ARGS = Some((Box::new(f), conf));
 
     std::panic::set_hook(Box::new(|info| {
@@ -1492,4 +1492,4 @@ where
     let class_string = frameworks::NSStringFromClass(class as _);
 
     UIApplicationMain(argc, &mut argv, nil, class_string);
-}
+}}

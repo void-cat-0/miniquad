@@ -4,7 +4,7 @@ pub unsafe fn create_empty_cursor(
     display: *mut Display,
     root: Window,
     libx11: &mut LibX11,
-) -> Cursor {
+) -> Cursor { unsafe {
     let mut cursor_color = XColor {
         pixel: 0 as libc::c_int as libc::c_ulong,
         red: 0,
@@ -34,4 +34,4 @@ pub unsafe fn create_empty_cursor(
     (libx11.XFreePixmap)(display, cursor_pixmap);
 
     empty_cursor
-}
+}}

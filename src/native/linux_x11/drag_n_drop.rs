@@ -20,7 +20,7 @@ pub struct X11DnD {
 }
 
 impl super::X11Display {
-    pub(super) unsafe fn init_drag_n_drop(&mut self) {
+    pub(super) unsafe fn init_drag_n_drop(&mut self) { unsafe {
         // Add the window property XdndAware to inform X that we accept drag-n-drop
         (self.libx11.XChangeProperty)(
             self.display,
@@ -32,7 +32,7 @@ impl super::X11Display {
             [5].as_ptr() as _, // XDnD version number
             1,
         );
-    }
+    }}
 }
 
 impl X11DnD {
@@ -42,7 +42,7 @@ impl X11DnD {
         display: *mut Display,
         _window: Window,
         data: ClientMessageData,
-    ) {
+    ) { unsafe {
         // Store the relevant info
         self.source = data.l[0] as _;
         self.version = data.l[1] >> 24;
@@ -72,7 +72,7 @@ impl X11DnD {
                 break;
             }
         }
-    }
+    }}
 
     pub unsafe fn on_position(
         &mut self,
@@ -80,7 +80,7 @@ impl X11DnD {
         display: *mut Display,
         window: Window,
         _data: ClientMessageData,
-    ) {
+    ) { unsafe {
         if self.version <= 5 {
             // We need to send back a client message of type XdndStatus
             let mut reply = XClientMessageEvent {
@@ -115,7 +115,7 @@ impl X11DnD {
             );
             (libx11.XFlush)(display);
         }
-    }
+    }}
 
     pub unsafe fn on_drop(
         &mut self,
@@ -123,7 +123,7 @@ impl X11DnD {
         display: *mut Display,
         window: Window,
         data: ClientMessageData,
-    ) {
+    ) { unsafe {
         if self.version <= 5 {
             if self.format != 0 {
                 // Request to retrieve the data
@@ -163,5 +163,5 @@ impl X11DnD {
                 (libx11.XFlush)(display);
             }
         }
-    }
+    }}
 }

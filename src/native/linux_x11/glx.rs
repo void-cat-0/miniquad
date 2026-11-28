@@ -151,7 +151,7 @@ impl LibGlx {
             })
     }
 
-    pub unsafe fn get_procaddr(&self, procname: &str) -> Option<unsafe extern "C" fn() -> ()> {
+    pub unsafe fn get_procaddr(&self, procname: &str) -> Option<unsafe extern "C" fn() -> ()> { unsafe {
         if self.glxGetProcAddress.is_some() {
             let name = std::ffi::CString::new(procname).unwrap();
             self.glxGetProcAddress.expect("non-null function pointer")(name.as_ptr() as _)
@@ -162,7 +162,7 @@ impl LibGlx {
         } else {
             self.module.get_symbol(procname).ok()
         }
-    }
+    }}
 }
 
 #[derive(Copy, Clone)]
@@ -216,7 +216,7 @@ impl Glx {
         display: *mut Display,
         screen: i32,
         conf: &crate::conf::Conf,
-    ) -> Result<Glx, X11Error> {
+    ) -> Result<Glx, X11Error> { unsafe {
         let mut libgl = LibGlx::try_load()?;
 
         let mut errorbase = 0;
@@ -311,13 +311,13 @@ impl Glx {
             extensions,
             fbconfig,
         })
-    }
+    }}
 
     pub unsafe fn create_context(
         &mut self,
         display: *mut Display,
         window: Window,
-    ) -> (GLXContext, GLXWindow) {
+    ) -> (GLXContext, GLXWindow) { unsafe {
         if self.extensions.glxCreateContextAttribsARB.is_none() {
             panic!("GLX: ARB_create_context and ARB_create_context_profile required");
         }
@@ -348,34 +348,34 @@ impl Glx {
         assert!(glx_window != 0, "GLX: failed to create window");
 
         (glx_ctx, glx_window)
-    }
+    }}
 
     pub unsafe fn destroy_context(
         &mut self,
         display: *mut Display,
         window: GLXWindow,
         ctx: GLXContext,
-    ) {
+    ) { unsafe {
         if window != 0 {
             self.libgl.glxDestroyWindow.unwrap()(display, window);
         }
         if !ctx.is_null() {
             self.libgl.glxDestroyContext.unwrap()(display, ctx);
         };
-    }
+    }}
 
     pub unsafe fn make_current(
         &mut self,
         display: *mut Display,
         window: GLXWindow,
         ctx: GLXContext,
-    ) {
+    ) { unsafe {
         self.libgl.glxMakeCurrent.unwrap()(display, window, ctx);
-    }
+    }}
 
-    pub unsafe fn swap_buffers(&mut self, display: *mut Display, window: GLXWindow) {
+    pub unsafe fn swap_buffers(&mut self, display: *mut Display, window: GLXWindow) { unsafe {
         self.libgl.glxSwapBuffers.unwrap()(display, window);
-    }
+    }}
 
     pub unsafe fn swap_interval(
         &mut self,
@@ -383,7 +383,7 @@ impl Glx {
         window: GLXWindow,
         ctx: GLXContext,
         interval: i32,
-    ) {
+    ) { unsafe {
         self.libgl.glxMakeCurrent.unwrap()(display, window, ctx);
 
         if self.extensions.glxSwapIntervalExt.is_some() {
@@ -391,7 +391,7 @@ impl Glx {
         } else if self.extensions.glxSwapIntervalMesa.is_some() {
             self.extensions.glxSwapIntervalMesa.unwrap()(interval);
         };
-    }
+    }}
 }
 
 // TODO: this code came a long way from sokol_app, better reimplement it!
@@ -402,7 +402,7 @@ unsafe fn choose_fbconfig(
     screen: i32,
     multisample: bool,
     desired_sample_count: i32,
-) -> GLXFBConfig {
+) -> GLXFBConfig { unsafe {
     let mut native_count: libc::c_int = 0;
     let mut usable_count;
     let mut trust_window_bit = true;
@@ -487,13 +487,13 @@ unsafe fn choose_fbconfig(
         (libx11.XFree)(native_configs as *mut libc::c_void);
     }
     result
-}
+}}
 
 pub unsafe extern "C" fn gl_choose_fbconfig(
     desired: *const GLFBConfig,
     alternatives: *const GLFBConfig,
     count: libc::c_uint,
-) -> *const GLFBConfig {
+) -> *const GLFBConfig { unsafe {
     let mut missing;
     let mut least_missing: i32 = 1000000;
     let mut color_diff;
@@ -584,4 +584,4 @@ pub unsafe extern "C" fn gl_choose_fbconfig(
         }
     }
     closest
-}
+}}

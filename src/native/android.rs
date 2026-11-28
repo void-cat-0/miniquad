@@ -16,17 +16,17 @@ pub use ndk_sys;
 
 pub mod ndk_utils;
 
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn JNI_OnLoad(
     vm: *mut ndk_sys::JavaVM,
     _: std::ffi::c_void,
-) -> ndk_sys::jint {
+) -> ndk_sys::jint { unsafe {
     VM = vm as *mut _ as _;
 
     ndk_sys::JNI_VERSION_1_6 as _
-}
+}}
 
-extern "C" {
+unsafe extern "C" {
     fn quad_main();
 }
 
@@ -106,37 +106,37 @@ fn send_message(message: Message) {
 pub static mut ACTIVITY: ndk_sys::jobject = std::ptr::null_mut();
 static mut VM: *mut ndk_sys::JavaVM = std::ptr::null_mut();
 
-pub unsafe fn console_debug(msg: *const ::core::ffi::c_char) {
+pub unsafe fn console_debug(msg: *const ::core::ffi::c_char) { unsafe {
     ndk_sys::__android_log_write(
         ndk_sys::android_LogPriority_ANDROID_LOG_DEBUG as _,
         b"SAPP\0".as_ptr() as _,
         msg,
     );
-}
+}}
 
-pub unsafe fn console_info(msg: *const ::core::ffi::c_char) {
+pub unsafe fn console_info(msg: *const ::core::ffi::c_char) { unsafe {
     ndk_sys::__android_log_write(
         ndk_sys::android_LogPriority_ANDROID_LOG_INFO as _,
         b"SAPP\0".as_ptr() as _,
         msg,
     );
-}
+}}
 
-pub unsafe fn console_warn(msg: *const ::core::ffi::c_char) {
+pub unsafe fn console_warn(msg: *const ::core::ffi::c_char) { unsafe {
     ndk_sys::__android_log_write(
         ndk_sys::android_LogPriority_ANDROID_LOG_WARN as _,
         b"SAPP\0".as_ptr() as _,
         msg,
     );
-}
+}}
 
-pub unsafe fn console_error(msg: *const ::core::ffi::c_char) {
+pub unsafe fn console_error(msg: *const ::core::ffi::c_char) { unsafe {
     ndk_sys::__android_log_write(
         ndk_sys::android_LogPriority_ANDROID_LOG_ERROR as _,
         b"SAPP\0".as_ptr() as _,
         msg,
     );
-}
+}}
 
 // fn log_info(message: &str) {
 //     use std::ffi::CString;
@@ -161,7 +161,7 @@ struct MainThreadState {
 }
 
 impl MainThreadState {
-    unsafe fn destroy_surface(&mut self) {
+    unsafe fn destroy_surface(&mut self) { unsafe {
         (self.libegl.eglMakeCurrent)(
             self.egl_display,
             std::ptr::null_mut(),
@@ -170,9 +170,9 @@ impl MainThreadState {
         );
         (self.libegl.eglDestroySurface)(self.egl_display, self.surface);
         self.surface = std::ptr::null_mut();
-    }
+    }}
 
-    unsafe fn update_surface(&mut self, window: *mut ndk_sys::ANativeWindow) {
+    unsafe fn update_surface(&mut self, window: *mut ndk_sys::ANativeWindow) { unsafe {
         if !self.window.is_null() {
             ndk_sys::ANativeWindow_release(self.window);
         }
@@ -198,7 +198,7 @@ impl MainThreadState {
         );
 
         assert!(res != 0);
-    }
+    }}
 
     fn process_message(&mut self, msg: Message) {
         match msg {
@@ -396,7 +396,7 @@ impl MainThreadState {
 /// TODO: Figure how to get into the thread destructor to correctly call Detach
 /// TODO: (this should be a GH issue)
 /// TODO: for reference - grep for "pthread_setspecific" in SDL2 sources, SDL fixed it!
-pub unsafe fn attach_jni_env() -> *mut ndk_sys::JNIEnv {
+pub unsafe fn attach_jni_env() -> *mut ndk_sys::JNIEnv { unsafe {
     let mut env: *mut ndk_sys::JNIEnv = std::ptr::null_mut();
     let attach_current_thread = (**VM).AttachCurrentThread.unwrap();
 
@@ -404,7 +404,7 @@ pub unsafe fn attach_jni_env() -> *mut ndk_sys::JNIEnv {
     assert!(res == 0);
 
     env
-}
+}}
 
 pub struct AndroidClipboard {}
 impl AndroidClipboard {
@@ -453,7 +453,7 @@ impl crate::native::Clipboard for AndroidClipboard {
 pub unsafe fn run<F>(conf: crate::conf::Conf, f: F)
 where
     F: 'static + FnOnce() -> Box<dyn EventHandler>,
-{
+{ unsafe {
     if conf.platform.android_panic_hook {
         use std::ffi::CString;
         use std::panic;
@@ -484,6 +484,7 @@ where
     MESSAGES_TX.with(move |messages_tx| *messages_tx.borrow_mut() = Some(tx2));
 
     thread::spawn(move || {
+        let _ = &f;
         let mut libegl = LibEgl::try_load().expect("Cant load LibEGL");
 
         // skip all the messages until android will be able to actually open a window
@@ -614,7 +615,7 @@ where
         (s.libegl.eglDestroyContext)(s.egl_display, s.egl_context);
         (s.libegl.eglTerminate)(s.egl_display);
     });
-}
+}}
 
 /// Adds a call to Receiver as if there was a `.recv_timeout_opt(timeout)`
 /// where the `timeout` arg is optional.
@@ -629,25 +630,25 @@ fn rx_recv<T>(
     }
 }
 
-#[no_mangle]
+#[unsafe(no_mangle)]
 extern "C" fn jni_on_load(vm: *mut std::ffi::c_void) {
     unsafe {
         VM = vm as _;
     }
 }
 
-unsafe fn create_native_window(surface: ndk_sys::jobject) -> *mut ndk_sys::ANativeWindow {
+unsafe fn create_native_window(surface: ndk_sys::jobject) -> *mut ndk_sys::ANativeWindow { unsafe {
     let env = attach_jni_env();
 
     ndk_sys::ANativeWindow_fromSurface(env, surface)
-}
+}}
 
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn Java_quad_1native_QuadNative_initializeContext(
     env: *mut ndk_sys::JNIEnv,
     _: ndk_sys::jobject,
     activity: ndk_sys::jobject,
-) {
+) { unsafe {
     let env = attach_jni_env();
     let activity_ref = (**env).NewGlobalRef.unwrap()(env, activity);
     ndk_context::initialize_android_context(std::mem::transmute(VM), activity_ref as _);
@@ -655,28 +656,28 @@ pub unsafe extern "C" fn Java_quad_1native_QuadNative_initializeContext(
     let mut env = unsafe { jni::JNIEnv::from_raw(env as *mut jni::sys::JNIEnv).unwrap() };
     let context = unsafe { jni::objects::JObject::from_raw(activity as jni::sys::jobject) };
     let _ = rustls_platform_verifier::android::init_with_env(&mut env, context);
-}
+}}
 
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn Java_quad_1native_QuadNative_releaseContext(
     _: *mut ndk_sys::JNIEnv,
     _: ndk_sys::jobject,
-) {
+) { unsafe {
     ndk_context::release_android_context();
-}
+}}
 
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn Java_quad_1native_QuadNative_activityOnCreate(
     _: *mut ndk_sys::JNIEnv,
     _: ndk_sys::jobject,
     activity: ndk_sys::jobject,
-) {
+) { unsafe {
     let env = attach_jni_env();
     ACTIVITY = (**env).NewGlobalRef.unwrap()(env, activity);
     quad_main();
-}
+}}
 
-#[no_mangle]
+#[unsafe(no_mangle)]
 unsafe extern "C" fn Java_quad_1native_QuadNative_activityOnResume(
     _: *mut ndk_sys::JNIEnv,
     _: ndk_sys::jobject,
@@ -684,7 +685,7 @@ unsafe extern "C" fn Java_quad_1native_QuadNative_activityOnResume(
     send_message(Message::Resume);
 }
 
-#[no_mangle]
+#[unsafe(no_mangle)]
 unsafe extern "C" fn Java_quad_1native_QuadNative_activityOnPause(
     _: *mut ndk_sys::JNIEnv,
     _: ndk_sys::jobject,
@@ -692,7 +693,7 @@ unsafe extern "C" fn Java_quad_1native_QuadNative_activityOnPause(
     send_message(Message::Pause);
 }
 
-#[no_mangle]
+#[unsafe(no_mangle)]
 unsafe extern "C" fn Java_quad_1native_QuadNative_activityOnDestroy(
     _: *mut ndk_sys::JNIEnv,
     _: ndk_sys::jobject,
@@ -700,7 +701,7 @@ unsafe extern "C" fn Java_quad_1native_QuadNative_activityOnDestroy(
     send_message(Message::Destroy);
 }
 
-#[no_mangle]
+#[unsafe(no_mangle)]
 extern "C" fn Java_quad_1native_QuadNative_surfaceOnSurfaceCreated(
     _: *mut ndk_sys::JNIEnv,
     _: ndk_sys::jobject,
@@ -710,7 +711,7 @@ extern "C" fn Java_quad_1native_QuadNative_surfaceOnSurfaceCreated(
     send_message(Message::SurfaceCreated { window });
 }
 
-#[no_mangle]
+#[unsafe(no_mangle)]
 extern "C" fn Java_quad_1native_QuadNative_surfaceOnSurfaceDestroyed(
     _: *mut ndk_sys::JNIEnv,
     _: ndk_sys::jobject,
@@ -718,7 +719,7 @@ extern "C" fn Java_quad_1native_QuadNative_surfaceOnSurfaceDestroyed(
     send_message(Message::SurfaceDestroyed);
 }
 
-#[no_mangle]
+#[unsafe(no_mangle)]
 extern "C" fn Java_quad_1native_QuadNative_surfaceOnSurfaceChanged(
     _: *mut ndk_sys::JNIEnv,
     _: ndk_sys::jobject,
@@ -732,7 +733,7 @@ extern "C" fn Java_quad_1native_QuadNative_surfaceOnSurfaceChanged(
     });
 }
 
-#[no_mangle]
+#[unsafe(no_mangle)]
 extern "C" fn Java_quad_1native_QuadNative_surfaceOnTouch(
     _: *mut ndk_sys::JNIEnv,
     _: ndk_sys::jobject,
@@ -759,7 +760,7 @@ extern "C" fn Java_quad_1native_QuadNative_surfaceOnTouch(
     });
 }
 
-#[no_mangle]
+#[unsafe(no_mangle)]
 extern "C" fn Java_quad_1native_QuadNative_surfaceOnKeyDown(
     _: *mut ndk_sys::JNIEnv,
     _: ndk_sys::jobject,
@@ -770,7 +771,7 @@ extern "C" fn Java_quad_1native_QuadNative_surfaceOnKeyDown(
     send_message(Message::KeyDown { keycode });
 }
 
-#[no_mangle]
+#[unsafe(no_mangle)]
 extern "C" fn Java_quad_1native_QuadNative_surfaceOnKeyUp(
     _: *mut ndk_sys::JNIEnv,
     _: ndk_sys::jobject,
@@ -781,7 +782,7 @@ extern "C" fn Java_quad_1native_QuadNative_surfaceOnKeyUp(
     send_message(Message::KeyUp { keycode });
 }
 
-#[no_mangle]
+#[unsafe(no_mangle)]
 extern "C" fn Java_quad_1native_QuadNative_surfaceOnCharacter(
     _: *mut ndk_sys::JNIEnv,
     _: ndk_sys::jobject,
@@ -792,31 +793,31 @@ extern "C" fn Java_quad_1native_QuadNative_surfaceOnCharacter(
     });
 }
 
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn Java_quad_1native_QuadNative_surfaceOnImePreedit(
     env: *mut ndk_sys::JNIEnv,
     _: ndk_sys::jobject,
     text: ndk_sys::jstring,
-) {
+) { unsafe {
     let s = jstring_to_string(env, text).unwrap_or_default();
     send_message(Message::ImePreedit(s));
-}
+}}
 
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn Java_quad_1native_QuadNative_surfaceOnImeCommit(
     env: *mut ndk_sys::JNIEnv,
     _: ndk_sys::jobject,
     text: ndk_sys::jstring,
-) {
+) { unsafe {
     let s = if text.is_null() {
         None
     } else {
         jstring_to_string(env, text)
     };
     send_message(Message::ImeCommit(s));
-}
+}}
 
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn Java_quad_1native_QuadNative_surfaceOnImeStateChanged(
     env: *mut ndk_sys::JNIEnv,
     _: ndk_sys::jclass,
@@ -826,7 +827,7 @@ pub unsafe extern "C" fn Java_quad_1native_QuadNative_surfaceOnImeStateChanged(
     composing_start: ndk_sys::jint,
     composing_end: ndk_sys::jint,
     element_id: ndk_sys::jlong,
-) {
+) { unsafe {
     let s = jstring_to_string(env, text).unwrap_or_default();
     let sel_start = if selection_start >= 0 { selection_start as usize } else { 0 };
     let sel_end = if selection_end >= 0 { selection_end as usize } else { 0 };
@@ -838,9 +839,9 @@ pub unsafe extern "C" fn Java_quad_1native_QuadNative_surfaceOnImeStateChanged(
         composing_end: if composing_end >= 0 { Some(composing_end as usize) } else { None },
         element_id: element_id as u64,
     });
-}
+}}
 
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn Java_quad_1native_QuadNative_surfaceOnKeyboard(
     _: *mut ndk_sys::JNIEnv,
     _: ndk_sys::jclass,
@@ -859,7 +860,7 @@ pub unsafe extern "C" fn Java_quad_1native_QuadNative_surfaceOnKeyboard(
     });
 }
 
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn Java_quad_1native_QuadNative_surfaceOnImeAction(
     _: *mut ndk_sys::JNIEnv,
     _: ndk_sys::jclass,
@@ -868,7 +869,7 @@ pub unsafe extern "C" fn Java_quad_1native_QuadNative_surfaceOnImeAction(
     send_message(Message::ImeAction(action_code as i32));
 }
 
-unsafe fn jstring_to_string(env: *mut ndk_sys::JNIEnv, jstr: ndk_sys::jstring) -> Option<String> {
+unsafe fn jstring_to_string(env: *mut ndk_sys::JNIEnv, jstr: ndk_sys::jstring) -> Option<String> { unsafe {
     if jstr.is_null() {
         return None;
     }
@@ -881,17 +882,17 @@ unsafe fn jstring_to_string(env: *mut ndk_sys::JNIEnv, jstr: ndk_sys::jstring) -
     let s = String::from_utf16_lossy(units);
     (**env).ReleaseStringChars.unwrap()(env, jstr, chars);
     Some(s)
-}
+}}
 
 /// A new local reference to a Java string with `text`'s contents.
-pub(crate) unsafe fn new_jstring(env: *mut ndk_sys::JNIEnv, text: &str) -> ndk_sys::jstring {
+pub(crate) unsafe fn new_jstring(env: *mut ndk_sys::JNIEnv, text: &str) -> ndk_sys::jstring { unsafe {
     let units: Vec<u16> = text.encode_utf16().collect();
     (**env).NewString.unwrap()(env, units.as_ptr(), units.len() as ndk_sys::jsize)
-}
+}}
 
-unsafe fn set_full_screen(env: *mut ndk_sys::JNIEnv, fullscreen: bool) {
+unsafe fn set_full_screen(env: *mut ndk_sys::JNIEnv, fullscreen: bool) { unsafe {
     ndk_utils::call_void_method!(env, ACTIVITY, "setFullScreen", "(Z)V", fullscreen as i32);
-}
+}}
 
 #[repr(C)]
 #[derive(Debug, Copy, Clone)]
@@ -903,14 +904,14 @@ pub struct android_asset {
 // According to documentation, AAssetManager_fromJava is as available as an
 // AAssetManager_open, which was used before
 // For some reason it is missing fron ndk_sys binding
-extern "C" {
+unsafe extern "C" {
     pub fn AAssetManager_fromJava(
         env: *mut ndk_sys::JNIEnv,
         assetManager: ndk_sys::jobject,
     ) -> *mut ndk_sys::AAssetManager;
 }
 
-pub(crate) unsafe fn load_asset(filepath: *const ::core::ffi::c_char, out: *mut android_asset) {
+pub(crate) unsafe fn load_asset(filepath: *const ::core::ffi::c_char, out: *mut android_asset) { unsafe {
     let env = attach_jni_env();
 
     let get_method_id = (**env).GetMethodID.unwrap();
@@ -938,4 +939,4 @@ pub(crate) unsafe fn load_asset(filepath: *const ::core::ffi::c_char, out: *mut 
         (*out).content_length = length as _;
         (*out).content = buffer as _;
     }
-}
+}}

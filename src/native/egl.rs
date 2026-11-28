@@ -172,7 +172,7 @@ pub unsafe fn create_egl_context(
     display: *mut std::ffi::c_void,
     alpha: bool,
     sample_count: i32,
-) -> Result<(EGLContext, EGLConfig, EGLDisplay), EglError> {
+) -> Result<(EGLContext, EGLConfig, EGLDisplay), EglError> { unsafe {
     let display = (egl.eglGetDisplay)(display as _);
     if display.is_null() {
         // == EGL_NO_DISPLAY
@@ -249,4 +249,4 @@ pub unsafe fn create_egl_context(
     }
 
     Ok((context, config, display))
-}
+}}

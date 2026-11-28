@@ -67,7 +67,7 @@ impl LibXi {
         &mut self,
         libx11: &mut libx11::LibX11,
         display: *mut Display,
-    ) {
+    ) { unsafe {
         let mut ev = 0;
         let mut err = 0;
         let mut xi_opcode = 0;
@@ -109,14 +109,14 @@ impl LibXi {
             1 as libc::c_int,
         );
         self.xi_extension_opcode = Some(xi_opcode);
-    }
+    }}
 
     /// Get mouse delta from XI_RawMotion's event XGenericEventCookie data
     pub unsafe fn read_cookie(
         &mut self,
         xcookie: &mut libx11::XGenericEventCookie,
         display: *mut Display,
-    ) -> (f64, f64) {
+    ) -> (f64, f64) { unsafe {
         assert!(xcookie.evtype == xi_input::XI_RawMotion);
 
         (self.XGetEventData)(display, xcookie);
@@ -131,5 +131,5 @@ impl LibXi {
         (self.XFreeEventData)(display, &mut (*xcookie) as *mut _);
 
         (dx, dy)
-    }
+    }}
 }

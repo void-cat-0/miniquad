@@ -69,7 +69,7 @@ const CPS_CANCEL: DWORD = 0x0004;
 // the application's inline preedit during a session.
 const ISC_SHOWUICOMPOSITIONWINDOW: LPARAM = 0x80000000u32 as LPARAM;
 
-unsafe fn ime_apply_rect(hwnd: HWND) {
+unsafe fn ime_apply_rect(hwnd: HWND) { unsafe {
     let Some((left, top, right, bottom)) = *IME_RECT.lock().unwrap() else {
         return;
     };
@@ -97,17 +97,17 @@ unsafe fn ime_apply_rect(hwnd: HWND) {
     };
     ImmSetCandidateWindow(himc, &cand_form);
     ImmReleaseContext(hwnd, himc);
-}
+}}
 
-unsafe fn ime_cancel_composition(hwnd: HWND) {
+unsafe fn ime_cancel_composition(hwnd: HWND) { unsafe {
     let himc = ImmGetContext(hwnd);
     if !himc.is_null() {
         ImmNotifyIME(himc, NI_COMPOSITIONSTR, CPS_CANCEL, 0);
         ImmReleaseContext(hwnd, himc);
     }
-}
+}}
 
-unsafe fn composition_string(himc: HIMC, kind: DWORD) -> Option<String> {
+unsafe fn composition_string(himc: HIMC, kind: DWORD) -> Option<String> { unsafe {
     let len = ImmGetCompositionStringW(himc, kind, std::ptr::null_mut(), 0);
     if len <= 0 {
         return None;
@@ -115,7 +115,7 @@ unsafe fn composition_string(himc: HIMC, kind: DWORD) -> Option<String> {
     let mut buffer: Vec<u16> = vec![0; len as usize / 2];
     ImmGetCompositionStringW(himc, kind, buffer.as_mut_ptr() as *mut _, len as u32);
     Some(String::from_utf16_lossy(&buffer))
-}
+}}
 
 const WHEEL_DELTA: f32 = 120.0;
 
@@ -140,7 +140,7 @@ struct CANDIDATEFORM {
 
 // Link to imm32.dll for IME support
 #[link(name = "imm32")]
-extern "system" {
+unsafe extern "system" {
     fn ImmGetCompositionStringW(himc: HIMC, index: DWORD, buf: *mut std::ffi::c_void, len: DWORD) -> i32;
     fn ImmAssociateContextEx(hwnd: HWND, himc: HIMC, flags: DWORD) -> i32;
     fn ImmSetCompositionWindow(himc: HIMC, lpCompForm: *const COMPOSITIONFORM) -> i32;
@@ -377,7 +377,7 @@ fn get_win_style(is_fullscreen: bool, is_resizable: bool) -> DWORD {
     }
 }
 
-unsafe fn update_clip_rect(hwnd: HWND) {
+unsafe fn update_clip_rect(hwnd: HWND) { unsafe {
     // Retrieve the screen coordinates of the client area,
     // and convert them into client coordinates.
     let mut rect: RECT = std::mem::zeroed();
@@ -403,9 +403,9 @@ unsafe fn update_clip_rect(hwnd: HWND) {
         lower_right.y,
     );
     ClipCursor(&mut rect as *mut _ as _);
-}
+}}
 
-unsafe fn convert_to_absolute(hwnd: HWND, x: i32, y: i32) -> (f32, f32) {
+unsafe fn convert_to_absolute(hwnd: HWND, x: i32, y: i32) -> (f32, f32) { unsafe {
     let mut rect: RECT = std::mem::zeroed();
     GetClientRect(hwnd, &mut rect as *mut _ as _);
     let mut upper_left = POINT {
@@ -416,7 +416,7 @@ unsafe fn convert_to_absolute(hwnd: HWND, x: i32, y: i32) -> (f32, f32) {
     let x = x - upper_left.x;
     let y = y - upper_left.y;
     (x as f32, y as f32)
-}
+}}
 
 fn get_uptime() -> f64 {
     let start = SystemTime::UNIX_EPOCH;
@@ -425,7 +425,7 @@ fn get_uptime() -> f64 {
     duration.as_secs() as f64 + duration.subsec_nanos() as f64 * 1e-9
 }
 
-unsafe fn key_mods() -> KeyMods {
+unsafe fn key_mods() -> KeyMods { unsafe {
     let mut mods = KeyMods::default();
 
     if GetKeyState(VK_SHIFT) as u32 & (1u32 << 31) != 0 {
@@ -442,14 +442,14 @@ unsafe fn key_mods() -> KeyMods {
     }
 
     mods
-}
+}}
 
 unsafe extern "system" fn win32_wndproc(
     hwnd: HWND,
     umsg: UINT,
     wparam: WPARAM,
     lparam: LPARAM,
-) -> LRESULT {
+) -> LRESULT { unsafe {
     let display_ptr: isize;
 
     #[cfg(target_pointer_width = "64")]
@@ -905,9 +905,9 @@ unsafe extern "system" fn win32_wndproc(
     }
 
     DefWindowProcW(hwnd, umsg, wparam, lparam)
-}
+}}
 
-unsafe fn create_win_icon_from_image(width: u32, height: u32, colors: &[u8]) -> Option<HICON> {
+unsafe fn create_win_icon_from_image(width: u32, height: u32, colors: &[u8]) -> Option<HICON> { unsafe {
     let mut bi: BITMAPV5HEADER = std::mem::zeroed();
 
     bi.bV5Size = std::mem::size_of::<BITMAPV5HEADER>() as _;
@@ -963,9 +963,9 @@ unsafe fn create_win_icon_from_image(width: u32, height: u32, colors: &[u8]) -> 
     DeleteObject(mask as *mut _);
 
     Some(icon_handle)
-}
+}}
 
-unsafe fn set_icon(wnd: HWND, icon: &Icon) {
+unsafe fn set_icon(wnd: HWND, icon: &Icon) { unsafe {
     let big_icon_w = GetSystemMetrics(SM_CXICON);
     let big_icon_h = GetSystemMetrics(SM_CYICON);
     let small_icon_w = GetSystemMetrics(SM_CXSMICON);
@@ -991,7 +991,7 @@ unsafe fn set_icon(wnd: HWND, icon: &Icon) {
     if let Some(icon) = small_icon {
         SendMessageW(wnd, WM_SETICON, ICON_SMALL as _, icon as LPARAM);
     }
-}
+}}
 
 unsafe fn create_window(
     window_title: &str,
@@ -999,7 +999,7 @@ unsafe fn create_window(
     resizable: bool,
     width: i32,
     height: i32,
-) -> (HWND, HDC) {
+) -> (HWND, HDC) { unsafe {
     let mut wndclassw: WNDCLASSW = std::mem::zeroed();
 
     // CS_OWNDC is required for OpenGL
@@ -1076,9 +1076,9 @@ unsafe fn create_window(
     DragAcceptFiles(hwnd, TRUE);
 
     (hwnd, dc)
-}
+}}
 
-unsafe fn create_msg_window() -> (HWND, HDC) {
+unsafe fn create_msg_window() -> (HWND, HDC) { unsafe {
     // Use a separate window class to avoid interfering with main window's IME
     let class_name = "MINIQUADMSGWND\0".encode_utf16().collect::<Vec<u16>>();
     
@@ -1127,10 +1127,10 @@ unsafe fn create_msg_window() -> (HWND, HDC) {
     );
 
     (msg_hwnd, msg_dc)
-}
+}}
 
 impl WindowsDisplay {
-    unsafe fn get_proc_address(&mut self, proc: &str) -> Option<unsafe extern "C" fn() -> ()> {
+    unsafe fn get_proc_address(&mut self, proc: &str) -> Option<unsafe extern "C" fn() -> ()> { unsafe {
         let proc = std::ffi::CString::new(proc).unwrap();
         let mut proc_ptr = (self.libopengl32.wglGetProcAddress)(proc.as_ptr());
         if proc_ptr.is_null() {
@@ -1144,12 +1144,12 @@ impl WindowsDisplay {
             *mut winapi::shared::minwindef::__some_function,
             unsafe extern "C" fn(),
         >(proc_ptr))
-    }
+    }}
 
     /// updates current window and framebuffer size from the window's client rect,
     /// and window position from the window's rect.
     /// returns true if size or position has changed
-    unsafe fn update_dimensions(&mut self, hwnd: HWND) -> bool {
+    unsafe fn update_dimensions(&mut self, hwnd: HWND) -> bool { unsafe {
         let mut d = crate::native_display().lock().unwrap();
         let mut rect: RECT = std::mem::zeroed();
 
@@ -1191,9 +1191,9 @@ impl WindowsDisplay {
         }
 
         false
-    }
+    }}
 
-    unsafe fn init_dpi(&mut self, high_dpi: bool) {
+    unsafe fn init_dpi(&mut self, high_dpi: bool) { unsafe {
         self.dpi_aware = high_dpi;
         // get dpi scale factor for main monitor
         if self.dpi_aware {
@@ -1218,7 +1218,7 @@ impl WindowsDisplay {
             self.content_scale = 1.0;
             self.mouse_scale = 1.0 / self.window_scale;
         }
-    }
+    }}
 
     fn process_request(&mut self, request: Request) {
         use Request::*;

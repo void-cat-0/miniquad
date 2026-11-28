@@ -201,7 +201,7 @@ pub struct Wgl {
     arb_pixel_format: bool,
 }
 
-unsafe fn get_wgl_proc_address<T>(libopengl32: &mut LibOpengl32, proc: &str) -> Option<T> {
+unsafe fn get_wgl_proc_address<T>(libopengl32: &mut LibOpengl32, proc: &str) -> Option<T> { unsafe {
     let proc = std::ffi::CString::new(proc).unwrap();
     let proc = (libopengl32.wglGetProcAddress)(proc.as_ptr() as *const _);
 
@@ -209,10 +209,10 @@ unsafe fn get_wgl_proc_address<T>(libopengl32: &mut LibOpengl32, proc: &str) -> 
         return None;
     }
     Some(std::mem::transmute_copy(&proc))
-}
+}}
 
 impl Wgl {
-    pub(crate) unsafe fn new(display: &mut WindowsDisplay) -> Wgl {
+    pub(crate) unsafe fn new(display: &mut WindowsDisplay) -> Wgl { unsafe {
         let mut pfd: PIXELFORMATDESCRIPTOR = std::mem::zeroed();
         pfd.nSize = std::mem::size_of_val(&pfd) as _;
         pfd.nVersion = 1;
@@ -293,7 +293,7 @@ impl Wgl {
             ext_swap_control,
             arb_pixel_format,
         }
-    }
+    }}
 
     unsafe fn wgl_attrib(
         &self,
@@ -315,7 +315,7 @@ impl Wgl {
         value
     }
 
-    unsafe fn wgl_find_pixel_format(&self, display: &mut WindowsDisplay, sample_count: i32) -> u32 {
+    unsafe fn wgl_find_pixel_format(&self, display: &mut WindowsDisplay, sample_count: i32) -> u32 { unsafe {
         let native_count = self.wgl_attrib(display, 1, WGL_NUMBER_PIXEL_FORMATS_ARB as _);
         let mut usable_configs = vec![GlFbconfig::default(); native_count as usize];
 
@@ -372,14 +372,14 @@ impl Wgl {
             }
         }
         pixel_format
-    }
+    }}
 
     pub(crate) unsafe fn create_context(
         &mut self,
         display: &mut WindowsDisplay,
         sample_count: i32,
         swap_interval: i32,
-    ) -> HGLRC {
+    ) -> HGLRC { unsafe {
         let pixel_format = self.wgl_find_pixel_format(display, sample_count);
         if 0 == pixel_format {
             panic!("WGL: Didn't find matching pixel format.");
@@ -465,5 +465,5 @@ impl Wgl {
         }
 
         gl_ctx
-    }
+    }}
 }

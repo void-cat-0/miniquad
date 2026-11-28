@@ -30,7 +30,7 @@ pub(super) enum Decorations {
 
 // If we use client decorations, `libdecor` will handle the creation for us.
 // So this is used for either server or no decorations.
-unsafe fn create_xdg_toplevel(display: &mut WaylandPayload) {
+unsafe fn create_xdg_toplevel(display: &mut WaylandPayload) { unsafe {
     let xdg_surface: *mut xdg_surface = wl_request_constructor!(
         display.client,
         display.xdg_wm_base,
@@ -57,7 +57,7 @@ unsafe fn create_xdg_toplevel(display: &mut WaylandPayload) {
         &XDG_TOPLEVEL_LISTENER as *const _ as _,
         display as *mut _ as _,
     );
-}
+}}
 
 impl Decorations {
     pub(super) fn new(display: &mut WaylandPayload, conf: &crate::conf::Conf) -> Self {
@@ -82,7 +82,7 @@ impl Decorations {
         client: &mut LibWaylandClient,
         xdg_toplevel: *mut xdg_toplevel,
         title: &str,
-    ) {
+    ) { unsafe {
         let title = std::ffi::CString::new(title).unwrap();
         match self {
             Decorations::None | Decorations::Server | Decorations::Fallback(..) => {
@@ -99,14 +99,14 @@ impl Decorations {
                 (libdecor.libdecor_frame_set_title)(*frame, title.as_ptr());
             }
         }
-    }
+    }}
 
-    unsafe fn none(display: &mut WaylandPayload) -> Self {
+    unsafe fn none(display: &mut WaylandPayload) -> Self { unsafe {
         create_xdg_toplevel(display);
         Decorations::None
-    }
+    }}
 
-    unsafe fn fallback(display: &mut WaylandPayload) -> Self {
+    unsafe fn fallback(display: &mut WaylandPayload) -> Self { unsafe {
         create_xdg_toplevel(display);
         let d = crate::native_display().lock().unwrap();
         let dpi_scale = d.dpi_scale as i32;
@@ -116,9 +116,9 @@ impl Decorations {
             d.screen_height / dpi_scale,
         );
         Decorations::Fallback(decorations)
-    }
+    }}
 
-    unsafe fn server(display: &mut WaylandPayload) -> Self {
+    unsafe fn server(display: &mut WaylandPayload) -> Self { unsafe {
         create_xdg_toplevel(display);
 
         let server_decoration: *mut extensions::xdg_decoration::zxdg_toplevel_decoration_v1 = wl_request_constructor!(
@@ -137,10 +137,10 @@ impl Decorations {
             extensions::xdg_decoration::ZXDG_TOPLEVEL_DECORATION_V1_MODE_SERVER_SIDE
         );
         Decorations::Server
-    }
+    }}
 
-    unsafe fn try_libdecor(display: &mut WaylandPayload, resizable: bool) -> Self {
-        if let Ok(libdecor) = LibDecor::try_load() {
+    unsafe fn try_libdecor(display: &mut WaylandPayload, resizable: bool) -> Self { unsafe {
+        match LibDecor::try_load() { Ok(libdecor) => {
             let context = (libdecor.libdecor_new)(display.display, &mut LIBDECOR_INTERFACE as _);
             let frame = (libdecor.libdecor_decorate)(
                 context,
@@ -161,10 +161,10 @@ impl Decorations {
                 context,
                 frame,
             }
-        } else {
+        } _ => {
             Decorations::none(display)
-        }
-    }
+        }}
+    }}
 
     fn libdecor(&mut self) -> Option<&mut LibDecor> {
         if let Decorations::LibDecor { libdecor, .. } = self {
@@ -179,7 +179,7 @@ unsafe extern "C" fn xdg_surface_handle_configure(
     data: *mut std::ffi::c_void,
     xdg_surface: *mut extensions::xdg_shell::xdg_surface,
     serial: u32,
-) {
+) { unsafe {
     assert!(!data.is_null());
     let payload: &mut WaylandPayload = &mut *(data as *mut _);
 
@@ -190,9 +190,9 @@ unsafe extern "C" fn xdg_surface_handle_configure(
         serial
     );
     wl_request!(payload.client, payload.surface, WL_SURFACE_COMMIT)
-}
+}}
 
-unsafe extern "C" fn handle_configure(data: *mut std::ffi::c_void, width: i32, height: i32) {
+unsafe extern "C" fn handle_configure(data: *mut std::ffi::c_void, width: i32, height: i32) { unsafe {
     assert!(!data.is_null());
     let payload: &mut WaylandPayload = &mut *(data as *mut _);
 
@@ -239,7 +239,7 @@ unsafe extern "C" fn handle_configure(data: *mut std::ffi::c_void, width: i32, h
                 .push(WaylandEvent::Resize(screen_width as _, screen_height as _));
         }
     }
-}
+}}
 
 unsafe extern "C" fn xdg_toplevel_handle_configure(
     data: *mut std::ffi::c_void,
@@ -247,15 +247,15 @@ unsafe extern "C" fn xdg_toplevel_handle_configure(
     width: i32,
     height: i32,
     _states: *mut wl_array,
-) {
+) { unsafe {
     handle_configure(data, width, height);
-}
+}}
 
 unsafe extern "C" fn libdecor_frame_handle_configure(
     frame: *mut libdecor_frame,
     configuration: *mut libdecor_configuration,
     data: *mut c_void,
-) {
+) { unsafe {
     let display: &mut WaylandPayload = &mut *(data as *mut _);
     let libdecor = display.decorations.libdecor().unwrap();
 
@@ -279,7 +279,7 @@ unsafe extern "C" fn libdecor_frame_handle_configure(
     (libdecor.libdecor_state_free)(state);
 
     handle_configure(data, width, height);
-}
+}}
 
 unsafe extern "C" fn xdg_toplevel_handle_close(
     _data: *mut std::ffi::c_void,
@@ -298,10 +298,10 @@ unsafe extern "C" fn libdecor_handle_error(
     _context: *mut libdecor,
     _error: *mut libdecor_error,
     message: *const c_char,
-) {
+) { unsafe {
     let message = core::ffi::CStr::from_ptr(message).to_str().unwrap();
     eprintln!("{}", message);
-}
+}}
 static mut LIBDECOR_INTERFACE: libdecor_interface = libdecor_interface {
     error: libdecor_handle_error,
 };
@@ -355,7 +355,7 @@ mod fallback {
         y: i32,
         w: i32,
         h: i32,
-    ) -> Decoration {
+    ) -> Decoration { unsafe {
         let surface = wl_request_constructor!(
             display.client,
             compositor,
@@ -391,7 +391,7 @@ mod fallback {
             subsurface,
             viewport,
         }
-    }
+    }}
 
     impl Decorations {
         pub const WIDTH: i32 = 2;
@@ -401,7 +401,7 @@ mod fallback {
             display: &mut WaylandPayload,
             width: i32,
             height: i32,
-        ) -> Decorations {
+        ) -> Decorations { unsafe {
             let buffer = shm::create_shm_buffer(
                 &mut display.client,
                 display.shm,
@@ -457,9 +457,9 @@ mod fallback {
                     Self::WIDTH,
                 ),
             }
-        }
+        }}
 
-        pub unsafe fn resize(&self, client: &mut LibWaylandClient, width: i32, height: i32) {
+        pub unsafe fn resize(&self, client: &mut LibWaylandClient, width: i32, height: i32) { unsafe {
             wl_request!(
                 client,
                 self.top_decoration.viewport,
@@ -509,6 +509,6 @@ mod fallback {
                 Self::WIDTH
             );
             wl_request!(client, self.bottom_decoration.surface, WL_SURFACE_COMMIT);
-        }
+        }}
     }
 }

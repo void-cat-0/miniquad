@@ -112,12 +112,12 @@ pub fn load_undocumented_cursor(cursor_name: &str) -> ObjcId {
     }
 }
 
-pub unsafe fn ccfstr_from_str(inp: &str) -> CFStringRef {
+pub unsafe fn ccfstr_from_str(inp: &str) -> CFStringRef { unsafe {
     let null = format!("{}\0", inp);
     __CFStringMakeConstantString(null.as_ptr() as *const ::core::ffi::c_char)
-}
+}}
 
-pub unsafe fn cfstring_ref_to_string(cfstring: CFStringRef) -> String {
+pub unsafe fn cfstring_ref_to_string(cfstring: CFStringRef) -> String { unsafe {
     let length = CFStringGetLength(cfstring);
     let range = CFRange {
         location: 0,
@@ -149,7 +149,7 @@ pub unsafe fn cfstring_ref_to_string(cfstring: CFStringRef) -> String {
         std::ptr::null_mut::<u64>(),
     );
     String::from_utf8(buffer).unwrap_or_default()
-}
+}}
 
 pub fn load_webkit_cursor(cursor_name_str: &str) -> ObjcId {
     unsafe {
@@ -652,11 +652,11 @@ pub fn load_mouse_cursor(cursor: CursorIcon) -> ObjcId {
 // }
 
 macro_rules! msg_send_ {
-    ($obj:expr, $name:ident) => ({
+    ($obj:expr_2021, $name:ident) => ({
         let res: ObjcId = msg_send!($obj, $name);
         res
     });
-    ($obj:expr, $($name:ident : $arg:expr)+) => ({
+    ($obj:expr_2021, $($name:ident : $arg:expr_2021)+) => ({
         let res: ObjcId = msg_send!($obj, $($name: $arg)*);
         res
     });

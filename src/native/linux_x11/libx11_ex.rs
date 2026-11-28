@@ -2,7 +2,7 @@
 use super::*;
 
 impl LibX11 {
-    pub unsafe fn update_system_dpi(&mut self, display: *mut Display) -> f32 {
+    pub unsafe fn update_system_dpi(&mut self, display: *mut Display) -> f32 { unsafe {
         let mut dpi_scale = 1.;
         let rms = (self.XResourceManagerString)(display);
         if !rms.is_null() {
@@ -29,44 +29,44 @@ impl LibX11 {
             }
         };
         dpi_scale
-    }
+    }}
 
-    pub unsafe fn grab_error_handler(&mut self) {
+    pub unsafe fn grab_error_handler(&mut self) { unsafe {
         pub unsafe extern "C" fn _sapp_x11_error_handler(
             mut _display: *mut Display,
             event: *mut XErrorEvent,
-        ) -> libc::c_int {
+        ) -> libc::c_int { unsafe {
             eprintln!("Error: {}", (*event).error_code);
             0 as libc::c_int
-        }
+        }}
 
         (self.XSetErrorHandler)(Some(
             _sapp_x11_error_handler
                 as unsafe extern "C" fn(_: *mut Display, _: *mut XErrorEvent) -> libc::c_int,
         ));
-    }
+    }}
 
-    pub unsafe fn release_error_handler(&mut self, display: *mut Display) {
+    pub unsafe fn release_error_handler(&mut self, display: *mut Display) { unsafe {
         (self.XSync)(display, false as _);
         (self.XSetErrorHandler)(None);
-    }
+    }}
 
     pub unsafe fn query_window_size(
         &mut self,
         display: *mut Display,
         window: Window,
-    ) -> (i32, i32) {
+    ) -> (i32, i32) { unsafe {
         let mut attribs: XWindowAttributes = std::mem::zeroed();
         (self.XGetWindowAttributes)(display, window, &mut attribs);
         (attribs.width, attribs.height)
-    }
+    }}
 
     pub unsafe fn update_window_title(
         &mut self,
         display: *mut Display,
         window: Window,
         title: &str,
-    ) {
+    ) { unsafe {
         let c_title = std::ffi::CString::new(title).unwrap();
 
         (self.Xutf8SetWMProperties)(
@@ -101,14 +101,14 @@ impl LibX11 {
             c_title.as_bytes().len() as libc::c_int,
         );
         (self.XFlush)(display);
-    }
+    }}
 
     pub unsafe fn update_window_icon(
         &mut self,
         display: *mut Display,
         window: Window,
         icon: &crate::conf::Icon,
-    ) {
+    ) { unsafe {
         let bytes_length = (icon.small.len() + icon.medium.len() + icon.big.len()) / 4 + 3 * 2;
 
         // "This is an array of 32bit packed CARDINAL ARGB" (c) freedesktop
@@ -149,7 +149,7 @@ impl LibX11 {
             icon_bytes.as_mut_ptr() as *mut _ as *mut _,
             icon_bytes.len() as _,
         );
-    }
+    }}
 
     pub unsafe fn create_window(
         &mut self,
@@ -158,7 +158,7 @@ impl LibX11 {
         visual: *mut Visual,
         depth: libc::c_int,
         conf: &crate::conf::Conf,
-    ) -> Window {
+    ) -> Window { unsafe {
         let mut wa = XSetWindowAttributes {
             background_pixmap: 0,
             background_pixel: 0,
@@ -249,11 +249,11 @@ impl LibX11 {
         self.update_window_title(display, window, &conf.window_title);
 
         window
-    }
+    }}
 
-    pub unsafe fn show_window(&mut self, display: *mut Display, window: Window) {
+    pub unsafe fn show_window(&mut self, display: *mut Display, window: Window) { unsafe {
         (self.XMapWindow)(display, window);
         (self.XRaiseWindow)(display, window);
         (self.XFlush)(display);
-    }
+    }}
 }

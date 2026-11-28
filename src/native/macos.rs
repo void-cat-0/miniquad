@@ -595,12 +595,12 @@ pub fn define_cocoa_window_delegate() -> *const Class {
     decl.register()
 }
 
-unsafe fn get_proc_address(name: *const u8) -> Option<unsafe extern "C" fn()> {
+unsafe fn get_proc_address(name: *const u8) -> Option<unsafe extern "C" fn()> { unsafe {
     mod libc {
         use std::ffi::{c_char, c_int, c_void};
 
         pub const RTLD_LAZY: c_int = 1;
-        extern "C" {
+        unsafe extern "C" {
             pub fn dlopen(filename: *const c_char, flag: c_int) -> *mut c_void;
             pub fn dlsym(handle: *mut c_void, symbol: *const c_char) -> *mut c_void;
         }
@@ -621,10 +621,10 @@ unsafe fn get_proc_address(name: *const u8) -> Option<unsafe extern "C" fn()> {
         return None;
     }
     Some(unsafe { std::mem::transmute_copy(&symbol) })
-}
+}}
 
 // methods for both metal or OPENGL view
-unsafe fn view_base_decl(decl: &mut ClassDecl) {
+unsafe fn view_base_decl(decl: &mut ClassDecl) { unsafe {
     extern "C" fn mouse_moved(this: &Object, _sel: Sel, event: ObjcId) {
         let payload = get_window_payload(this);
 
@@ -1267,7 +1267,7 @@ unsafe fn view_base_decl(decl: &mut ClassDecl) {
         first_rect_for_character_range_single
             as extern "C" fn(&Object, Sel, NSRange) -> NSRect,
     );
-}
+}}
 
 pub fn define_opengl_view_class() -> *const Class {
     extern "C" fn reshape(this: &Object, _sel: Sel) {
@@ -1367,7 +1367,7 @@ fn get_window_payload(this: &Object) -> &mut MacosDisplay {
     }
 }
 
-unsafe fn create_metal_view(_: &mut MacosDisplay, sample_count: i32, _: bool) -> ObjcId {
+unsafe fn create_metal_view(_: &mut MacosDisplay, sample_count: i32, _: bool) -> ObjcId { unsafe {
     let mtl_device_obj = MTLCreateSystemDefaultDevice();
     let view_class = define_metal_view_class();
     let view: ObjcId = msg_send![view_class, alloc];
@@ -1383,7 +1383,7 @@ unsafe fn create_metal_view(_: &mut MacosDisplay, sample_count: i32, _: bool) ->
     let () = msg_send![view, setPaused: true];
 
     view
-}
+}}
 
 #[allow(clippy::vec_init_then_push)]
 unsafe fn create_opengl_view(
@@ -1571,11 +1571,11 @@ impl Drop for FramePacer {
     }
 }
 
-unsafe extern "C" fn release_data(info: *mut c_void, _: *const c_void, _: usize) {
+unsafe extern "C" fn release_data(info: *mut c_void, _: *const c_void, _: usize) { unsafe {
     drop(Box::from_raw(info as *mut &[u8]));
-}
+}}
 
-unsafe fn set_icon(ns_app: ObjcId, icon: &Icon) {
+unsafe fn set_icon(ns_app: ObjcId, icon: &Icon) { unsafe {
     let width = 64_usize;
     let height = 64_usize;
     let colors = &icon.big[..];
@@ -1614,7 +1614,7 @@ unsafe fn set_icon(ns_app: ObjcId, icon: &Icon) {
     CGDataProviderRelease(provider);
     CGColorSpaceRelease(rgb);
     CGImageRelease(image);
-}
+}}
 
 /// Initialize the system menu bar for this application
 /// - ns_app: This NSApplication

@@ -13,7 +13,7 @@ unsafe fn get_clipboard(
     display: *mut Display,
     window: Window,
     format: Atom,
-) -> Option<Vec<u8>> {
+) -> Option<Vec<u8>> { unsafe {
     // We ask X server to ask current clipboard owner to convert selection to the desired format
     // Selection owner is other X11 application and if it will not satisfy our request for any reason -
     // we will wait for appropriate event forever
@@ -46,7 +46,7 @@ unsafe fn get_clipboard(
             respond_to_clipboard_request(libx11, display, &mut event as *mut _);
         }
     }
-}
+}}
 
 /// Get the bytes from the window property
 /// INCR protocol is implemented; will block until all data are received
@@ -63,7 +63,7 @@ pub(crate) unsafe fn get_property_bytes(
     display: *mut Display,
     window: Window,
     property: Atom,
-) -> Vec<u8> {
+) -> Vec<u8> { unsafe {
     let mut bytes = Vec::new();
     let mut buf = std::ptr::null_mut::<libc::c_char>();
     let mut size: libc::c_ulong = 0;
@@ -125,7 +125,7 @@ pub(crate) unsafe fn get_property_bytes(
             }
         }
     }
-}
+}}
 
 // Next message for clipboard request
 static mut MESSAGE: Option<String> = None;
@@ -137,7 +137,7 @@ unsafe fn claim_clipboard_ownership(
     display: *mut Display,
     window: Window,
     message: String,
-) {
+) { unsafe {
     (libx11.XSetSelectionOwner)(
         display,
         libx11.extensions.clipboard,
@@ -146,7 +146,7 @@ unsafe fn claim_clipboard_ownership(
     );
 
     MESSAGE = Some(message);
-}
+}}
 
 /// this function is supposed to be called from sapp's event loop
 /// when XSelectionEvent received.
@@ -155,11 +155,11 @@ pub(crate) unsafe fn respond_to_clipboard_request(
     libx11: &mut LibX11,
     display: *mut Display,
     event: *const XEvent,
-) {
+) { unsafe {
     assert!((*event).type_0 == SelectionRequest); // is it really SelectionRequest
 
     let empty_message = String::new();
-    let message = MESSAGE.as_ref().unwrap_or(&empty_message);
+    let message = (*std::ptr::addr_of!(MESSAGE)).as_ref().unwrap_or(&empty_message);
 
     let utf8_string = libx11.extensions.utf8_string;
     let xselectionrequest = (*event).xselectionrequest;
@@ -207,7 +207,7 @@ pub(crate) unsafe fn respond_to_clipboard_request(
             &mut ev as *mut XSelectionEvent as *mut XEvent,
         );
     }
-}
+}}
 
 pub struct X11Clipboard {
     libx11: LibX11,

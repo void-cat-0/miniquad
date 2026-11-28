@@ -103,7 +103,7 @@ impl WaylandPayload {
         &mut self,
         key: core::ffi::c_uint,
         repeat: bool,
-    ) {
+    ) { unsafe {
         let libxkb = &mut self.xkb;
         let keymap = &self.keymap;
         let xkb_state = self.xkb_state;
@@ -194,12 +194,12 @@ impl WaylandPayload {
                 self.events.push(WaylandEvent::Char(chr, keymods, repeat));
             }
         }
-    }
+    }}
     /// Poll new events, `blocking` specifies whether it should block until a new event is
     /// available
     // needs to combine both the Wayland events and the key repeat events
     // the implementation is translated from glfw
-    unsafe fn poll_new_event(&mut self, blocking: bool) {
+    unsafe fn poll_new_event(&mut self, blocking: bool) { unsafe {
         let mut fds = [
             libc::pollfd {
                 fd: (self.client.wl_display_get_fd)(self.display),
@@ -273,8 +273,8 @@ impl WaylandPayload {
                 panic!("Wayland display error with code {}", errno)
             }
         }
-    }
-    unsafe fn init_data_device(&mut self) {
+    }}
+    unsafe fn init_data_device(&mut self) { unsafe {
         self.data_device = wl_request_constructor!(
             self.client,
             self.data_device_manager,
@@ -293,8 +293,8 @@ impl WaylandPayload {
             &DATA_DEVICE_LISTENER as *const _ as _,
             self as *mut _ as _,
         );
-    }
-    unsafe fn init_pointer_context(&mut self) {
+    }}
+    unsafe fn init_pointer_context(&mut self) { unsafe {
         if !self.pointer_context.cursor_shape_manager.is_null() {
             self.pointer_context.cursor_shape_device = wl_request_constructor!(
                 self.client,
@@ -307,8 +307,8 @@ impl WaylandPayload {
         } else {
             eprintln!("Wayland compositor does not support cursor shape");
         }
-    }
-    unsafe fn init_text_input(&mut self) {
+    }}
+    unsafe fn init_text_input(&mut self) { unsafe {
         if self.text_input_manager.is_null() || self.seat.is_null() {
             return;
         }
@@ -334,9 +334,9 @@ impl WaylandPayload {
             &TEXT_INPUT_LISTENER as *const _ as _,
             self as *mut _ as _,
         );
-    }
+    }}
 
-    unsafe fn set_fullscreen(&mut self, full: bool) {
+    unsafe fn set_fullscreen(&mut self, full: bool) { unsafe {
         if full {
             wl_request!(
                 self.client,
@@ -351,7 +351,7 @@ impl WaylandPayload {
                 extensions::xdg_shell::xdg_toplevel::unset_fullscreen
             );
         }
-    }
+    }}
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -433,11 +433,11 @@ impl KeyboardContext {
         keymap: &XkbKeymap,
         xkb_state: *mut xkb_state,
         events: &mut Vec<WaylandEvent>,
-    ) {
+    ) { unsafe {
         if let Some(key) = self.repeated_key {
             self.generate_key_events(libxkb, keymap, xkb_state, key, true, events)
         }
-    }
+    }}
     unsafe fn generate_key_events(
         &self,
         libxkb: &mut LibXkbCommon,
@@ -446,7 +446,7 @@ impl KeyboardContext {
         key: core::ffi::c_uint,
         repeat: bool,
         events: &mut Vec<WaylandEvent>,
-    ) {
+    ) { unsafe {
         let keymods = keymap.get_keymods(libxkb, xkb_state);
 
         // The keycodes in Miniquad are obtained without modifiers
@@ -462,7 +462,7 @@ impl KeyboardContext {
                 events.push(WaylandEvent::Char(chr, keymods, repeat));
             }
         }
-    }
+    }}
 }
 
 struct PointerContext {
@@ -504,7 +504,7 @@ impl PointerContext {
         client: &mut LibWaylandClient,
         icon: Option<crate::CursorIcon>,
         serial: core::ffi::c_uint,
-    ) {
+    ) { unsafe {
         self.cursor_icon = icon;
         if let Some(icon) = icon {
             if !self.cursor_shape_device.is_null() {
@@ -527,7 +527,7 @@ impl PointerContext {
                 0
             );
         }
-    }
+    }}
     fn handle_enter(&mut self, client: &mut LibWaylandClient, serial: core::ffi::c_uint) {
         self.enter_serial = Some(serial);
         let change = self.queued_cursor_icon.take().unwrap_or(self.cursor_icon);
@@ -547,7 +547,7 @@ impl PointerContext {
             self.queued_cursor_icon = Some(icon);
         }
     }
-    unsafe fn set_grab(&mut self, data: *mut std::ffi::c_void, grab: bool) {
+    unsafe fn set_grab(&mut self, data: *mut std::ffi::c_void, grab: bool) { unsafe {
         let display: &mut WaylandPayload = &mut *(data as *mut _);
         if grab {
             if self.locked_pointer.is_null() {
@@ -601,7 +601,7 @@ impl PointerContext {
                 self.relative_pointer = std::ptr::null_mut();
             }
         }
-    }
+    }}
 }
 
 static mut SEAT_LISTENER: wl_seat_listener = wl_seat_listener::dummy();
@@ -622,7 +622,7 @@ unsafe extern "C" fn seat_handle_capabilities(
     data: *mut std::ffi::c_void,
     seat: *mut wl_seat,
     caps: wl_seat_capability,
-) {
+) { unsafe {
     let display: &mut WaylandPayload = &mut *(data as *mut _);
 
     if caps & wl_seat_capability_WL_SEAT_CAPABILITY_POINTER != 0 {
@@ -684,7 +684,7 @@ unsafe extern "C" fn seat_handle_capabilities(
             data,
         );
     }
-}
+}}
 
 #[derive(Clone, Copy)]
 struct InputPosition {
@@ -729,7 +729,7 @@ unsafe extern "C" fn keyboard_handle_keymap(
     _format: u32,
     fd: i32,
     size: u32,
-) {
+) { unsafe {
     let display: &mut WaylandPayload = &mut *(data as *mut _);
     let map_shm = libc::mmap(
         std::ptr::null_mut::<std::ffi::c_void>(),
@@ -755,25 +755,25 @@ unsafe extern "C" fn keyboard_handle_keymap(
     if !display.xkb_compose_state.is_null() {
         (display.xkb.xkb_compose_state_reset)(display.xkb_compose_state);
     }
-}
+}}
 unsafe extern "C" fn keyboard_handle_enter(
     data: *mut ::core::ffi::c_void,
     _wl_keyboard: *mut wl_keyboard,
     serial: ::core::ffi::c_uint,
     _surface: *mut wl_surface,
     _keys: *mut wl_array,
-) {
+) { unsafe {
     let display: &mut WaylandPayload = &mut *(data as *mut _);
     // Needed for setting the clipboard
     display.keyboard_context.enter_serial = Some(serial);
     display.events.push(WaylandEvent::WindowRestored);
-}
+}}
 unsafe extern "C" fn keyboard_handle_leave(
     data: *mut ::core::ffi::c_void,
     _wl_keyboard: *mut wl_keyboard,
     _serial: u32,
     _surface: *mut wl_surface,
-) {
+) { unsafe {
     // Clear modifiers
     let display: &mut WaylandPayload = &mut *(data as *mut _);
     (display.xkb.xkb_state_update_mask)(display.xkb_state, 0, 0, 0, 0, 0, 0);
@@ -787,7 +787,7 @@ unsafe extern "C" fn keyboard_handle_leave(
         (display.xkb.xkb_compose_state_reset)(display.xkb_compose_state);
     }
     display.events.push(WaylandEvent::WindowMinimized);
-}
+}}
 unsafe extern "C" fn keyboard_handle_key(
     data: *mut ::core::ffi::c_void,
     _wl_keyboard: *mut wl_keyboard,
@@ -795,7 +795,7 @@ unsafe extern "C" fn keyboard_handle_key(
     _time: u32,
     key: u32,
     state: wl_keyboard_key_state,
-) {
+) { unsafe {
     let display: &mut WaylandPayload = &mut *(data as *mut _);
     let libxkb = &mut display.xkb;
     let xkb_keymap = display.keymap.xkb_keymap;
@@ -822,7 +822,7 @@ unsafe extern "C" fn keyboard_handle_key(
             eprintln!("Unknown wl_keyboard::key_state");
         }
     };
-}
+}}
 unsafe extern "C" fn keyboard_handle_modifiers(
     data: *mut ::core::ffi::c_void,
     _wl_keyboard: *mut wl_keyboard,
@@ -831,7 +831,7 @@ unsafe extern "C" fn keyboard_handle_modifiers(
     mods_latched: u32,
     mods_locked: u32,
     group: u32,
-) {
+) { unsafe {
     let display: &mut WaylandPayload = &mut *(data as *mut _);
     (display.xkb.xkb_state_update_mask)(
         display.xkb_state,
@@ -842,13 +842,13 @@ unsafe extern "C" fn keyboard_handle_modifiers(
         0,
         group,
     );
-}
+}}
 unsafe extern "C" fn keyboard_handle_repeat_info(
     data: *mut ::core::ffi::c_void,
     _wl_keyboard: *mut wl_keyboard,
     rate: i32,
     delay: i32,
-) {
+) { unsafe {
     let display: &mut WaylandPayload = &mut *(data as *mut _);
     display.keyboard_context.repeat_info = if rate == 0 {
         RepeatInfo::NoRepeat
@@ -858,7 +858,7 @@ unsafe extern "C" fn keyboard_handle_repeat_info(
             gap: Duration::from_micros(1_000_000 / rate as u64),
         }
     };
-}
+}}
 
 unsafe extern "C" fn pointer_handle_enter(
     data: *mut ::core::ffi::c_void,
@@ -867,7 +867,7 @@ unsafe extern "C" fn pointer_handle_enter(
     surface: *mut wl_surface,
     surface_x: i32,
     surface_y: i32,
-) {
+) { unsafe {
     let display: &mut WaylandPayload = &mut *(data as *mut _);
     display.focused_window = surface;
     if surface == display.surface {
@@ -880,20 +880,20 @@ unsafe extern "C" fn pointer_handle_enter(
             .pointer_context
             .handle_enter(&mut display.client, serial);
     }
-}
+}}
 
 unsafe extern "C" fn pointer_handle_leave(
     data: *mut ::core::ffi::c_void,
     _wl_pointer: *mut wl_pointer,
     _serial: u32,
     surface: *mut wl_surface,
-) {
+) { unsafe {
     let display: &mut WaylandPayload = &mut *(data as *mut _);
     display.pointer_context.enter_serial = None;
     if surface == display.surface {
         display.events.push(WaylandEvent::PointerLeave);
     }
-}
+}}
 
 unsafe extern "C" fn pointer_handle_motion(
     data: *mut ::core::ffi::c_void,
@@ -901,7 +901,7 @@ unsafe extern "C" fn pointer_handle_motion(
     _time: u32,
     surface_x: i32,
     surface_y: i32,
-) {
+) { unsafe {
     let display: &mut WaylandPayload = &mut *(data as *mut _);
     if display.focused_window == display.surface {
         let scale = crate::native_display().lock().unwrap().dpi_scale;
@@ -910,7 +910,7 @@ unsafe extern "C" fn pointer_handle_motion(
         let position = InputPosition::from_logical(logical, scale);
         display.events.push(WaylandEvent::PointerMotion(position));
     }
-}
+}}
 unsafe extern "C" fn pointer_handle_button(
     data: *mut ::core::ffi::c_void,
     _wl_pointer: *mut wl_pointer,
@@ -918,7 +918,7 @@ unsafe extern "C" fn pointer_handle_button(
     _time: u32,
     button: u32,
     state: u32,
-) {
+) { unsafe {
     let display: &mut WaylandPayload = &mut *(data as *mut _);
     if display.focused_window == display.surface {
         // The code is defined in the kernel's linux/input-event-codes.h header file, e.g. BTN_LEFT
@@ -934,14 +934,14 @@ unsafe extern "C" fn pointer_handle_button(
             .events
             .push(WaylandEvent::PointerButton(button, state == 1, position));
     }
-}
+}}
 unsafe extern "C" fn pointer_handle_axis(
     data: *mut ::core::ffi::c_void,
     _wl_pointer: *mut wl_pointer,
     _time: u32,
     axis: u32,
     value: i32,
-) {
+) { unsafe {
     let display: &mut WaylandPayload = &mut *(data as *mut _);
     let mut value = wl_fixed_to_double(value);
     // https://wayland-book.com/seat/pointer.html
@@ -954,7 +954,7 @@ unsafe extern "C" fn pointer_handle_axis(
         // Horizontal scroll
         display.events.push(WaylandEvent::PointerAxis(value, 0.0));
     }
-}
+}}
 
 unsafe extern "C" fn relative_pointer_handle_relative_motion(
     data: *mut ::core::ffi::c_void,
@@ -965,7 +965,7 @@ unsafe extern "C" fn relative_pointer_handle_relative_motion(
     dy: wl_fixed_t,
     _dx_unaccel: wl_fixed_t,
     _dy_unaccel: wl_fixed_t,
-) {
+) { unsafe {
     let display: &mut WaylandPayload = &mut *(data as *mut _);
     if display.focused_window == display.surface {
         // From wl_fixed_to_double(), it simply divides by 256
@@ -973,7 +973,7 @@ unsafe extern "C" fn relative_pointer_handle_relative_motion(
         let dy = wl_fixed_to_double(dy);
         display.events.push(WaylandEvent::RawMotion(dx, dy));
     }
-}
+}}
 
 unsafe extern "C" fn output_handle_scale(
     _data: *mut std::ffi::c_void,
@@ -998,7 +998,7 @@ unsafe extern "C" fn touch_handle_down(
     id: core::ffi::c_int,
     x: wl_fixed_t,
     y: wl_fixed_t,
-) {
+) { unsafe {
     let display: &mut WaylandPayload = &mut *(data as *mut _);
     display.focused_window = surface;
     if display.focused_window == display.surface {
@@ -1013,7 +1013,7 @@ unsafe extern "C" fn touch_handle_down(
             time as f64 / 1000.,
         ));
     }
-}
+}}
 
 unsafe extern "C" fn touch_handle_motion(
     data: *mut std::ffi::c_void,
@@ -1022,7 +1022,7 @@ unsafe extern "C" fn touch_handle_motion(
     id: core::ffi::c_int,
     x: wl_fixed_t,
     y: wl_fixed_t,
-) {
+) { unsafe {
     let display: &mut WaylandPayload = &mut *(data as *mut _);
     if display.focused_window == display.surface {
         let scale = crate::native_display().lock().unwrap().dpi_scale;
@@ -1036,7 +1036,7 @@ unsafe extern "C" fn touch_handle_motion(
             time as f64 / 1000.,
         ));
     }
-}
+}}
 
 unsafe extern "C" fn touch_handle_up(
     data: *mut std::ffi::c_void,
@@ -1044,7 +1044,7 @@ unsafe extern "C" fn touch_handle_up(
     _serial: core::ffi::c_uint,
     time: core::ffi::c_uint,
     id: core::ffi::c_int,
-) {
+) { unsafe {
     let display: &mut WaylandPayload = &mut *(data as *mut _);
     if display.focused_window == display.surface {
         if let Some(position) = display.touch_positions.remove(&id) {
@@ -1056,9 +1056,9 @@ unsafe extern "C" fn touch_handle_up(
             ));
         }
     }
-}
+}}
 
-unsafe extern "C" fn touch_handle_cancel(data: *mut std::ffi::c_void, _touch: *mut wl_touch) {
+unsafe extern "C" fn touch_handle_cancel(data: *mut std::ffi::c_void, _touch: *mut wl_touch) { unsafe {
     let display: &mut WaylandPayload = &mut *(data as *mut _);
     for (id, position) in display.touch_positions.drain() {
         display.events.push(WaylandEvent::Touch(
@@ -1068,29 +1068,29 @@ unsafe extern "C" fn touch_handle_cancel(data: *mut std::ffi::c_void, _touch: *m
             0.0,
         ));
     }
-}
+}}
 
 unsafe extern "C" fn text_input_handle_enter(
     data: *mut core::ffi::c_void,
     _text_input: *mut extensions::text_input::zwp_text_input_v3,
     _surface: *mut wl_surface,
-) {
+) { unsafe {
     // The compositor forgets the state when focus leaves; send it again.
     let display: &mut WaylandPayload = &mut *(data as *mut _);
     text_input_sync(display);
-}
+}}
 
 unsafe extern "C" fn text_input_handle_leave(
     data: *mut core::ffi::c_void,
     _text_input: *mut extensions::text_input::zwp_text_input_v3,
     _surface: *mut wl_surface,
-) {
+) { unsafe {
     let display: &mut WaylandPayload = &mut *(data as *mut _);
     if display.ime_preediting {
         display.ime_preediting = false;
         display.events.push(WaylandEvent::ImePreedit(String::new(), 0));
     }
-}
+}}
 
 unsafe extern "C" fn text_input_handle_preedit_string(
     data: *mut core::ffi::c_void,
@@ -1098,7 +1098,7 @@ unsafe extern "C" fn text_input_handle_preedit_string(
     text: *const core::ffi::c_char,
     cursor_begin: core::ffi::c_int,
     cursor_end: core::ffi::c_int,
-) {
+) { unsafe {
     let display: &mut WaylandPayload = &mut *(data as *mut _);
     let preedit = if text.is_null() {
         String::new()
@@ -1106,19 +1106,19 @@ unsafe extern "C" fn text_input_handle_preedit_string(
         core::ffi::CStr::from_ptr(text).to_string_lossy().into_owned()
     };
     display.ime_pending_preedit = Some((preedit, cursor_begin, cursor_end));
-}
+}}
 
 unsafe extern "C" fn text_input_handle_commit_string(
     data: *mut core::ffi::c_void,
     _text_input: *mut extensions::text_input::zwp_text_input_v3,
     text: *const core::ffi::c_char,
-) {
+) { unsafe {
     let display: &mut WaylandPayload = &mut *(data as *mut _);
     if !text.is_null() {
         display.ime_pending_commit =
             Some(core::ffi::CStr::from_ptr(text).to_string_lossy().into_owned());
     }
-}
+}}
 
 unsafe extern "C" fn text_input_handle_delete_surrounding_text(
     _data: *mut core::ffi::c_void,
@@ -1133,7 +1133,7 @@ unsafe extern "C" fn text_input_handle_done(
     data: *mut core::ffi::c_void,
     _text_input: *mut extensions::text_input::zwp_text_input_v3,
     _serial: core::ffi::c_uint,
-) {
+) { unsafe {
     // Apply the batch in protocol order: commit, then the new preedit. A
     // batch without preedit_string clears the preedit.
     let display: &mut WaylandPayload = &mut *(data as *mut _);
@@ -1155,10 +1155,10 @@ unsafe extern "C" fn text_input_handle_done(
         display.ime_preediting = !preedit.is_empty();
         display.events.push(WaylandEvent::ImePreedit(preedit, caret));
     }
-}
+}}
 
 /// Send the session's enable state, content type, and caret rectangle.
-unsafe fn text_input_sync(display: &mut WaylandPayload) {
+unsafe fn text_input_sync(display: &mut WaylandPayload) { unsafe {
     use extensions::text_input::zwp_text_input_v3 as ti;
     if display.text_input.is_null() {
         return;
@@ -1186,7 +1186,7 @@ unsafe fn text_input_sync(display: &mut WaylandPayload) {
         }
     }
     wl_request!(display.client, display.text_input, ti::commit);
-}
+}}
 
 /// zwp_text_input_v3 content hint flags and purpose for a session.
 fn content_type(config: &crate::TextInputConfig) -> (u32, u32) {
@@ -1233,7 +1233,7 @@ unsafe extern "C" fn registry_add_object(
     name: u32,
     interface: *const ::core::ffi::c_char,
     version: u32,
-) {
+) { unsafe {
     let display: &mut WaylandPayload = &mut *(data as *mut _);
 
     let interface = std::ffi::CStr::from_ptr(interface).to_str().unwrap();
@@ -1376,13 +1376,13 @@ unsafe extern "C" fn registry_add_object(
 
         _ => {}
     }
-}
+}}
 
 unsafe extern "C" fn xdg_wm_base_handle_ping(
     data: *mut std::ffi::c_void,
     toplevel: *mut extensions::xdg_shell::xdg_wm_base,
     serial: u32,
-) {
+) { unsafe {
     assert!(!data.is_null());
     let payload: &mut WaylandPayload = &mut *(data as *mut _);
 
@@ -1392,13 +1392,13 @@ unsafe extern "C" fn xdg_wm_base_handle_ping(
         extensions::xdg_shell::xdg_wm_base::pong,
         serial
     );
-}
+}}
 
 unsafe extern "C" fn data_device_handle_data_offer(
     data: *mut ::core::ffi::c_void,
     data_device: *mut wl_data_device,
     data_offer: *mut wl_data_offer,
-) {
+) { unsafe {
     DATA_OFFER_LISTENER.source_actions = drag_n_drop::data_offer_handle_source_actions;
     let display: &mut WaylandPayload = &mut *(data as *mut _);
     assert_eq!(data_device, display.data_device);
@@ -1407,7 +1407,7 @@ unsafe extern "C" fn data_device_handle_data_offer(
         &DATA_OFFER_LISTENER as *const _ as _,
         data,
     );
-}
+}}
 
 pub fn run<F>(conf: &crate::conf::Conf, f: &mut Option<F>) -> Option<()>
 where

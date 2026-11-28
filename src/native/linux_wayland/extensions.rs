@@ -15,9 +15,9 @@ macro_rules! count {
 
 #[macro_export]
 macro_rules! method_consts {
-    ($x:expr, ()) => {
+    ($x:expr_2021, ()) => {
     };
-    ($x:expr, ($next:ident, $($rest:ident,)*)) => {
+    ($x:expr_2021, ($next:ident, $($rest:ident,)*)) => {
         pub const $next: u32 = $x;
         $crate::method_consts!(($x + 1), ($($rest,)*));
     };
@@ -25,15 +25,15 @@ macro_rules! method_consts {
 
 #[macro_export]
 macro_rules! wayland_interface {
-    ($name:ident, $struct_name:ident, $version:expr,
+    ($name:ident, $struct_name:ident, $version:expr_2021,
      [
          $(
-             ($method_name:ident, $method_sign:expr, ($($method_argument_name:expr),*))
+             ($method_name:ident, $method_sign:expr_2021, ($($method_argument_name:expr_2021),*))
          ),*
      ],
      [
          $(
-             ($event_name:ident, $event_sign:expr, ($($event_argument_name:expr),*))
+             ($event_name:ident, $event_sign:expr_2021, ($($event_argument_name:expr_2021),*))
          ),*
      ]) => {
         mod $name {

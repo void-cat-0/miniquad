@@ -74,19 +74,19 @@ unsafe extern "C" fn preedit_done_callback(
     _xic: libx11::XIC,
     client_data: *mut libc::c_void,
     _call_data: *mut libc::c_void,
-) {
+) { unsafe {
     let display_ptr = client_data as *mut X11Display;
     if !display_ptr.is_null() {
         (*display_ptr).preedit_text.clear();
         (*display_ptr).pending_preedit_update = true;
     }
-}
+}}
 
 unsafe extern "C" fn preedit_draw_callback(
     _xic: libx11::XIC,
     client_data: *mut libc::c_void,
     call_data: *mut libc::c_void,
-) {
+) { unsafe {
     let display_ptr = client_data as *mut X11Display;
     if display_ptr.is_null() || call_data.is_null() {
         return;
@@ -131,7 +131,7 @@ unsafe extern "C" fn preedit_draw_callback(
     display.preedit_cursor =
         crate::text_input::chars_to_utf16(&display.preedit_text, draw_data.caret.max(0) as usize);
     display.pending_preedit_update = true;
-}
+}}
 
 unsafe extern "C" fn preedit_caret_callback(
     _xic: libx11::XIC,
@@ -147,7 +147,7 @@ fn ime_session_active() -> bool {
 }
 
 impl X11Display {
-    unsafe fn set_spot_location(&mut self) {
+    unsafe fn set_spot_location(&mut self) { unsafe {
         if self.xic.is_null() {
             return;
         }
@@ -170,9 +170,9 @@ impl X11Display {
             );
             (self.libx11.XFree)(preedit_attr);
         }
-    }
+    }}
 
-    pub unsafe fn init_xim(&mut self, window: Window) {
+    pub unsafe fn init_xim(&mut self, window: Window) { unsafe {
         libc::setlocale(libc::LC_CTYPE, b"\0".as_ptr() as _);
 
         let mod_res = (self.libx11.XSetLocaleModifiers)(b"\0".as_ptr() as _);
@@ -326,9 +326,9 @@ impl X11Display {
             | PropertyChangeMask;
         let combined_mask = base_mask | fe_mask;
         (self.libx11.XSelectInput)(self.display, window, combined_mask);
-    }
+    }}
 
-    unsafe fn process_event(&mut self, event: &mut XEvent, event_handler: &mut dyn EventHandler) {
+    unsafe fn process_event(&mut self, event: &mut XEvent, event_handler: &mut dyn EventHandler) { unsafe {
         if !self.xic.is_null() {
             let win = if event.xany.window != 0 {
                 event.xany.window
@@ -594,11 +594,11 @@ impl X11Display {
                 d.quit_ordered = true
             }
         }
-    }
+    }}
 
     // TODO: right now it just exits early if fullscreen is false.
     // should be able to able to go back from fullscreen to windowed instead
-    unsafe fn set_fullscreen(&mut self, window: Window, fullscreen: bool) {
+    unsafe fn set_fullscreen(&mut self, window: Window, fullscreen: bool) { unsafe {
         let wm_state = (self.libx11.XInternAtom)(
             self.display,
             b"_NET_WM_STATE\x00" as *const u8 as *const _,
@@ -667,19 +667,19 @@ impl X11Display {
                 &mut ev as *mut XClientMessageEvent as *mut _,
             );
         }
-    }
+    }}
 
-    unsafe fn set_window_size(&mut self, window: Window, new_width: i32, new_height: i32) {
+    unsafe fn set_window_size(&mut self, window: Window, new_width: i32, new_height: i32) { unsafe {
         (self.libx11.XResizeWindow)(self.display, window, new_width, new_height);
         (self.libx11.XFlush)(self.display);
-    }
+    }}
 
     /// Set the window position in screen coordinates.
-    unsafe fn set_window_position(&mut self, window: Window, new_x: i32, new_y: i32) {
+    unsafe fn set_window_position(&mut self, window: Window, new_x: i32, new_y: i32) { unsafe {
         (self.libx11.XMoveWindow)(self.display, window, new_x, new_y);
-    }
+    }}
 
-    pub unsafe fn set_cursor_grab(&mut self, window: Window, grab: bool) {
+    pub unsafe fn set_cursor_grab(&mut self, window: Window, grab: bool) { unsafe {
         (self.libx11.XUngrabPointer)(self.display, 0);
 
         if grab {
@@ -709,8 +709,8 @@ impl X11Display {
         }
 
         (self.libx11.XFlush)(self.display);
-    }
-    pub unsafe fn set_cursor(&mut self, window: Window, cursor: Option<CursorIcon>) {
+    }}
+    pub unsafe fn set_cursor(&mut self, window: Window, cursor: Option<CursorIcon>) { unsafe {
         let libx11 = &mut self.libx11;
         let display = self.display;
 
@@ -737,7 +737,7 @@ impl X11Display {
             }),
         };
         (libx11.XDefineCursor)(display, window, cursor);
-    }
+    }}
 
     fn process_request(&mut self, request: Request) {
         use Request::*;
@@ -813,7 +813,7 @@ unsafe fn glx_main_loop<F>(
 ) -> Result<(), X11Display>
 where
     F: 'static + FnOnce() -> Box<dyn EventHandler>,
-{
+{ unsafe {
     let mut glx = match glx::Glx::init(&mut display.libx11, display.display, screen, conf) {
         Ok(glx) => glx,
         _ => return Err(display),
@@ -902,7 +902,7 @@ where
     (display.libx11.XCloseDisplay)(display.display);
 
     Ok(())
-}
+}}
 
 unsafe fn egl_main_loop<F>(
     mut display: X11Display,
@@ -911,7 +911,7 @@ unsafe fn egl_main_loop<F>(
 ) -> Result<(), X11Display>
 where
     F: 'static + FnOnce() -> Box<dyn EventHandler>,
-{
+{ unsafe {
     let mut egl_lib = match egl::LibEgl::try_load().ok() {
         Some(glx) => glx,
         _ => return Err(display),
@@ -1011,7 +1011,7 @@ where
     (display.libx11.XCloseDisplay)(display.display);
 
     Ok(())
-}
+}}
 
 pub fn run<F>(conf: &crate::conf::Conf, f: &mut Option<F>) -> Result<(), X11Error>
 where

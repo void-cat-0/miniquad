@@ -4,20 +4,20 @@ use super::libwayland_client::{
 };
 use crate::wl_request_constructor;
 
-unsafe fn wl_shm_pool_destroy(libwayland: &mut LibWaylandClient, wl_shm_pool: *mut wl_shm_pool) {
+unsafe fn wl_shm_pool_destroy(libwayland: &mut LibWaylandClient, wl_shm_pool: *mut wl_shm_pool) { unsafe {
     (libwayland.wl_proxy_marshal)(wl_shm_pool as _, WL_SHM_POOL_DESTROY);
     (libwayland.wl_proxy_destroy)(wl_shm_pool as _);
-}
+}}
 
-unsafe extern "C" fn create_tmpfile_cloexec(tmpname: *mut libc::c_char) -> libc::c_int {
+unsafe extern "C" fn create_tmpfile_cloexec(tmpname: *mut libc::c_char) -> libc::c_int { unsafe {
     let fd = libc::mkostemp(tmpname, libc::O_CLOEXEC);
     if fd >= 0 {
         libc::unlink(tmpname);
     }
     fd
-}
+}}
 
-unsafe extern "C" fn create_anonymous_file(size: usize) -> libc::c_int {
+unsafe extern "C" fn create_anonymous_file(size: usize) -> libc::c_int { unsafe {
     let xdg_folder_path = std::env::var("XDG_RUNTIME_DIR").expect("XDG_RUNTIME_DIR not set");
     let filepath = format!("{}/miniquad-shared-XXXXXX", xdg_folder_path);
     let c_filepath = std::ffi::CString::new(filepath).unwrap();
@@ -34,7 +34,7 @@ unsafe extern "C" fn create_anonymous_file(size: usize) -> libc::c_int {
         panic!("Cant create temp file")
     }
     fd
-}
+}}
 
 pub unsafe fn create_shm_buffer(
     libwayland: &mut LibWaylandClient,
@@ -42,7 +42,7 @@ pub unsafe fn create_shm_buffer(
     width: i32,
     height: i32,
     pixels: &[u8],
-) -> *mut wl_buffer {
+) -> *mut wl_buffer { unsafe {
     let stride = width * 4;
     let length = width * height * 4;
 
@@ -95,4 +95,4 @@ pub unsafe fn create_shm_buffer(
 
     wl_shm_pool_destroy(libwayland, pool);
     buffer
-}
+}}

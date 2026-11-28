@@ -11,7 +11,7 @@ pub(super) unsafe extern "C" fn data_offer_handle_source_actions(
     data: *mut ::core::ffi::c_void,
     data_offer: *mut wl_data_offer,
     actions: ::core::ffi::c_uint,
-) {
+) { unsafe {
     if actions & WL_DATA_DEVICE_MANAGER_DND_ACTION_COPY == 1 {
         let display: &mut WaylandPayload = &mut *(data as *mut _);
         wl_request!(
@@ -22,7 +22,7 @@ pub(super) unsafe extern "C" fn data_offer_handle_source_actions(
             WL_DATA_DEVICE_MANAGER_DND_ACTION_COPY
         );
     }
-}
+}}
 
 pub(super) unsafe extern "C" fn data_device_handle_enter(
     data: *mut ::core::ffi::c_void,
@@ -32,7 +32,7 @@ pub(super) unsafe extern "C" fn data_device_handle_enter(
     _surface_x: i32,
     _surface_y: i32,
     data_offer: *mut wl_data_offer,
-) {
+) { unsafe {
     let display: &mut WaylandPayload = &mut *(data as *mut _);
     assert_eq!(data_device, display.data_device);
     display.drag_n_drop.enter_serial = Some(serial);
@@ -46,22 +46,22 @@ pub(super) unsafe extern "C" fn data_device_handle_enter(
         serial,
         mime_type.as_ptr()
     );
-}
+}}
 
 pub(super) unsafe extern "C" fn data_device_handle_leave(
     data: *mut ::core::ffi::c_void,
     data_device: *mut wl_data_device,
-) {
+) { unsafe {
     let display: &mut WaylandPayload = &mut *(data as *mut _);
     assert_eq!(data_device, display.data_device);
     display.drag_n_drop.enter_serial = None;
     display.drag_n_drop.data_offer = None;
-}
+}}
 
 pub(super) unsafe extern "C" fn data_device_handle_drop(
     data: *mut ::core::ffi::c_void,
     data_device: *mut wl_data_device,
-) {
+) { unsafe {
     let display: &mut WaylandPayload = &mut *(data as *mut _);
     assert_eq!(data_device, display.data_device);
     if let Some(data_offer) = display.drag_n_drop.data_offer {
@@ -82,4 +82,4 @@ pub(super) unsafe extern "C" fn data_device_handle_drop(
             }
         }
     }
-}
+}}

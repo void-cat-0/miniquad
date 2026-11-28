@@ -627,7 +627,7 @@ impl LibWaylandClient {
         name: c_uint,
         interface: *const wl_interface,
         version: c_uint,
-    ) -> *mut c_void {
+    ) -> *mut c_void { unsafe {
         let id: *mut wl_proxy = (self.wl_proxy_marshal_constructor_versioned)(
             wl_registry as _,
             WL_REGISTRY_BIND,
@@ -638,13 +638,13 @@ impl LibWaylandClient {
             version,
         );
         id as *mut _
-    }
+    }}
     pub unsafe fn data_offer_receive(
         &mut self,
         display: *mut wl_display,
         data_offer: *mut wl_data_offer,
         mime_type: *const c_char,
-    ) -> Option<Vec<u8>> {
+    ) -> Option<Vec<u8>> { unsafe {
         let mut fds: [c_int; 2] = [0; 2];
         assert_eq!(libc::pipe(fds.as_mut_ptr()), 0);
         (self.wl_proxy_marshal)(data_offer as _, WL_DATA_OFFER_RECEIVE, mime_type, fds[1]);
@@ -662,16 +662,16 @@ impl LibWaylandClient {
         }
         libc::close(fds[0]);
         Some(bytes)
-    }
+    }}
 }
 
 #[macro_export]
 macro_rules! wl_request_constructor {
-    ($libwayland:expr, $instance:expr, $request_name:expr, $interface:expr) => {
+    ($libwayland:expr_2021, $instance:expr_2021, $request_name:expr_2021, $interface:expr_2021) => {
         wl_request_constructor!($libwayland, $instance, $request_name, $interface, ())
     };
 
-    ($libwayland:expr, $instance:expr, $request_name:expr, $interface:expr, $($arg:expr),*) => {{
+    ($libwayland:expr_2021, $instance:expr_2021, $request_name:expr_2021, $interface:expr_2021, $($arg:expr_2021),*) => {{
         let id: *mut wl_proxy;
 
         id = ($libwayland.wl_proxy_marshal_constructor)(
@@ -688,11 +688,11 @@ macro_rules! wl_request_constructor {
 
 #[macro_export]
 macro_rules! wl_request {
-    ($libwayland:expr, $instance:expr, $request_name:expr) => {
+    ($libwayland:expr_2021, $instance:expr_2021, $request_name:expr_2021) => {
         wl_request!($libwayland, $instance, $request_name, ())
     };
 
-    ($libwayland:expr, $instance:expr, $request_name:expr, $($arg:expr),*) => {{
+    ($libwayland:expr_2021, $instance:expr_2021, $request_name:expr_2021, $($arg:expr_2021),*) => {{
         ($libwayland.wl_proxy_marshal)(
             $instance as _,
             $request_name,

@@ -314,7 +314,7 @@ impl TransferCaps {
 }
 
 #[cfg(not(target_arch = "wasm32"))]
-unsafe fn transfer_extensions(indexed: bool) -> Vec<String> {
+unsafe fn transfer_extensions(indexed: bool) -> Vec<String> { unsafe {
     use std::ffi::CStr;
     if indexed {
         (0..gl_integer(GL_NUM_EXTENSIONS).max(0) as GLuint)
@@ -335,13 +335,13 @@ unsafe fn transfer_extensions(indexed: bool) -> Vec<String> {
                 .collect()
         }
     }
-}
+}}
 
 // GLES can expose RGBA/FLOAT rather than RGBA/HALF_FLOAT as the readable
 // pair for a floating-point color attachment. GL widens its binary16 values
 // exactly; convert the finite widened values back to their original bits.
 #[cfg(not(target_arch = "wasm32"))]
-unsafe fn read_es_half_float(width: GLsizei, height: GLsizei, bytes: &mut [u8]) {
+unsafe fn read_es_half_float(width: GLsizei, height: GLsizei, bytes: &mut [u8]) { unsafe {
     let format = gl_integer(GL_IMPLEMENTATION_COLOR_READ_FORMAT) as GLenum;
     let pixel_type = gl_integer(GL_IMPLEMENTATION_COLOR_READ_TYPE) as GLenum;
     match (format, pixel_type) {
@@ -373,7 +373,7 @@ unsafe fn read_es_half_float(width: GLsizei, height: GLsizei, bytes: &mut [u8]) 
         }
         _ => panic!("this GLES context does not support RGBA half-float readback"),
     }
-}
+}}
 
 #[cfg(not(target_arch = "wasm32"))]
 fn narrow_widened_half(value: f32) -> u16 {
@@ -414,11 +414,11 @@ fn mip_sizes(width: GLsizei, height: GLsizei) -> impl Iterator<Item = (GLsizei, 
     })
 }
 
-unsafe fn gl_integer(param: GLenum) -> GLint {
+unsafe fn gl_integer(param: GLenum) -> GLint { unsafe {
     let mut value = 0;
     glGetIntegerv(param, &mut value);
     value
-}
+}}
 
 // Borrow the actual GL binding on the active texture unit without changing the
 // active unit or Miniquad's cache. Raw GL users need not synchronize the cache
@@ -426,7 +426,7 @@ unsafe fn gl_integer(param: GLenum) -> GLint {
 struct TransferTextureBinding(GLenum, GLuint);
 
 impl TransferTextureBinding {
-    unsafe fn new(kind: TextureKind, texture: GLuint) -> Self {
+    unsafe fn new(kind: TextureKind, texture: GLuint) -> Self { unsafe {
         let name = match kind {
             TextureKind::Texture2D => GL_TEXTURE_BINDING_2D,
             TextureKind::CubeMap => GL_TEXTURE_BINDING_CUBE_MAP,
@@ -434,7 +434,7 @@ impl TransferTextureBinding {
         let binding = Self(kind.into(), gl_integer(name) as GLuint);
         glBindTexture(binding.0, texture);
         binding
-    }
+    }}
 }
 
 impl Drop for TransferTextureBinding {
@@ -456,7 +456,7 @@ struct TightPixelStore {
 }
 
 impl TightPixelStore {
-    unsafe fn new(caps: &TransferCaps, transfer: PixelTransfer) -> Self {
+    unsafe fn new(caps: &TransferCaps, transfer: PixelTransfer) -> Self { unsafe {
         let (alignment, subimage, offsets, buffer, binding) = match transfer {
             PixelTransfer::Pack => (
                 GL_PACK_ALIGNMENT,
@@ -511,16 +511,16 @@ impl TightPixelStore {
             }
         }
         state
-    }
+    }}
 
-    unsafe fn set(&mut self, param: GLenum, tight: GLint) {
+    unsafe fn set(&mut self, param: GLenum, tight: GLint) { unsafe {
         let previous = gl_integer(param);
         if previous != tight {
             self.params[self.count] = (param, previous);
             self.count += 1;
             glPixelStorei(param, tight);
         }
-    }
+    }}
 }
 
 impl Drop for TightPixelStore {
@@ -544,7 +544,7 @@ struct ReadbackFramebuffer {
 }
 
 impl ReadbackFramebuffer {
-    unsafe fn new(caps: &TransferCaps, depth: bool) -> Option<Self> {
+    unsafe fn new(caps: &TransferCaps, depth: bool) -> Option<Self> { unsafe {
         let target = if caps.split_framebuffers && !depth {
             GL_READ_FRAMEBUFFER
         } else {
@@ -569,7 +569,7 @@ impl ReadbackFramebuffer {
             previous: previous as GLuint,
             previous_read,
         })
-    }
+    }}
 }
 
 impl Drop for ReadbackFramebuffer {

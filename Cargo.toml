@@ -2,8 +2,8 @@
 name = "miniquad"
 version = "0.4.10"
 authors = ["not-fl3 <not.fl3@gmail.com>"]
-edition = "2018"
-rust-version = "1.70"
+edition = "2024"
+rust-version = "1.90"
 license = "MIT OR Apache-2.0"
 homepage = "https://github.com/not-fl3/miniquad"
 repository = "https://github.com/not-fl3/miniquad"
