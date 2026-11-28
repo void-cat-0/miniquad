@@ -377,10 +377,19 @@ impl X11Display {
                     );
                     if status == libx11::XLookupChars || status == libx11::XLookupBoth {
                         if let Ok(s) = std::str::from_utf8(&buf[..n as usize]) {
+                            // Shortcuts such as Ctrl+A also look up to a control
+                            // character; they are key events, not text.
+                            let s: String = s.chars().filter(|c| !c.is_control()).collect();
+                            let s = s.as_str();
+                            let had_preedit = !self.preedit_text.is_empty();
                             self.preedit_text.clear();
                             let ime_active = ime_session_active();
                             if ime_active {
-                                event_handler.on_ime_preedit("", 0);
+                                // Only end a composition that exists: an empty
+                                // preedit replaces the selection in editors.
+                                if had_preedit {
+                                    event_handler.on_ime_preedit("", 0);
+                                }
                                 if s.chars().count() > 1 {
                                     event_handler.on_ime_commit(Some(s));
                                 } else {
