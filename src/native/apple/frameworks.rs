@@ -1330,6 +1330,7 @@ impl OSError {
         })
     }
 
+    #[allow(clippy::not_unsafe_ptr_arg_deref)]
     pub fn from_nserror(ns_error: ObjcId) -> Result<(), Self> {
         if ns_error != nil {
             let code: i32 = unsafe { msg_send![ns_error, code] };

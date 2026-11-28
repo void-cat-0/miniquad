@@ -93,7 +93,7 @@ enum Message {
 unsafe impl Send for Message {}
 
 thread_local! {
-    static MESSAGES_TX: RefCell<Option<mpsc::Sender<Message>>> = RefCell::new(None);
+    static MESSAGES_TX: RefCell<Option<mpsc::Sender<Message>>> = const { RefCell::new(None) };
 }
 
 fn send_message(message: Message) {
@@ -109,7 +109,7 @@ static mut VM: *mut ndk_sys::JavaVM = std::ptr::null_mut();
 pub unsafe fn console_debug(msg: *const ::core::ffi::c_char) { unsafe {
     ndk_sys::__android_log_write(
         ndk_sys::android_LogPriority_ANDROID_LOG_DEBUG as _,
-        b"SAPP\0".as_ptr() as _,
+        c"SAPP".as_ptr() as _,
         msg,
     );
 }}
@@ -117,7 +117,7 @@ pub unsafe fn console_debug(msg: *const ::core::ffi::c_char) { unsafe {
 pub unsafe fn console_info(msg: *const ::core::ffi::c_char) { unsafe {
     ndk_sys::__android_log_write(
         ndk_sys::android_LogPriority_ANDROID_LOG_INFO as _,
-        b"SAPP\0".as_ptr() as _,
+        c"SAPP".as_ptr() as _,
         msg,
     );
 }}
@@ -125,7 +125,7 @@ pub unsafe fn console_info(msg: *const ::core::ffi::c_char) { unsafe {
 pub unsafe fn console_warn(msg: *const ::core::ffi::c_char) { unsafe {
     ndk_sys::__android_log_write(
         ndk_sys::android_LogPriority_ANDROID_LOG_WARN as _,
-        b"SAPP\0".as_ptr() as _,
+        c"SAPP".as_ptr() as _,
         msg,
     );
 }}
@@ -133,7 +133,7 @@ pub unsafe fn console_warn(msg: *const ::core::ffi::c_char) { unsafe {
 pub unsafe fn console_error(msg: *const ::core::ffi::c_char) { unsafe {
     ndk_sys::__android_log_write(
         ndk_sys::android_LogPriority_ANDROID_LOG_ERROR as _,
-        b"SAPP\0".as_ptr() as _,
+        c"SAPP".as_ptr() as _,
         msg,
     );
 }}
@@ -177,7 +177,7 @@ impl MainThreadState {
             ndk_sys::ANativeWindow_release(self.window);
         }
         self.window = window;
-        if self.surface.is_null() == false {
+        if !self.surface.is_null() {
             self.destroy_surface();
         }
 
@@ -303,7 +303,7 @@ impl MainThreadState {
     fn frame(&mut self) {
         self.event_handler.update();
 
-        if self.surface.is_null() == false {
+        if !self.surface.is_null() {
             self.update_requested = false;
             self.event_handler.draw();
 
@@ -412,6 +412,12 @@ impl AndroidClipboard {
         AndroidClipboard {}
     }
 }
+
+impl Default for AndroidClipboard {
+    fn default() -> Self {
+        Self::new()
+    }
+}
 impl crate::native::Clipboard for AndroidClipboard {
     fn get(&mut self) -> Option<String> {
         unsafe {
@@ -492,19 +498,13 @@ where
         // sometimes before launching an app android will show a permission dialog
         // it is important to create GL context only after a first SurfaceChanged
         let window = 'a: loop {
-            match rx.try_recv() {
-                Ok(Message::SurfaceCreated { window }) => {
-                    break 'a window;
-                }
-                _ => {}
+            if let Ok(Message::SurfaceCreated { window }) = rx.try_recv() {
+                break 'a window;
             }
         };
         let (screen_width, screen_height) = 'a: loop {
-            match rx.try_recv() {
-                Ok(Message::SurfaceChanged { width, height }) => {
-                    break 'a (width as f32, height as f32);
-                }
-                _ => {}
+            if let Ok(Message::SurfaceChanged { width, height }) = rx.try_recv() {
+                break 'a (width as f32, height as f32);
             }
         };
 
@@ -645,16 +645,16 @@ unsafe fn create_native_window(surface: ndk_sys::jobject) -> *mut ndk_sys::ANati
 
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn Java_quad_1native_QuadNative_initializeContext(
-    env: *mut ndk_sys::JNIEnv,
+    _env: *mut ndk_sys::JNIEnv,
     _: ndk_sys::jobject,
     activity: ndk_sys::jobject,
 ) { unsafe {
     let env = attach_jni_env();
     let activity_ref = (**env).NewGlobalRef.unwrap()(env, activity);
-    ndk_context::initialize_android_context(std::mem::transmute(VM), activity_ref as _);
+    ndk_context::initialize_android_context(VM as *mut std::ffi::c_void, activity_ref as _);
 
-    let mut env = unsafe { jni::JNIEnv::from_raw(env as *mut jni::sys::JNIEnv).unwrap() };
-    let context = unsafe { jni::objects::JObject::from_raw(activity as jni::sys::jobject) };
+    let mut env = jni::JNIEnv::from_raw(env as *mut jni::sys::JNIEnv).unwrap();
+    let context = jni::objects::JObject::from_raw(activity as jni::sys::jobject);
     let _ = rustls_platform_verifier::android::init_with_env(&mut env, context);
 }}
 
@@ -754,8 +754,8 @@ extern "C" fn Java_quad_1native_QuadNative_surfaceOnTouch(
     send_message(Message::Touch {
         phase,
         touch_id: touch_id as _,
-        x: x as f32,
-        y: y as f32,
+        x,
+        y,
         time: time as u64,
     });
 }
@@ -866,7 +866,7 @@ pub unsafe extern "C" fn Java_quad_1native_QuadNative_surfaceOnImeAction(
     _: ndk_sys::jclass,
     action_code: ndk_sys::jint,
 ) {
-    send_message(Message::ImeAction(action_code as i32));
+    send_message(Message::ImeAction(action_code));
 }
 
 unsafe fn jstring_to_string(env: *mut ndk_sys::JNIEnv, jstr: ndk_sys::jstring) -> Option<String> { unsafe {
@@ -921,8 +921,8 @@ pub(crate) unsafe fn load_asset(filepath: *const ::core::ffi::c_char, out: *mut 
     let mid = (get_method_id)(
         env,
         get_object_class(env, ACTIVITY),
-        b"getAssets\0".as_ptr() as _,
-        b"()Landroid/content/res/AssetManager;\0".as_ptr() as _,
+        c"getAssets".as_ptr() as _,
+        c"()Landroid/content/res/AssetManager;".as_ptr() as _,
     );
     let asset_manager = (call_object_method)(env, ACTIVITY, mid);
     let mgr = AAssetManager_fromJava(env, asset_manager);

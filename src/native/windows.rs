@@ -122,6 +122,7 @@ const WHEEL_DELTA: f32 = 120.0;
 // COMPOSITIONFORM structure
 #[repr(C)]
 #[allow(non_snake_case)]
+#[allow(clippy::upper_case_acronyms)]
 struct COMPOSITIONFORM {
     dwStyle: DWORD,
     ptCurrentPos: POINT,
@@ -131,6 +132,7 @@ struct COMPOSITIONFORM {
 // CANDIDATEFORM structure
 #[repr(C)]
 #[allow(non_snake_case)]
+#[allow(clippy::upper_case_acronyms)]
 struct CANDIDATEFORM {
     dwIndex: DWORD,
     dwStyle: DWORD,
@@ -301,9 +303,6 @@ impl WindowsDisplay {
     fn set_window_position(&mut self, new_x: u32, new_y: u32) {
         let mut rect: RECT = unsafe { std::mem::zeroed() };
         if unsafe { GetClientRect(self.wnd, &mut rect as *mut _ as _) } != 0 {
-            let mut new_rect = rect;
-            new_rect.right = new_rect.right - new_rect.left + new_x as i32;
-            new_rect.bottom = new_rect.bottom - new_rect.top + new_y as i32;
             unsafe {
                 SetWindowPos(
                     self.wnd,
@@ -866,7 +865,7 @@ unsafe extern "system" fn win32_wndproc(
                 if path_len > 0 {
                     // SAFETY: `DragQueryFileW` initializes `path_ptr` up to `path_len`
                     // elements before use, and we only access the initialized portion.
-                    let path = unsafe {
+                    let path = {
                         let path = path.assume_init();
                         PathBuf::from(OsString::from_wide(&path[0..path_len]))
                     };

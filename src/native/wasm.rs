@@ -231,6 +231,7 @@ impl crate::native::Clipboard for Clipboard {
     }
 }
 
+#[allow(clippy::not_unsafe_ptr_arg_deref)]
 #[unsafe(no_mangle)]
 pub extern "C" fn on_clipboard_paste(msg: *mut u8, len: usize) {
     let msg = unsafe { String::from_raw_parts(msg, len, len) };
@@ -296,6 +297,7 @@ pub extern "C" fn frame() {
     });
 }
 
+#[allow(clippy::not_unsafe_ptr_arg_deref)]
 #[unsafe(no_mangle)]
 pub extern "C" fn on_ime_state_changed(
     text_ptr: *mut u8,
@@ -342,6 +344,7 @@ pub extern "C" fn on_soft_keyboard(visible: u32, x: f32, y: f32, w: f32, h: f32)
     tl_event_handler(|event_handler| event_handler.soft_keyboard_event(visible != 0, x, y, w, h));
 }
 
+#[allow(clippy::not_unsafe_ptr_arg_deref)]
 #[unsafe(no_mangle)]
 pub extern "C" fn on_ime_preedit(text_ptr: *mut u8, text_len: usize) {
     let text = unsafe { String::from_raw_parts(text_ptr, text_len, text_len) };
@@ -351,6 +354,7 @@ pub extern "C" fn on_ime_preedit(text_ptr: *mut u8, text_len: usize) {
     });
 }
 
+#[allow(clippy::not_unsafe_ptr_arg_deref)]
 #[unsafe(no_mangle)]
 pub extern "C" fn on_ime_commit(text_ptr: *mut u8, text_len: usize) {
     let text = if text_ptr.is_null() || text_len == 0 {
@@ -486,6 +490,7 @@ pub extern "C" fn on_files_dropped_finish() {
     tl_event_handler(|event_handler| event_handler.files_dropped_event());
 }
 
+#[allow(clippy::not_unsafe_ptr_arg_deref)]
 #[unsafe(no_mangle)]
 pub extern "C" fn on_file_dropped(
     path: *mut u8,

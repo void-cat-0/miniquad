@@ -10,6 +10,7 @@ use crate::{
     CursorIcon,
 };
 
+#[allow(clippy::not_unsafe_ptr_arg_deref)]
 pub fn nsstring_to_string(string: ObjcId) -> String {
     if string.is_null() {
         return String::new();
@@ -40,16 +41,7 @@ pub fn utf16_offset_to_byte_index(s: &str, utf16_offset: usize) -> usize {
 }
 
 pub fn char_index_to_utf16_offset(s: &str, char_idx: usize) -> usize {
-    let mut current_char = 0;
-    let mut utf16_offset = 0;
-    for c in s.chars() {
-        if current_char >= char_idx {
-            break;
-        }
-        utf16_offset += c.len_utf16();
-        current_char += 1;
-    }
-    utf16_offset
+    s.chars().take(char_idx).map(char::len_utf16).sum()
 }
 
 pub fn utf16_offset_to_char_index(s: &str, utf16_offset: usize) -> usize {
@@ -187,6 +179,7 @@ pub fn load_webkit_cursor(cursor_name_str: &str) -> ObjcId {
     }
 }
 
+#[allow(clippy::not_unsafe_ptr_arg_deref)]
 pub fn get_event_char(event: ObjcId) -> Option<char> {
     unsafe {
         let characters: ObjcId = msg_send![event, characters];
@@ -202,6 +195,7 @@ pub fn get_event_char(event: ObjcId) -> Option<char> {
     }
 }
 
+#[allow(clippy::not_unsafe_ptr_arg_deref)]
 pub fn get_event_key_modifier(event: ObjcId) -> KeyMods {
     let flags: u64 = unsafe { msg_send![event, modifierFlags] };
     KeyMods {
@@ -212,6 +206,7 @@ pub fn get_event_key_modifier(event: ObjcId) -> KeyMods {
     }
 }
 
+#[allow(clippy::not_unsafe_ptr_arg_deref)]
 pub fn get_event_keycode(event: ObjcId) -> Option<KeyCode> {
     unsafe {
         let chars_obj: ObjcId = msg_send![event, charactersIgnoringModifiers];
@@ -219,7 +214,7 @@ pub fn get_event_keycode(event: ObjcId) -> Option<KeyCode> {
             let s = nsstring_to_string(chars_obj);
             if let Some(ch) = s.chars().next() {
                 let lower = ch.to_ascii_lowercase();
-                if lower >= 'a' && lower <= 'z' {
+                if lower.is_ascii_lowercase() {
                     let code = match lower {
                         'a' => KeyCode::A,
                         'b' => KeyCode::B,
@@ -507,8 +502,10 @@ pub fn keycode_to_menu_key(keycode: KeyCode, shift: bool) -> &'static str {
 }
 
 pub unsafe fn superclass(this: &Object) -> &Class {
-    let superclass: ObjcId = msg_send![this, superclass];
-    &*(superclass as *const _)
+    unsafe {
+        let superclass: ObjcId = msg_send![this, superclass];
+        &*(superclass as *const _)
+    }
 }
 
 #[cfg(target_os = "macos")]

@@ -609,7 +609,7 @@ unsafe fn get_proc_address(name: *const u8) -> Option<unsafe extern "C" fn()> { 
 
     if OPENGL.is_null() {
         OPENGL = libc::dlopen(
-            b"/System/Library/Frameworks/OpenGL.framework/Versions/Current/OpenGL\0".as_ptr() as _,
+            c"/System/Library/Frameworks/OpenGL.framework/Versions/Current/OpenGL".as_ptr() as _,
             libc::RTLD_LAZY,
         );
     }
@@ -620,7 +620,7 @@ unsafe fn get_proc_address(name: *const u8) -> Option<unsafe extern "C" fn()> { 
     if symbol.is_null() {
         return None;
     }
-    Some(unsafe { std::mem::transmute_copy(&symbol) })
+    Some(std::mem::transmute_copy(&symbol))
 }}
 
 // methods for both metal or OPENGL view
@@ -1360,6 +1360,7 @@ pub fn define_metal_view_class() -> *const Class {
     decl.register()
 }
 
+#[allow(clippy::mut_from_ref)]
 fn get_window_payload(this: &Object) -> &mut MacosDisplay {
     unsafe {
         let ptr: *mut c_void = *this.get_ivar("display_ptr");
@@ -1711,224 +1712,226 @@ pub unsafe fn run<F>(conf: crate::conf::Conf, f: F)
 where
     F: 'static + FnOnce() -> Box<dyn EventHandler>,
 {
-    let (tx, rx) = std::sync::mpsc::channel();
-    let clipboard = Box::new(MacosClipboard);
-    crate::set_display(NativeDisplayData {
-        high_dpi: conf.high_dpi,
-        gfx_api: conf.platform.apple_gfx_api,
-        blocking_event_loop: conf.platform.blocking_event_loop,
-        ..NativeDisplayData::new(conf.window_width, conf.window_height, tx, clipboard)
-    });
-
-    let mut display = MacosDisplay {
-        view: std::ptr::null_mut(),
-        window: std::ptr::null_mut(),
-        gl_context: std::ptr::null_mut(),
-        fullscreen: false,
-        occluded: false,
-        cursor_shown: true,
-        current_cursor: CursorIcon::Default,
-        cursor_grabbed: false,
-        cursors: HashMap::new(),
-        gfx_api: conf.platform.apple_gfx_api,
-        f: Some(Box::new(f)),
-        event_handler: None,
-        native_requests: rx,
-        modifiers: Modifiers::default(),
-        update_requested: true,
-        last_paint_start_time: Instant::now(),
-        text_input: None,
-        ime_rect: (0., 0., 0., 0.),
-        marked_text: String::new(),
-        marked_selection: NSRange {
-            location: 0,
-            length: 0,
-        },
-    };
-
-    let app_delegate_class = define_app_delegate();
-    let app_delegate_instance: ObjcId = msg_send![app_delegate_class, new];
-    (*app_delegate_instance).set_ivar("activated", false);
-
-    let ns_app: ObjcId = msg_send![class!(NSApplication), sharedApplication];
-    let () = msg_send![ns_app, setDelegate: app_delegate_instance];
-    let () = msg_send![
-        ns_app,
-        setActivationPolicy: NSApplicationActivationPolicy::NSApplicationActivationPolicyRegular
-            as i64
-    ];
-
-    if let Some(icon) = &conf.icon {
-        set_icon(ns_app, icon);
-    }
-
-    initialize_menu_bar(ns_app);
-
-    let mut window_masks = NSWindowStyleMask::NSTitledWindowMask as u64
-        | NSWindowStyleMask::NSClosableWindowMask as u64
-        | NSWindowStyleMask::NSMiniaturizableWindowMask as u64;
-
-    if conf.window_resizable {
-        window_masks |= NSWindowStyleMask::NSResizableWindowMask as u64;
-    }
-
-    let window_frame = NSRect {
-        origin: NSPoint { x: 0., y: 0. },
-        size: NSSize {
-            width: conf.window_width as f64,
-            height: conf.window_height as f64,
-        },
-    };
-
-    let window: ObjcId = msg_send![class!(NSWindow), alloc];
-    let window: ObjcId = msg_send![
-        window,
-        initWithContentRect: window_frame
-        styleMask: window_masks
-        backing: NSBackingStoreType::NSBackingStoreBuffered as u64
-        defer: NO
-    ];
-    assert!(!window.is_null());
-
-    let window_delegate_class = define_cocoa_window_delegate();
-    let window_delegate: ObjcId = msg_send![window_delegate_class, new];
-    let () = msg_send![window, setDelegate: window_delegate];
-
-    (*window_delegate).set_ivar("display_ptr", &mut display as *mut _ as *mut c_void);
-
-    let title = str_to_nsstring(&conf.window_title);
-    //let () = msg_send![window, setReleasedWhenClosed: NO];
-    let () = msg_send![window, setTitle: title];
-
-    let view = match conf.platform.apple_gfx_api {
-        AppleGfxApi::OpenGl => create_opengl_view(&mut display, conf.sample_count, conf.high_dpi),
-        AppleGfxApi::Metal => create_metal_view(&mut display, conf.sample_count, conf.high_dpi),
-    };
-    {
-        let mut d = native_display().lock().unwrap();
-        d.view = view;
-    }
-    (*view).set_ivar("display_ptr", &mut display as *mut _ as *mut c_void);
-
-    // Tell the view to accept file drops. Without this, dragging files onto the window will do nothing.
-    let dragged_types: ObjcId =
-        msg_send![class!(NSArray), arrayWithObject: NSPasteboardTypeFileURL];
-    let () = msg_send![view, registerForDraggedTypes: dragged_types];
-
-    display.window = window;
-    display.view = view;
-
-    // cannot place it to create_opengl_view, because it should be called after setContentView
-    if conf.platform.apple_gfx_api == AppleGfxApi::OpenGl {
-        msg_send_![display.gl_context, setView:view];
-        msg_send_![display.gl_context, makeCurrentContext];
-
-        gl::load_gl_funcs(|proc| {
-            let name = std::ffi::CString::new(proc).unwrap();
-
-            get_proc_address(name.as_ptr() as _)
+    unsafe {
+        let (tx, rx) = std::sync::mpsc::channel();
+        let clipboard = Box::new(MacosClipboard);
+        crate::set_display(NativeDisplayData {
+            high_dpi: conf.high_dpi,
+            gfx_api: conf.platform.apple_gfx_api,
+            blocking_event_loop: conf.platform.blocking_event_loop,
+            ..NativeDisplayData::new(conf.window_width, conf.window_height, tx, clipboard)
         });
-    }
 
-    let () = msg_send![window, setContentView: view];
-    // InVisibleRect follows resize; 0x400 enables notifications during mouse drags.
-    let bounds: NSRect = msg_send![view, bounds];
-    let tracking: ObjcId = msg_send![class!(NSTrackingArea), alloc];
-    let tracking: ObjcId = msg_send![tracking,
-        initWithRect: bounds
-        options: (NSTrackignActiveAlways | NSTrackingInVisibleRect
-            | NSTrackingMouseEnteredAndExited | 0x400u64)
-        owner: view
-        userInfo: nil
-    ];
-    let () = msg_send![view, addTrackingArea: tracking];
-    // The view retains the tracking area.
-    let () = msg_send![tracking, release];
-    let () = msg_send![window, makeFirstResponder: view];
+        let mut display = MacosDisplay {
+            view: std::ptr::null_mut(),
+            window: std::ptr::null_mut(),
+            gl_context: std::ptr::null_mut(),
+            fullscreen: false,
+            occluded: false,
+            cursor_shown: true,
+            current_cursor: CursorIcon::Default,
+            cursor_grabbed: false,
+            cursors: HashMap::new(),
+            gfx_api: conf.platform.apple_gfx_api,
+            f: Some(Box::new(f)),
+            event_handler: None,
+            native_requests: rx,
+            modifiers: Modifiers::default(),
+            update_requested: true,
+            last_paint_start_time: Instant::now(),
+            text_input: None,
+            ime_rect: (0., 0., 0., 0.),
+            marked_text: String::new(),
+            marked_selection: NSRange {
+                location: 0,
+                length: 0,
+            },
+        };
 
-    let _ = display.update_dimensions();
+        let app_delegate_class = define_app_delegate();
+        let app_delegate_instance: ObjcId = msg_send![app_delegate_class, new];
+        (*app_delegate_instance).set_ivar("activated", false);
 
-    assert!(!view.is_null());
+        let ns_app: ObjcId = msg_send![class!(NSApplication), sharedApplication];
+        let () = msg_send![ns_app, setDelegate: app_delegate_instance];
+        let () = msg_send![
+            ns_app,
+            setActivationPolicy: NSApplicationActivationPolicy::NSApplicationActivationPolicyRegular
+                as i64
+        ];
 
-    let () = msg_send![window, center];
-    let () = msg_send![window, setAcceptsMouseMovedEvents: YES];
-
-    if conf.fullscreen {
-        let () = msg_send![window, toggleFullScreen: nil];
-    }
-
-    msg_send_![window, orderFront: nil];
-    let () = msg_send![window, makeKeyAndOrderFront: nil];
-
-    let () = msg_send![ns_app, finishLaunching];
-
-    // Found this here: https://github.com/kovidgoyal/kitty/issues/6341#issuecomment-1578348104
-    let current_runloop = msg_send_![class!(NSRunLoop), currentRunLoop];
-    let timer = match conf.platform.apple_gfx_api {
-        AppleGfxApi::OpenGl => msg_send_![class!(NSTimer), timerWithTimeInterval:0.016 // ~60FPS
-                                                           target:view
-                                                           selector:sel!(setNeedsDisplayHack)
-                                                           userInfo:nil
-                                                           repeats:YES],
-        AppleGfxApi::Metal => msg_send_![class!(NSTimer), timerWithTimeInterval:0.016 // ~60FPS
-                                                          target:view
-                                                          selector:sel!(draw)
-                                                          userInfo:nil
-                                                          repeats:YES],
-    };
-    msg_send_![current_runloop, addTimer:timer forMode:NSEventTrackingRunLoopMode];
-
-    // Basically reimplementing msg_send![ns_app, run] here
-    let distant_future: ObjcId = msg_send![class!(NSDate), distantFuture];
-    let distant_past: ObjcId = msg_send![class!(NSDate), distantPast];
-    let frame_pacer = if conf.platform.blocking_event_loop {
-        None
-    } else {
-        FramePacer::new()
-    };
-    let mut done = false;
-    while !(done || crate::native_display().lock().unwrap().quit_ordered) {
-
-        // Wait at the top for just in time rendering
-        if let Some(frame_pacer) = frame_pacer.as_ref() {
-            frame_pacer.wait_next_frame(Duration::from_millis(50));
+        if let Some(icon) = &conf.icon {
+            set_icon(ns_app, icon);
         }
 
-        while let Ok(request) = display.native_requests.try_recv() {
-            display.process_request(request);
+        initialize_menu_bar(ns_app);
+
+        let mut window_masks = NSWindowStyleMask::NSTitledWindowMask as u64
+            | NSWindowStyleMask::NSClosableWindowMask as u64
+            | NSWindowStyleMask::NSMiniaturizableWindowMask as u64;
+
+        if conf.window_resizable {
+            window_masks |= NSWindowStyleMask::NSResizableWindowMask as u64;
         }
 
+        let window_frame = NSRect {
+            origin: NSPoint { x: 0., y: 0. },
+            size: NSSize {
+                width: conf.window_width as f64,
+                height: conf.window_height as f64,
+            },
+        };
+
+        let window: ObjcId = msg_send![class!(NSWindow), alloc];
+        let window: ObjcId = msg_send![
+            window,
+            initWithContentRect: window_frame
+            styleMask: window_masks
+            backing: NSBackingStoreType::NSBackingStoreBuffered as u64
+            defer: NO
+        ];
+        assert!(!window.is_null());
+
+        let window_delegate_class = define_cocoa_window_delegate();
+        let window_delegate: ObjcId = msg_send![window_delegate_class, new];
+        let () = msg_send![window, setDelegate: window_delegate];
+
+        (*window_delegate).set_ivar("display_ptr", &mut display as *mut _ as *mut c_void);
+
+        let title = str_to_nsstring(&conf.window_title);
+        //let () = msg_send![window, setReleasedWhenClosed: NO];
+        let () = msg_send![window, setTitle: title];
+
+        let view = match conf.platform.apple_gfx_api {
+            AppleGfxApi::OpenGl => create_opengl_view(&mut display, conf.sample_count, conf.high_dpi),
+            AppleGfxApi::Metal => create_metal_view(&mut display, conf.sample_count, conf.high_dpi),
+        };
         {
-            let d = native_display().lock().unwrap();
-            if d.quit_requested || d.quit_ordered {
-                done = true;
-            }
+            let mut d = native_display().lock().unwrap();
+            d.view = view;
+        }
+        (*view).set_ivar("display_ptr", &mut display as *mut _ as *mut c_void);
+
+        // Tell the view to accept file drops. Without this, dragging files onto the window will do nothing.
+        let dragged_types: ObjcId =
+            msg_send![class!(NSArray), arrayWithObject: NSPasteboardTypeFileURL];
+        let () = msg_send![view, registerForDraggedTypes: dragged_types];
+
+        display.window = window;
+        display.view = view;
+
+        // cannot place it to create_opengl_view, because it should be called after setContentView
+        if conf.platform.apple_gfx_api == AppleGfxApi::OpenGl {
+            msg_send_![display.gl_context, setView:view];
+            msg_send_![display.gl_context, makeCurrentContext];
+
+            gl::load_gl_funcs(|proc| {
+                let name = std::ffi::CString::new(proc).unwrap();
+
+                get_proc_address(name.as_ptr() as _)
+            });
         }
 
-        let block_on_wait = conf.platform.blocking_event_loop && !display.update_requested;
-        if block_on_wait {
-            let event: ObjcId = msg_send![ns_app, nextEventMatchingMask: NSEventMask::NSAnyEventMask untilDate: distant_future inMode:NSDefaultRunLoopMode dequeue:YES];
+        let () = msg_send![window, setContentView: view];
+        // InVisibleRect follows resize; 0x400 enables notifications during mouse drags.
+        let bounds: NSRect = msg_send![view, bounds];
+        let tracking: ObjcId = msg_send![class!(NSTrackingArea), alloc];
+        let tracking: ObjcId = msg_send![tracking,
+            initWithRect: bounds
+            options: (NSTrackignActiveAlways | NSTrackingInVisibleRect
+                | NSTrackingMouseEnteredAndExited | 0x400u64)
+            owner: view
+            userInfo: nil
+        ];
+        let () = msg_send![view, addTrackingArea: tracking];
+        // The view retains the tracking area.
+        let () = msg_send![tracking, release];
+        let () = msg_send![window, makeFirstResponder: view];
 
-            if event != nil {
-                display.generate_swallowed_key_events(event);
+        let _ = display.update_dimensions();
+
+        assert!(!view.is_null());
+
+        let () = msg_send![window, center];
+        let () = msg_send![window, setAcceptsMouseMovedEvents: YES];
+
+        if conf.fullscreen {
+            let () = msg_send![window, toggleFullScreen: nil];
+        }
+
+        msg_send_![window, orderFront: nil];
+        let () = msg_send![window, makeKeyAndOrderFront: nil];
+
+        let () = msg_send![ns_app, finishLaunching];
+
+        // Found this here: https://github.com/kovidgoyal/kitty/issues/6341#issuecomment-1578348104
+        let current_runloop = msg_send_![class!(NSRunLoop), currentRunLoop];
+        let timer = match conf.platform.apple_gfx_api {
+            AppleGfxApi::OpenGl => msg_send_![class!(NSTimer), timerWithTimeInterval:0.016 // ~60FPS
+                                                               target:view
+                                                               selector:sel!(setNeedsDisplayHack)
+                                                               userInfo:nil
+                                                               repeats:YES],
+            AppleGfxApi::Metal => msg_send_![class!(NSTimer), timerWithTimeInterval:0.016 // ~60FPS
+                                                              target:view
+                                                              selector:sel!(draw)
+                                                              userInfo:nil
+                                                              repeats:YES],
+        };
+        msg_send_![current_runloop, addTimer:timer forMode:NSEventTrackingRunLoopMode];
+
+        // Basically reimplementing msg_send![ns_app, run] here
+        let distant_future: ObjcId = msg_send![class!(NSDate), distantFuture];
+        let distant_past: ObjcId = msg_send![class!(NSDate), distantPast];
+        let frame_pacer = if conf.platform.blocking_event_loop {
+            None
+        } else {
+            FramePacer::new()
+        };
+        let mut done = false;
+        while !(done || crate::native_display().lock().unwrap().quit_ordered) {
+
+            // Wait at the top for just in time rendering
+            if let Some(frame_pacer) = frame_pacer.as_ref() {
+                frame_pacer.wait_next_frame(Duration::from_millis(50));
             }
 
-            let () = msg_send![ns_app, sendEvent:event];
-        } else {
-            loop {
-                let event: ObjcId = msg_send![ns_app, nextEventMatchingMask: NSEventMask::NSAnyEventMask untilDate: distant_past inMode:NSDefaultRunLoopMode dequeue:YES];
-                if event == nil {
-                    break;
+            while let Ok(request) = display.native_requests.try_recv() {
+                display.process_request(request);
+            }
+
+            {
+                let d = native_display().lock().unwrap();
+                if d.quit_requested || d.quit_ordered {
+                    done = true;
                 }
-                display.generate_swallowed_key_events(event);
+            }
+
+            let block_on_wait = conf.platform.blocking_event_loop && !display.update_requested;
+            if block_on_wait {
+                let event: ObjcId = msg_send![ns_app, nextEventMatchingMask: NSEventMask::NSAnyEventMask untilDate: distant_future inMode:NSDefaultRunLoopMode dequeue:YES];
+
+                if event != nil {
+                    display.generate_swallowed_key_events(event);
+                }
 
                 let () = msg_send![ns_app, sendEvent:event];
+            } else {
+                loop {
+                    let event: ObjcId = msg_send![ns_app, nextEventMatchingMask: NSEventMask::NSAnyEventMask untilDate: distant_past inMode:NSDefaultRunLoopMode dequeue:YES];
+                    if event == nil {
+                        break;
+                    }
+                    display.generate_swallowed_key_events(event);
+
+                    let () = msg_send![ns_app, sendEvent:event];
+                }
             }
-        }
 
-        if !conf.platform.blocking_event_loop || display.update_requested {
-            perform_redraw(&mut display, conf.platform.apple_gfx_api, false);
-        }
+            if !conf.platform.blocking_event_loop || display.update_requested {
+                perform_redraw(&mut display, conf.platform.apple_gfx_api, false);
+            }
 
+        }
     }
 }

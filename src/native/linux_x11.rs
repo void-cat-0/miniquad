@@ -173,9 +173,9 @@ impl X11Display {
     }}
 
     pub unsafe fn init_xim(&mut self, window: Window) { unsafe {
-        libc::setlocale(libc::LC_CTYPE, b"\0".as_ptr() as _);
+        libc::setlocale(libc::LC_CTYPE, c"".as_ptr() as _);
 
-        let mod_res = (self.libx11.XSetLocaleModifiers)(b"\0".as_ptr() as _);
+        let mod_res = (self.libx11.XSetLocaleModifiers)(c"".as_ptr() as _);
         if mod_res.is_null() {
             eprintln!("WARNING: XSetLocaleModifiers returned NULL! XIM may not work properly with current $XMODIFIERS.");
         }
@@ -202,22 +202,23 @@ impl X11Display {
             (self.libx11.XFree)(styles_ptr as *mut libc::c_void);
         }
 
+        type XimProc = unsafe extern "C" fn(libx11::XIC, *mut libc::c_void, *mut libc::c_void) -> libc::c_int;
         self.xim_callbacks = [
             libx11::XIMCallback {
                 client_data: self as *mut _ as *mut libc::c_void,
-                callback: Some(std::mem::transmute(preedit_start_callback as *const ())),
+                callback: Some(std::mem::transmute::<*const (), XimProc>(preedit_start_callback as *const ())),
             },
             libx11::XIMCallback {
                 client_data: self as *mut _ as *mut libc::c_void,
-                callback: Some(std::mem::transmute(preedit_done_callback as *const ())),
+                callback: Some(std::mem::transmute::<*const (), XimProc>(preedit_done_callback as *const ())),
             },
             libx11::XIMCallback {
                 client_data: self as *mut _ as *mut libc::c_void,
-                callback: Some(std::mem::transmute(preedit_draw_callback as *const ())),
+                callback: Some(std::mem::transmute::<*const (), XimProc>(preedit_draw_callback as *const ())),
             },
             libx11::XIMCallback {
                 client_data: self as *mut _ as *mut libc::c_void,
-                callback: Some(std::mem::transmute(preedit_caret_callback as *const ())),
+                callback: Some(std::mem::transmute::<*const (), XimProc>(preedit_caret_callback as *const ())),
             },
         ];
 
@@ -576,12 +577,11 @@ impl X11Display {
             17 => {}
 
             // GenericEvent
-            35 if Some(event.xcookie.extension) == self.libxi.xi_extension_opcode => {
-                if event.xcookie.evtype == xi_input::XI_RawMotion {
+            35 if Some(event.xcookie.extension) == self.libxi.xi_extension_opcode
+                && event.xcookie.evtype == xi_input::XI_RawMotion => {
                     let (dx, dy) = self.libxi.read_cookie(&mut event.xcookie, self.display);
                     event_handler.raw_mouse_motion(dx as f32, dy as f32);
                 }
-            }
             _ => {}
         };
 
@@ -641,10 +641,10 @@ impl X11Display {
         // however, this is X, so just in case - the second method
         // send ClientMessage to the window with request to change property to fullscreen
         {
-            let mut data = [0isize; 5];
+            let mut data = [0 as libc::c_long; 5];
 
             data[0] = 1;
-            data[1] = wm_fullscreen as isize;
+            data[1] = wm_fullscreen as libc::c_long;
             data[2] = 0;
 
             let mut ev = XClientMessageEvent {
@@ -656,7 +656,7 @@ impl X11Display {
                 display: self.display,
                 format: 32,
                 data: ClientMessageData {
-                    l: std::mem::transmute(data),
+                    l: data,
                 },
             };
             (self.libx11.XSendEvent)(
@@ -805,6 +805,7 @@ impl X11Display {
     }
 }
 
+#[allow(clippy::result_large_err)]
 unsafe fn glx_main_loop<F>(
     mut display: X11Display,
     conf: &crate::conf::Conf,
@@ -904,6 +905,7 @@ where
     Ok(())
 }}
 
+#[allow(clippy::result_large_err)]
 unsafe fn egl_main_loop<F>(
     mut display: X11Display,
     conf: &crate::conf::Conf,
@@ -1025,10 +1027,10 @@ where
         (libx11.XInitThreads)();
         (libx11.XrmInitialize)();
 
-        libc::setlocale(libc::LC_ALL, b"\0".as_ptr() as _);
-        let loc_res = libc::setlocale(libc::LC_CTYPE, b"\0".as_ptr() as _);
+        libc::setlocale(libc::LC_ALL, c"".as_ptr() as _);
+        let _loc_res = libc::setlocale(libc::LC_CTYPE, c"".as_ptr() as _);
 
-        let mod_res = (libx11.XSetLocaleModifiers)(b"\0".as_ptr() as _);
+        let mod_res = (libx11.XSetLocaleModifiers)(c"".as_ptr() as _);
         if mod_res.is_null() {
             eprintln!("WARNING: XSetLocaleModifiers returned NULL! (check $XMODIFIERS)");
         }

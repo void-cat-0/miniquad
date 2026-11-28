@@ -45,7 +45,7 @@ macro_rules! wayland_interface {
 
                     pub static mut METHOD_ARGUMENTS_TYPES:
                         [*const wl_interface; $crate::count!($($method_argument_name)*)] =
-                        [$(unsafe { &$method_argument_name as *const _},)*];
+                        [$(&raw const $method_argument_name as *const _,)*];
 
                 }
             )*
@@ -62,7 +62,7 @@ macro_rules! wayland_interface {
 
                     pub static mut EVENT_ARGUMENTS_TYPES:
                         [*const wl_interface; $crate::count!($($event_argument_name)*)] =
-                        [$(unsafe { &$event_argument_name as *const _},)*];
+                        [$(&raw const $event_argument_name as *const _,)*];
                 }
             )*
 

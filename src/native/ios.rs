@@ -127,6 +127,7 @@ impl IosDisplay {
     }
 }
 
+#[allow(clippy::mut_from_ref)]
 fn get_window_payload(this: &Object) -> &mut IosDisplay {
     unsafe {
         let ptr: *mut c_void = *this.get_ivar("display_ptr");
@@ -513,7 +514,7 @@ unsafe fn get_proc_address(name: *const u8) -> Option<unsafe extern "C" fn()> { 
 
     if OPENGL.is_null() {
         OPENGL = libc::dlopen(
-            b"/System/Library/Frameworks/OpenGLES.framework/OpenGLES\0".as_ptr() as _,
+            c"/System/Library/Frameworks/OpenGLES.framework/OpenGLES".as_ptr() as _,
             libc::RTLD_LAZY,
         );
     }
@@ -524,7 +525,7 @@ unsafe fn get_proc_address(name: *const u8) -> Option<unsafe extern "C" fn()> { 
     if symbol.is_null() {
         return None;
     }
-    Some(unsafe { std::mem::transmute_copy(&symbol) })
+    Some(std::mem::transmute_copy(&symbol))
 }}
 
 pub fn define_glk_or_mtk_view_dlg(superclass: &Class) -> *const Class {
@@ -533,7 +534,7 @@ pub fn define_glk_or_mtk_view_dlg(superclass: &Class) -> *const Class {
     extern "C" fn draw_in_rect(this: &Object, _: Sel, _: ObjcId, _: ObjcId) {
         static DRAW_ENTER_COUNT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
         let draw_count = DRAW_ENTER_COUNT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        if draw_count == 0 || draw_count == 60 || draw_count % 300 == 0 {
+        if draw_count == 0 || draw_count == 60 || draw_count.is_multiple_of(300) {
             log(&format!("[miniquad] draw_in_rect entered (call count: {})", draw_count));
         }
 
@@ -772,138 +773,142 @@ struct View {
 }
 
 unsafe fn create_opengl_view(screen_rect: NSRect, _sample_count: i32, high_dpi: bool) -> View {
-    let container_view: ObjcId = msg_send![class!(UIView), alloc];
-    let container_view: ObjcId = msg_send![container_view, initWithFrame: screen_rect];
-    let black_color: ObjcId = msg_send![class!(UIColor), blackColor];
-    let _: () = msg_send![container_view, setBackgroundColor: black_color];
+    unsafe {
+        let container_view: ObjcId = msg_send![class!(UIView), alloc];
+        let container_view: ObjcId = msg_send![container_view, initWithFrame: screen_rect];
+        let black_color: ObjcId = msg_send![class!(UIColor), blackColor];
+        let _: () = msg_send![container_view, setBackgroundColor: black_color];
 
-    let glk_view_obj: ObjcId = msg_send![define_glk_or_mtk_view(class!(GLKView)), alloc];
-    let glk_view_obj: ObjcId = msg_send![glk_view_obj, initWithFrame: screen_rect];
+        let glk_view_obj: ObjcId = msg_send![define_glk_or_mtk_view(class!(GLKView)), alloc];
+        let glk_view_obj: ObjcId = msg_send![glk_view_obj, initWithFrame: screen_rect];
 
-    let glk_view_dlg_obj: ObjcId = msg_send![define_glk_or_mtk_view_dlg(class!(NSObject)), alloc];
-    let glk_view_dlg_obj: ObjcId = msg_send![glk_view_dlg_obj, init];
+        let glk_view_dlg_obj: ObjcId = msg_send![define_glk_or_mtk_view_dlg(class!(NSObject)), alloc];
+        let glk_view_dlg_obj: ObjcId = msg_send![glk_view_dlg_obj, init];
 
-    let eagl_context_obj: ObjcId = msg_send![class!(EAGLContext), alloc];
-    let mut eagl_context_obj: ObjcId = msg_send![eagl_context_obj, initWithAPI: 3];
-    let mut gles2 = false;
-    if eagl_context_obj.is_null() {
-        eagl_context_obj = msg_send![eagl_context_obj, initWithAPI: 2];
-        gles2 = true;
-    }
+        let eagl_context_obj: ObjcId = msg_send![class!(EAGLContext), alloc];
+        let mut eagl_context_obj: ObjcId = msg_send![eagl_context_obj, initWithAPI: 3];
+        let mut gles2 = false;
+        if eagl_context_obj.is_null() {
+            eagl_context_obj = msg_send![eagl_context_obj, initWithAPI: 2];
+            gles2 = true;
+        }
 
-    msg_send_![
-        glk_view_obj,
-        setDrawableColorFormat: frameworks::GLKViewDrawableColorFormatRGBA8888
-    ];
-    msg_send_![
-        glk_view_obj,
-        setDrawableDepthFormat: frameworks::GLKViewDrawableDepthFormat::Format24 as i32
-    ];
-    msg_send_![
-        glk_view_obj,
-        setDrawableStencilFormat: frameworks::GLKViewDrawableStencilFormat::FormatNone as i32
-    ];
-    msg_send_![glk_view_obj, setContext: eagl_context_obj];
+        msg_send_![
+            glk_view_obj,
+            setDrawableColorFormat: frameworks::GLKViewDrawableColorFormatRGBA8888
+        ];
+        msg_send_![
+            glk_view_obj,
+            setDrawableDepthFormat: frameworks::GLKViewDrawableDepthFormat::Format24 as i32
+        ];
+        msg_send_![
+            glk_view_obj,
+            setDrawableStencilFormat: frameworks::GLKViewDrawableStencilFormat::FormatNone as i32
+        ];
+        msg_send_![glk_view_obj, setContext: eagl_context_obj];
 
-    msg_send_![glk_view_obj, setDelegate: glk_view_dlg_obj];
-    msg_send_![glk_view_obj, setEnableSetNeedsDisplay: YES];
-    msg_send_![glk_view_obj, setUserInteractionEnabled: YES];
-    msg_send_![glk_view_obj, setMultipleTouchEnabled: YES];
-    if high_dpi {
-        let main_screen: ObjcId = msg_send![class!(UIScreen), mainScreen];
-        let scale: f64 = msg_send![main_screen, scale];
+        msg_send_![glk_view_obj, setDelegate: glk_view_dlg_obj];
+        msg_send_![glk_view_obj, setEnableSetNeedsDisplay: YES];
+        msg_send_![glk_view_obj, setUserInteractionEnabled: YES];
+        msg_send_![glk_view_obj, setMultipleTouchEnabled: YES];
+        if high_dpi {
+            let main_screen: ObjcId = msg_send![class!(UIScreen), mainScreen];
+            let scale: f64 = msg_send![main_screen, scale];
 
-        msg_send_![glk_view_obj, setContentScaleFactor: scale];
-    } else {
-        msg_send_![glk_view_obj, setContentScaleFactor: 1.0];
-    }
+            msg_send_![glk_view_obj, setContentScaleFactor: scale];
+        } else {
+            msg_send_![glk_view_obj, setContentScaleFactor: 1.0];
+        }
 
-    let view_ctrl_obj: ObjcId = msg_send![define_view_controller(), alloc];
-    let view_ctrl_obj: ObjcId = msg_send![view_ctrl_obj, init];
+        let view_ctrl_obj: ObjcId = msg_send![define_view_controller(), alloc];
+        let view_ctrl_obj: ObjcId = msg_send![view_ctrl_obj, init];
 
-    let _: () = msg_send![container_view, addSubview: glk_view_obj];
-    let _: () = msg_send![view_ctrl_obj, setView: container_view];
+        let _: () = msg_send![container_view, addSubview: glk_view_obj];
+        let _: () = msg_send![view_ctrl_obj, setView: container_view];
 
-    let display_link: ObjcId = msg_send![
-        class!(CADisplayLink),
-        displayLinkWithTarget: glk_view_dlg_obj
-        selector: sel!(onDisplayLink:)
-    ];
-    let main_run_loop: ObjcId = msg_send![class!(NSRunLoop), mainRunLoop];
-    let common_modes = if frameworks::NSRunLoopCommonModes.is_null() {
-        apple_util::str_to_nsstring("kCFRunLoopCommonModes")
-    } else {
-        frameworks::NSRunLoopCommonModes
-    };
-    msg_send_![display_link, addToRunLoop: main_run_loop forMode: common_modes];
+        let display_link: ObjcId = msg_send![
+            class!(CADisplayLink),
+            displayLinkWithTarget: glk_view_dlg_obj
+            selector: sel!(onDisplayLink:)
+        ];
+        let main_run_loop: ObjcId = msg_send![class!(NSRunLoop), mainRunLoop];
+        let common_modes = if frameworks::NSRunLoopCommonModes.is_null() {
+            apple_util::str_to_nsstring("kCFRunLoopCommonModes")
+        } else {
+            frameworks::NSRunLoopCommonModes
+        };
+        msg_send_![display_link, addToRunLoop: main_run_loop forMode: common_modes];
 
-    View {
-        view: glk_view_obj,
-        view_dlg: glk_view_dlg_obj,
-        view_ctrl: view_ctrl_obj,
-        display_link,
-        _gles2: gles2,
+        View {
+            view: glk_view_obj,
+            view_dlg: glk_view_dlg_obj,
+            view_ctrl: view_ctrl_obj,
+            display_link,
+            _gles2: gles2,
+        }
     }
 }
 
 unsafe fn create_metal_view(screen_rect: NSRect, sample_count: i32, _high_dpi: bool) -> View {
-    let container_view: ObjcId = msg_send![class!(UIView), alloc];
-    let container_view: ObjcId = msg_send![container_view, initWithFrame: screen_rect];
-    let black_color: ObjcId = msg_send![class!(UIColor), blackColor];
-    let _: () = msg_send![container_view, setBackgroundColor: black_color];
+    unsafe {
+        let container_view: ObjcId = msg_send![class!(UIView), alloc];
+        let container_view: ObjcId = msg_send![container_view, initWithFrame: screen_rect];
+        let black_color: ObjcId = msg_send![class!(UIColor), blackColor];
+        let _: () = msg_send![container_view, setBackgroundColor: black_color];
 
-    let mtk_view_obj: ObjcId = msg_send![define_glk_or_mtk_view(class!(MTKView)), alloc];
-    let mtk_view_obj: ObjcId = msg_send![mtk_view_obj, initWithFrame: screen_rect];
+        let mtk_view_obj: ObjcId = msg_send![define_glk_or_mtk_view(class!(MTKView)), alloc];
+        let mtk_view_obj: ObjcId = msg_send![mtk_view_obj, initWithFrame: screen_rect];
 
-    let mtk_view_dlg_obj: ObjcId = msg_send![define_glk_or_mtk_view_dlg(class!(NSObject)), alloc];
-    let mtk_view_dlg_obj: ObjcId = msg_send![mtk_view_dlg_obj, init];
+        let mtk_view_dlg_obj: ObjcId = msg_send![define_glk_or_mtk_view_dlg(class!(NSObject)), alloc];
+        let mtk_view_dlg_obj: ObjcId = msg_send![mtk_view_dlg_obj, init];
 
-    let view_ctrl_obj: ObjcId = msg_send![define_view_controller(), alloc];
-    let view_ctrl_obj: ObjcId = msg_send![view_ctrl_obj, init];
+        let view_ctrl_obj: ObjcId = msg_send![define_view_controller(), alloc];
+        let view_ctrl_obj: ObjcId = msg_send![view_ctrl_obj, init];
 
-    let _: () = msg_send![container_view, addSubview: mtk_view_obj];
-    let _: () = msg_send![view_ctrl_obj, setView: container_view];
+        let _: () = msg_send![container_view, addSubview: mtk_view_obj];
+        let _: () = msg_send![view_ctrl_obj, setView: container_view];
 
-    msg_send_![mtk_view_obj, setEnableSetNeedsDisplay: NO];
-    msg_send_![mtk_view_obj, setPaused: YES];
-    msg_send_![mtk_view_obj, setPreferredFramesPerSecond: 60];
-    msg_send_![mtk_view_obj, setDelegate: mtk_view_dlg_obj];
-    let device = MTLCreateSystemDefaultDevice();
-    msg_send_![mtk_view_obj, setDevice: device];
-    msg_send_![mtk_view_obj, setUserInteractionEnabled: YES];
-    msg_send_![mtk_view_obj, setMultipleTouchEnabled: YES];
+        msg_send_![mtk_view_obj, setEnableSetNeedsDisplay: NO];
+        msg_send_![mtk_view_obj, setPaused: YES];
+        msg_send_![mtk_view_obj, setPreferredFramesPerSecond: 60];
+        msg_send_![mtk_view_obj, setDelegate: mtk_view_dlg_obj];
+        let device = MTLCreateSystemDefaultDevice();
+        msg_send_![mtk_view_obj, setDevice: device];
+        msg_send_![mtk_view_obj, setUserInteractionEnabled: YES];
+        msg_send_![mtk_view_obj, setMultipleTouchEnabled: YES];
 
-    if _high_dpi {
-        let main_screen: ObjcId = msg_send![class!(UIScreen), mainScreen];
-        let scale: f64 = msg_send![main_screen, scale];
-        msg_send_![mtk_view_obj, setContentScaleFactor: scale];
-    } else {
-        msg_send_![mtk_view_obj, setContentScaleFactor: 1.0];
-    }
+        if _high_dpi {
+            let main_screen: ObjcId = msg_send![class!(UIScreen), mainScreen];
+            let scale: f64 = msg_send![main_screen, scale];
+            msg_send_![mtk_view_obj, setContentScaleFactor: scale];
+        } else {
+            msg_send_![mtk_view_obj, setContentScaleFactor: 1.0];
+        }
 
-    if sample_count > 1 {
-        msg_send_![mtk_view_obj, setSampleCount: sample_count as u64];
-    }
+        if sample_count > 1 {
+            msg_send_![mtk_view_obj, setSampleCount: sample_count as u64];
+        }
 
-    let display_link: ObjcId = msg_send![
-        class!(CADisplayLink),
-        displayLinkWithTarget: mtk_view_dlg_obj
-        selector: sel!(onDisplayLink:)
-    ];
-    let main_run_loop: ObjcId = msg_send![class!(NSRunLoop), mainRunLoop];
-    let common_modes = if frameworks::NSRunLoopCommonModes.is_null() {
-        apple_util::str_to_nsstring("kCFRunLoopCommonModes")
-    } else {
-        frameworks::NSRunLoopCommonModes
-    };
-    msg_send_![display_link, addToRunLoop: main_run_loop forMode: common_modes];
+        let display_link: ObjcId = msg_send![
+            class!(CADisplayLink),
+            displayLinkWithTarget: mtk_view_dlg_obj
+            selector: sel!(onDisplayLink:)
+        ];
+        let main_run_loop: ObjcId = msg_send![class!(NSRunLoop), mainRunLoop];
+        let common_modes = if frameworks::NSRunLoopCommonModes.is_null() {
+            apple_util::str_to_nsstring("kCFRunLoopCommonModes")
+        } else {
+            frameworks::NSRunLoopCommonModes
+        };
+        msg_send_![display_link, addToRunLoop: main_run_loop forMode: common_modes];
 
-    View {
-        view: mtk_view_obj,
-        view_dlg: mtk_view_dlg_obj,
-        view_ctrl: view_ctrl_obj,
-        display_link,
-        _gles2: false,
+        View {
+            view: mtk_view_obj,
+            view_dlg: mtk_view_dlg_obj,
+            view_ctrl: view_ctrl_obj,
+            display_link,
+            _gles2: false,
+        }
     }
 }
 
@@ -1058,6 +1063,8 @@ pub fn define_app_delegate() -> *const Class {
                 ..NativeDisplayData::new(screen_width, screen_height, tx, clipboard)
             });
 
+            // Only the main thread and the render thread it spawns touch this state.
+            #[allow(clippy::arc_with_non_send_sync)]
             let state_original = Arc::new(Mutex::new(MainThreadState {
                 quit: false,
                 paused: false,

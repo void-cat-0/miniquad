@@ -2,10 +2,12 @@
 //!
 //! Demonstrates:
 //! - Text input box with visible text using fontdue
-//! - IME candidate window positioning using window::set_ime_position()
+//! - IME candidate window positioning using window::set_text_input_rect()
 //! - Chinese/Japanese/Korean input support
 //!
 //! Click on an input box to focus it, then type with your IME.
+
+#![allow(clippy::too_many_arguments)]
 
 use fontdue::{Font, FontSettings};
 use miniquad::*;
@@ -236,7 +238,7 @@ impl Stage {
             let x = (b.cursor_x(&mut self.tr) * self.dpi) as i32;
             let y = ((b.y + b.h) * self.dpi) as i32;
             // Use miniquad's built-in IME position API
-            window::set_ime_position(x, y);
+            window::set_text_input_rect(x as f32, y as f32, 0., 0.);
         }
     }
 }
@@ -321,13 +323,13 @@ impl EventHandler for Stage {
             if b.focused { 
                 self.focus = Some(i); 
                 // Enable IME when an input box is focused
-                window::set_ime_enabled(true);
+                window::start_text_input(Default::default());
             }
         }
         self.update_ime();
         if self.focus.is_none() { 
             // Disable IME when no input box is focused (for game controls)
-            window::set_ime_enabled(false);
+            window::stop_text_input();
         }
     }
 
@@ -346,7 +348,7 @@ impl EventHandler for Stage {
                     self.boxes[i].focused = false; 
                     self.focus = None; 
                     // Disable IME when focus is lost
-                    window::set_ime_enabled(false);
+                    window::stop_text_input();
                 }
                 _ => {}
             }

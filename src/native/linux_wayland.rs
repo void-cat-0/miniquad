@@ -178,12 +178,11 @@ impl WaylandPayload {
                     }
                     (libxkb.xkb_compose_state_reset)(compose_state);
                 }
-                XKB_COMPOSE_NOTHING => {
-                    if self.compose_preediting {
+                XKB_COMPOSE_NOTHING
+                    if self.compose_preediting => {
                         self.compose_preediting = false;
                         self.events.push(WaylandEvent::ImePreedit(String::new(), 0));
                     }
-                }
                 _ => {}
             }
         }
@@ -1648,14 +1647,13 @@ where
                             display.events.push(WaylandEvent::ImePreedit(String::new(), 0));
                         }
                     }
-                    Request::SetTextInputRect { x, y, w, h } => {
-                        if display.ime_rect != (x, y, w, h) {
+                    Request::SetTextInputRect { x, y, w, h }
+                        if display.ime_rect != (x, y, w, h) => {
                             display.ime_rect = (x, y, w, h);
                             if crate::text_input::session().is_some() {
                                 text_input_sync(&mut display);
                             }
                         }
-                    }
                     // TODO: implement the other events
                     _ => (),
                 }

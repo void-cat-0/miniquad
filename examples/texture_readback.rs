@@ -12,9 +12,14 @@ fn main() {
         }
     }
 
-    let mut conf = conf::Conf::default();
-    conf.window_title = "Texture transfer checks".to_owned();
-    conf.platform.linux_backend = conf::LinuxBackend::X11Only;
+    let conf = conf::Conf {
+        window_title: "Texture transfer checks".to_owned(),
+        platform: conf::Platform {
+            linux_backend: conf::LinuxBackend::X11Only,
+            ..Default::default()
+        },
+        ..Default::default()
+    };
     miniquad::start(conf, || {
         let mut ctx = miniquad::GlContext::new();
         println!(
