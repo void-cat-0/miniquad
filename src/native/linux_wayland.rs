@@ -333,14 +333,9 @@ impl WaylandPayload {
             self.seat
         );
         assert!(!self.data_device.is_null());
-        DATA_DEVICE_LISTENER.data_offer = data_device_handle_data_offer;
-        DATA_DEVICE_LISTENER.enter = drag_n_drop::data_device_handle_enter;
-        DATA_DEVICE_LISTENER.leave = drag_n_drop::data_device_handle_leave;
-        DATA_DEVICE_LISTENER.drop = drag_n_drop::data_device_handle_drop;
-        DATA_DEVICE_LISTENER.selection = clipboard::data_device_handle_selection;
         (self.client.wl_proxy_add_listener)(
             self.data_device as _,
-            (&raw mut DATA_DEVICE_LISTENER).cast(),
+            (&raw const DATA_DEVICE_LISTENER).cast_mut().cast(),
             self as *mut _ as _,
         );
     }
@@ -662,8 +657,18 @@ static mut KEYBOARD_LISTENER: wl_keyboard_listener = wl_keyboard_listener::dummy
 static mut POINTER_LISTENER: wl_pointer_listener = wl_pointer_listener::dummy();
 static mut TOUCH_LISTENER: wl_touch_listener = wl_touch_listener::dummy();
 static mut OUTPUT_LISTENER: wl_output_listener = wl_output_listener::dummy();
-static mut DATA_DEVICE_LISTENER: wl_data_device_listener = wl_data_device_listener::dummy();
-static mut DATA_OFFER_LISTENER: wl_data_offer_listener = wl_data_offer_listener::dummy();
+static DATA_DEVICE_LISTENER: wl_data_device_listener = wl_data_device_listener {
+    data_offer: data_device_handle_data_offer,
+    enter: drag_n_drop::data_device_handle_enter,
+    leave: drag_n_drop::data_device_handle_leave,
+    drop: drag_n_drop::data_device_handle_drop,
+    selection: clipboard::data_device_handle_selection,
+    ..wl_data_device_listener::dummy()
+};
+static DATA_OFFER_LISTENER: wl_data_offer_listener = wl_data_offer_listener {
+    source_actions: drag_n_drop::data_offer_handle_source_actions,
+    ..wl_data_offer_listener::dummy()
+};
 static mut XDG_WM_BASE_LISTENER: extensions::xdg_shell::xdg_wm_base_listener =
     extensions::xdg_shell::xdg_wm_base_listener::dummy();
 static mut RELATIVE_POINTER_LISTENER: extensions::cursor::zwp_relative_pointer_v1_listener =
@@ -1382,12 +1387,11 @@ unsafe extern "C" fn data_device_handle_data_offer(
     data_device: *mut wl_data_device,
     data_offer: *mut wl_data_offer,
 ) {
-    DATA_OFFER_LISTENER.source_actions = drag_n_drop::data_offer_handle_source_actions;
     let display: &mut WaylandPayload = &mut *(data as *mut _);
     assert_eq!(data_device, display.data_device);
     (display.client.wl_proxy_add_listener)(
         data_offer as _,
-        (&raw mut DATA_OFFER_LISTENER).cast(),
+        (&raw const DATA_OFFER_LISTENER).cast_mut().cast(),
         data,
     );
 }
