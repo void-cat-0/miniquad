@@ -845,9 +845,10 @@ where
 
     // A failed Wayland startup may have already published temporary display data.
     let (tx, rx) = std::sync::mpsc::channel();
+    let clipboard_display = std::sync::Arc::new(std::sync::atomic::AtomicPtr::new(display.display));
     let clipboard = Box::new(clipboard::X11Clipboard::new(
         display.libx11.clone(),
-        display.display,
+        clipboard_display.clone(),
         display.window,
     ));
     crate::set_or_replace_display(NativeDisplayData {
@@ -922,6 +923,7 @@ where
     drop(event_handler);
     (display.libx11.XUnmapWindow)(display.display, display.window);
     (display.libx11.XDestroyWindow)(display.display, display.window);
+    clipboard::detach(&clipboard_display);
     (display.libx11.XCloseDisplay)(display.display);
     None
 }
@@ -967,9 +969,10 @@ where
         .query_window_size(display.display, display.window);
 
     let (tx, rx) = std::sync::mpsc::channel();
+    let clipboard_display = std::sync::Arc::new(std::sync::atomic::AtomicPtr::new(display.display));
     let clipboard = Box::new(clipboard::X11Clipboard::new(
         display.libx11.clone(),
-        display.display,
+        clipboard_display.clone(),
         display.window,
     ));
     crate::set_or_replace_display(NativeDisplayData {
@@ -1019,6 +1022,7 @@ where
     glx.destroy_context(display.display, glx_window, glx_context);
     (display.libx11.XUnmapWindow)(display.display, display.window);
     (display.libx11.XDestroyWindow)(display.display, display.window);
+    clipboard::detach(&clipboard_display);
     (display.libx11.XCloseDisplay)(display.display);
 
     Ok(())
@@ -1079,9 +1083,10 @@ where
         .query_window_size(display.display, display.window);
 
     let (tx, rx) = std::sync::mpsc::channel();
+    let clipboard_display = std::sync::Arc::new(std::sync::atomic::AtomicPtr::new(display.display));
     let clipboard = Box::new(clipboard::X11Clipboard::new(
         display.libx11.clone(),
-        display.display,
+        clipboard_display.clone(),
         display.window,
     ));
     crate::set_or_replace_display(NativeDisplayData {
@@ -1127,6 +1132,7 @@ where
 
     (display.libx11.XUnmapWindow)(display.display, display.window);
     (display.libx11.XDestroyWindow)(display.display, display.window);
+    clipboard::detach(&clipboard_display);
     (display.libx11.XCloseDisplay)(display.display);
 
     Ok(())

@@ -7,6 +7,8 @@
 //! so use this with caution.
 
 use super::libx11::*;
+use std::sync::atomic::{AtomicPtr, Ordering};
+use std::sync::Arc;
 use std::sync::Mutex;
 
 unsafe fn get_clipboard(
@@ -212,14 +214,17 @@ pub(crate) unsafe fn respond_to_clipboard_request(
 
 pub struct X11Clipboard {
     libx11: LibX11,
-    display: *mut Display,
+    /// The X connection the clipboard talks on. `None` once the window is gone:
+    /// the display is closed when the event loop returns, and the clipboard
+    /// outlives it in `NATIVE_DISPLAY`.
+    display: Arc<AtomicPtr<Display>>,
     window: Window,
 }
 unsafe impl Send for X11Clipboard {}
 unsafe impl Sync for X11Clipboard {}
 
 impl X11Clipboard {
-    pub fn new(libx11: LibX11, display: *mut Display, window: Window) -> X11Clipboard {
+    pub fn new(libx11: LibX11, display: Arc<AtomicPtr<Display>>, window: Window) -> X11Clipboard {
         X11Clipboard {
             libx11,
             display,
@@ -227,17 +232,30 @@ impl X11Clipboard {
         }
     }
 }
+
+/// Detaches the clipboard handle; call this before closing the X display.
+pub fn detach(display: &Arc<AtomicPtr<Display>>) {
+    display.store(std::ptr::null_mut(), Ordering::Release);
+}
+
 impl crate::native::Clipboard for X11Clipboard {
     fn get(&mut self) -> Option<String> {
+        let display = self.display.load(Ordering::Acquire);
+        if display.is_null() {
+            return None;
+        }
         let utf8_string = self.libx11.extensions.utf8_string;
-        let bytes =
-            unsafe { get_clipboard(&mut self.libx11, self.display, self.window, utf8_string)? };
+        let bytes = unsafe { get_clipboard(&mut self.libx11, display, self.window, utf8_string)? };
         Some(std::str::from_utf8(&bytes).ok()?.to_string())
     }
 
     fn set(&mut self, data: &str) {
+        let display = self.display.load(Ordering::Acquire);
+        if display.is_null() {
+            return;
+        }
         unsafe {
-            claim_clipboard_ownership(&mut self.libx11, self.display, self.window, data.to_owned());
+            claim_clipboard_ownership(&mut self.libx11, display, self.window, data.to_owned());
         };
     }
 }
